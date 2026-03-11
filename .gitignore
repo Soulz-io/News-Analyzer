@@ -1,0 +1,9 @@
+node_modules/
+control-ui-patched/
+engine/venv/
+engine/*.db
+engine/__pycache__/
+engine/**/__pycache__/
+.env
+*.pyc
+.setup-complete

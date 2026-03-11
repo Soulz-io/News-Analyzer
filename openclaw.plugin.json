@@ -1,0 +1,43 @@
+{
+  "id": "openclaw-news-analyzer",
+  "name": "News Analyzer",
+  "description": "AI newsroom: detects narrative run-ups, builds game theory decision trees, predicts events from global news",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "fetchIntervalMinutes": {
+        "type": "number",
+        "default": 30
+      },
+      "scanIntervalHours": {
+        "type": "number",
+        "default": 2
+      },
+      "runupCheckIntervalHours": {
+        "type": "number",
+        "default": 6
+      },
+      "probabilityShiftThreshold": {
+        "type": "number",
+        "default": 0.10
+      },
+      "enginePort": {
+        "type": "number",
+        "default": 9120
+      },
+      "scannerModel": {
+        "type": "string",
+        "default": "anthropic/claude-haiku-4-5-20251001"
+      },
+      "analystModel": {
+        "type": "string",
+        "default": "anthropic/claude-sonnet-4-6"
+      },
+      "pythonPath": {
+        "type": "string",
+        "default": "python3"
+      }
+    }
+  }
+}

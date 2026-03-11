@@ -1,0 +1,16 @@
+{
+  "name": "openclaw-news-analyzer",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "OpenClaw plugin: AI newsroom for narrative run-up detection and game theory event prediction",
+  "extensions": "./index.ts",
+  "files": [
+    "index.ts",
+    "src/",
+    "ui/",
+    "engine/",
+    "openclaw.plugin.json"
+  ],
+  "author": "Soulz-io",
+  "license": "MIT"
+}
