@@ -28,8 +28,13 @@ from .db import (
     Consequence,
     ProbabilityUpdate,
     Prediction,
+    UserFeed,
+    TokenUsage,
+    EngineSettings,
 )
+from .narrative_tracker import update_narratives, detect_runups, consolidate_runups
 from .probability_engine import get_significant_shifts
+from .tree_generator import generate_tree, generate_trees_for_new_runups
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +112,13 @@ class PredictionCreate(BaseModel):
 class PredictionVerify(BaseModel):
     outcome: str  # "correct", "incorrect", "partial"
     evidence: str = ""
+
+
+class UserFeedCreate(BaseModel):
+    name: str
+    url: str
+    region: str = "global"
+    lang: str = "en"
 
 
 # ===========================================================================
@@ -328,6 +340,164 @@ def create_runup(payload: RunUpCreate, db: Session = Depends(_get_db)):
     db.commit()
     db.refresh(ru)
     return _runup_to_dict(ru)
+
+
+# ---- Manual analysis trigger ----------------------------------------------
+
+@router.post("/analyze")
+def run_analysis(db: Session = Depends(_get_db)):
+    """Manually trigger narrative analysis and run-up detection.
+
+    Fetches all existing briefs (with article eagerly loaded), runs
+    update_narratives and detect_runups using the narrative tracker's
+    own session management.
+    """
+    from sqlalchemy.orm import joinedload
+
+    briefs = (
+        db.query(ArticleBrief)
+        .options(joinedload(ArticleBrief.article))
+        .all()
+    )
+    if not briefs:
+        return {
+            "status": "ok",
+            "briefs_processed": 0,
+            "narratives_updated": 0,
+            "runups_detected": 0,
+        }
+
+    brief_count = len(briefs)
+
+    # Expunge briefs so they can be used outside this session
+    for b in briefs:
+        db.expunge(b)
+    db.close()
+
+    narratives = update_narratives(briefs)
+    runups = detect_runups()
+
+    # Consolidate overlapping run-ups into topics
+    primaries = consolidate_runups()
+
+    # Generate decision trees for new consolidated topics
+    trees = generate_trees_for_new_runups()
+
+    return {
+        "status": "ok",
+        "briefs_processed": brief_count,
+        "narratives_updated": len(narratives),
+        "runups_detected": len(runups),
+        "runups_consolidated": len(primaries),
+        "trees_generated": len(trees),
+        "trees": trees,
+    }
+
+
+# ---- Tree generation (Claude API) -----------------------------------------
+
+@router.post("/generate-tree/{run_up_id}")
+def api_generate_tree(run_up_id: int):
+    """Generate a decision tree for a specific run-up using Claude API."""
+    result = generate_tree(run_up_id)
+    if result is None:
+        raise HTTPException(500, detail="Tree generation failed. Check logs.")
+    return result
+
+
+@router.post("/generate-trees")
+def api_generate_trees():
+    """Consolidate run-ups and generate decision trees for top-N without trees."""
+    primaries = consolidate_runups()
+    trees = generate_trees_for_new_runups()
+    return {
+        "status": "ok",
+        "consolidated_topics": len(primaries),
+        "trees_generated": len(trees),
+        "trees": trees,
+    }
+
+
+# ---- Token budget ---------------------------------------------------------
+
+@router.get("/budget")
+def get_budget():
+    """Get current token budget status."""
+    from .tree_generator import get_daily_budget_eur, get_today_spending_eur
+    budget = get_daily_budget_eur()
+    spent = get_today_spending_eur()
+    return {
+        "daily_budget_eur": budget,
+        "spent_today_eur": round(spent, 4),
+        "remaining_eur": round(max(0, budget - spent), 4),
+        "percentage_used": round((spent / budget * 100) if budget > 0 else 0, 1),
+    }
+
+
+class BudgetUpdate(BaseModel):
+    daily_budget_eur: float = Field(..., ge=0.0, le=100.0)
+
+
+@router.put("/budget")
+def update_budget(payload: BudgetUpdate):
+    """Update the daily token budget in EUR."""
+    from .tree_generator import set_daily_budget_eur
+    new_budget = set_daily_budget_eur(payload.daily_budget_eur)
+    return {
+        "status": "ok",
+        "daily_budget_eur": new_budget,
+    }
+
+
+class ApiKeyUpdate(BaseModel):
+    api_key: str = Field(..., min_length=1)
+
+
+@router.put("/settings/api-key")
+def update_api_key(payload: ApiKeyUpdate):
+    """Set the Anthropic API key (stored in DB, persists across restarts)."""
+    config.anthropic_api_key = payload.api_key
+    masked = payload.api_key[:8] + "..." + payload.api_key[-4:] if len(payload.api_key) > 12 else "****"
+    return {"status": "ok", "api_key_set": True, "masked": masked}
+
+
+@router.get("/settings/api-key")
+def get_api_key_status():
+    """Check if an Anthropic API key is configured."""
+    key = config.anthropic_api_key
+    has_key = bool(key)
+    masked = key[:8] + "..." + key[-4:] if key and len(key) > 12 else ("****" if key else "")
+    return {"has_key": has_key, "masked": masked}
+
+
+@router.get("/budget/history")
+def budget_history(days: int = Query(7, ge=1, le=90), db: Session = Depends(_get_db)):
+    """Return daily token spending for the last N days."""
+    from .db import TokenUsage
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    rows = (
+        db.query(
+            func.date(TokenUsage.timestamp).label("day"),
+            func.sum(TokenUsage.cost_eur).label("total_cost"),
+            func.sum(TokenUsage.input_tokens).label("total_input"),
+            func.sum(TokenUsage.output_tokens).label("total_output"),
+            func.count(TokenUsage.id).label("calls"),
+        )
+        .filter(TokenUsage.timestamp >= cutoff)
+        .group_by(func.date(TokenUsage.timestamp))
+        .order_by(func.date(TokenUsage.timestamp).desc())
+        .all()
+    )
+    return [
+        {
+            "date": str(r.day),
+            "cost_eur": round(float(r.total_cost), 4),
+            "input_tokens": int(r.total_input),
+            "output_tokens": int(r.total_output),
+            "api_calls": int(r.calls),
+        }
+        for r in rows
+    ]
 
 
 # ---- Decision trees -------------------------------------------------------
@@ -567,6 +737,126 @@ def verify_prediction(
     return _prediction_to_dict(pred)
 
 
+# ---- Feed management ------------------------------------------------------
+
+@router.get("/feeds")
+def get_feeds(db: Session = Depends(_get_db)):
+    """Return all feeds (default from config + user-added from DB).
+
+    Default feeds carry ``source: "default"`` and an ``id`` derived from their
+    index in default_feeds.yaml (prefixed ``"default-"``).  User feeds carry
+    ``source: "user"`` and their real database ``id``.
+    """
+    # Default feeds from config
+    default_feeds = config.feeds
+    result: List[Dict] = []
+    for idx, feed in enumerate(default_feeds):
+        result.append({
+            "id": f"default-{idx}",
+            "name": feed.get("name", ""),
+            "url": feed.get("url", ""),
+            "region": feed.get("region", "global"),
+            "lang": feed.get("lang", "en"),
+            "enabled": True,
+            "source": "default",
+        })
+
+    # User feeds from DB
+    user_feeds = db.query(UserFeed).order_by(UserFeed.added_at).all()
+    for uf in user_feeds:
+        result.append({
+            "id": uf.id,
+            "name": uf.name,
+            "url": uf.url,
+            "region": uf.region,
+            "lang": uf.lang,
+            "enabled": uf.enabled,
+            "source": "user",
+            "added_at": uf.added_at.isoformat() if uf.added_at else None,
+        })
+
+    return result
+
+
+@router.post("/feeds")
+def create_feed(payload: UserFeedCreate, db: Session = Depends(_get_db)):
+    """Add a new user-defined RSS feed."""
+    # Check for duplicate URL among user feeds
+    existing = db.query(UserFeed).filter(UserFeed.url == payload.url).first()
+    if existing:
+        raise HTTPException(409, detail="A user feed with this URL already exists.")
+
+    # Also check against default feeds
+    for feed in config.feeds:
+        if feed.get("url") == payload.url:
+            raise HTTPException(
+                409, detail="This URL is already present in the default feeds."
+            )
+
+    uf = UserFeed(
+        name=payload.name,
+        url=payload.url,
+        region=payload.region,
+        lang=payload.lang,
+        enabled=True,
+    )
+    db.add(uf)
+    db.commit()
+    db.refresh(uf)
+
+    return {
+        "id": uf.id,
+        "name": uf.name,
+        "url": uf.url,
+        "region": uf.region,
+        "lang": uf.lang,
+        "enabled": uf.enabled,
+        "source": "user",
+        "added_at": uf.added_at.isoformat() if uf.added_at else None,
+    }
+
+
+@router.delete("/feeds/{feed_id}")
+def delete_feed(feed_id: int, db: Session = Depends(_get_db)):
+    """Remove a user-added feed.  Default feeds cannot be deleted."""
+    uf = db.query(UserFeed).get(feed_id)
+    if uf is None:
+        raise HTTPException(
+            404,
+            detail="User feed not found. Only user-added feeds can be deleted.",
+        )
+
+    db.delete(uf)
+    db.commit()
+    return {"status": "deleted", "id": feed_id}
+
+
+@router.put("/feeds/{feed_id}/toggle")
+def toggle_feed(feed_id: int, db: Session = Depends(_get_db)):
+    """Enable or disable a user-added feed."""
+    uf = db.query(UserFeed).get(feed_id)
+    if uf is None:
+        raise HTTPException(
+            404,
+            detail="User feed not found. Only user-added feeds can be toggled.",
+        )
+
+    uf.enabled = not uf.enabled
+    db.commit()
+    db.refresh(uf)
+
+    return {
+        "id": uf.id,
+        "name": uf.name,
+        "url": uf.url,
+        "region": uf.region,
+        "lang": uf.lang,
+        "enabled": uf.enabled,
+        "source": "user",
+        "added_at": uf.added_at.isoformat() if uf.added_at else None,
+    }
+
+
 # ===========================================================================
 # DASHBOARD ENDPOINTS (read-only)
 # ===========================================================================
@@ -576,21 +866,51 @@ def dashboard_overview(db: Session = Depends(_get_db)):
     """High-level stats for the dashboard landing page."""
     total_articles = db.query(func.count(Article.id)).scalar() or 0
     total_briefs = db.query(func.count(ArticleBrief.id)).scalar() or 0
-    active_runups = (
-        db.query(func.count(RunUp.id)).filter(RunUp.status == "active").scalar() or 0
+
+    # Active run-ups — exclude merged ones (only show consolidated topics)
+    active_runup_rows = (
+        db.query(RunUp)
+        .filter(RunUp.status == "active", RunUp.merged_into_id.is_(None))
+        .order_by(desc(RunUp.current_score))
+        .all()
     )
-    open_nodes = (
-        db.query(func.count(DecisionNode.id))
-        .filter(DecisionNode.status == "open")
-        .scalar()
-        or 0
-    )
-    pending_predictions = (
-        db.query(func.count(Prediction.id))
-        .filter(Prediction.outcome == "pending")
-        .scalar()
-        or 0
-    )
+
+    # Enrich run-ups with root decision node info
+    runups_out = []
+    for ru in active_runup_rows:
+        rd = _runup_to_dict(ru)
+        # Find root decision node for this run-up
+        root_node = (
+            db.query(DecisionNode)
+            .filter(DecisionNode.run_up_id == ru.id, DecisionNode.depth == 0)
+            .first()
+        )
+        if root_node:
+            rd["root_question"] = root_node.question
+            rd["root_probability"] = round((root_node.yes_probability or 0.5) * 100, 1)
+        else:
+            rd["root_question"] = ""
+            rd["root_probability"] = 0
+        # Days active
+        if ru.start_date:
+            rd["days_active"] = (date.today() - ru.start_date).days
+        else:
+            rd["days_active"] = 0
+        rd["name"] = ru.narrative_name
+        rd["narrative"] = ru.narrative_name
+        rd["score"] = ru.current_score
+        rd["article_count"] = ru.article_count_total
+        rd["active"] = ru.status == "active"
+        runups_out.append(rd)
+
+    # Prediction scoreboard stats
+    predictions = db.query(Prediction).all()
+    total_preds = len(predictions)
+    verified = [p for p in predictions if p.outcome != "pending"]
+    correct = sum(1 for p in verified if p.outcome == "correct")
+    incorrect = sum(1 for p in verified if p.outcome == "incorrect")
+    partial = sum(1 for p in verified if p.outcome == "partial")
+    accuracy = (correct + partial * 0.5) / len(verified) * 100 if verified else 0.0
 
     # Recent intensity distribution
     cutoff = datetime.utcnow() - timedelta(hours=24)
@@ -605,11 +925,26 @@ def dashboard_overview(db: Session = Depends(_get_db)):
             intensity_dist[b.intensity] += 1
 
     return {
+        "runups": runups_out,
+        "stats": {
+            "predictions": total_preds,
+            "correct": correct,
+            "incorrect": incorrect,
+            "partial": partial,
+            "accuracy": round(accuracy, 1),
+            "recent_outcomes": [
+                {
+                    "description": p.prediction_text,
+                    "probability": round((p.confidence or 0) * 100, 1),
+                    "outcome": p.outcome,
+                    "date": p.verified_at.isoformat() if p.verified_at else (p.created_at.isoformat() if p.created_at else None),
+                }
+                for p in sorted(predictions, key=lambda x: x.created_at or datetime.min, reverse=True)[:10]
+            ],
+        },
         "total_articles": total_articles,
         "total_briefs": total_briefs,
-        "active_runups": active_runups,
-        "open_decision_nodes": open_nodes,
-        "pending_predictions": pending_predictions,
+        "active_runups": len(active_runup_rows),
         "last_24h_briefs": len(recent_briefs),
         "intensity_distribution": intensity_dist,
     }
@@ -742,9 +1077,11 @@ def get_status(db: Session = Depends(_get_db)):
 
     return {
         "status": "ok" if db_ok else "degraded",
+        "engine": "running" if db_ok else "stopped",
         "engine_port": config.engine_port,
         "database": config.database_uri,
         "feeds_configured": len(config.feeds),
+        "feeds": len(config.feeds),
         "total_articles": article_count,
         "total_briefs": brief_count,
         "fetch_interval_minutes": config.fetch_interval_minutes,

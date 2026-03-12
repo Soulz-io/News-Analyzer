@@ -1,6 +1,7 @@
 {
   "id": "openclaw-news-analyzer",
   "name": "News Analyzer",
+  "category": "monitoring",
   "description": "AI newsroom: detects narrative run-ups, builds game theory decision trees, predicts events from global news",
   "configSchema": {
     "type": "object",

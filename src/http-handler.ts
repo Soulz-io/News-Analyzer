@@ -48,6 +48,9 @@ export function createHttpHandler(params: HttpHandlerParams) {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     const pathname = url.pathname;
 
+    // ── Only handle our plugin prefix ────────────────────────
+    if (!pathname.startsWith(PREFIX)) return false;
+
     // ── API proxy: forward to Python engine ──────────────────
     if (pathname.startsWith(API_PREFIX)) {
       const enginePath = "/api/" + pathname.slice(API_PREFIX.length);

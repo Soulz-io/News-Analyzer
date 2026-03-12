@@ -135,14 +135,14 @@ class RSSFetcher:
     # All-feed fetch
     # ------------------------------------------------------------------
     async def fetch_all_feeds(self) -> List[Dict]:
-        """Fetch every feed listed in the configuration concurrently.
+        """Fetch every active feed (default + user) concurrently.
 
         Returns
         -------
         list[dict]
             All raw article dicts from every feed (before dedup).
         """
-        feeds = config.feeds
+        feeds = config.get_all_active_feeds()
         if not feeds:
             logger.warning("No feeds configured -- nothing to fetch.")
             return []

@@ -6,6 +6,7 @@ Responsibilities:
   - Detect narratives whose score exceeds a threshold and manage RunUp records.
 """
 
+import json
 import logging
 from collections import defaultdict
 from datetime import datetime, date, timedelta
@@ -38,16 +39,40 @@ RECENT_DAYS = 2
 # Narrative naming
 # ---------------------------------------------------------------------------
 
-def _narrative_name_for_cluster(cluster_id: Optional[int], briefs: List[ArticleBrief]) -> str:
+def _narrative_name_for_cluster(
+    cluster_id: Optional[int],
+    briefs: List[ArticleBrief],
+    pseudo_key: Optional[str] = None,
+) -> str:
     """Derive a human-readable narrative name from a cluster's briefs.
 
     Uses the most frequent keyword across the cluster.  Falls back to
     ``cluster_<id>`` when no keywords are available.
+
+    If *pseudo_key* is provided (e.g. ``"middle-east-military"``), it is
+    used directly as the narrative name -- this supports the keyword-based
+    grouping for unclustered briefs.
     """
+    if pseudo_key is not None:
+        return pseudo_key
+
     if cluster_id is None:
+        # Attempt to build a name from keywords even for unclustered briefs
+        keyword_freq: Dict[str, int] = defaultdict(int)
+        for b in briefs:
+            try:
+                import json
+                kws = json.loads(b.keywords_json) if b.keywords_json else []
+            except Exception:
+                kws = []
+            for kw in kws:
+                keyword_freq[kw.lower()] = keyword_freq.get(kw.lower(), 0) + 1
+        if keyword_freq:
+            top_kw = max(keyword_freq, key=keyword_freq.get)  # type: ignore[arg-type]
+            return top_kw.replace(" ", "-")
         return "unclustered"
 
-    keyword_freq: Dict[str, int] = defaultdict(int)
+    keyword_freq = defaultdict(int)
     for b in briefs:
         try:
             import json
@@ -68,8 +93,80 @@ def _narrative_name_for_cluster(cluster_id: Optional[int], briefs: List[ArticleB
 # Timeline updates
 # ---------------------------------------------------------------------------
 
+def _get_brief_keywords(brief: ArticleBrief) -> List[str]:
+    """Extract keywords from a brief's keywords_json field."""
+    try:
+        kws = json.loads(brief.keywords_json) if brief.keywords_json else []
+        return [str(kw).lower().strip() for kw in kws] if isinstance(kws, list) else []
+    except Exception:
+        return []
+
+
+def _group_unclustered_by_region_keyword(
+    unclustered_briefs: List[ArticleBrief],
+) -> Dict[str, List[ArticleBrief]]:
+    """Group unclustered briefs into pseudo-clusters by region + shared keyword.
+
+    Strategy:
+      1. Bucket briefs by region.
+      2. Within each region, find the most frequent keyword across all briefs.
+      3. For each brief, create a key = ``"{region}-{top_keyword}"`` using
+         the top keyword from the brief's own keywords that overlaps with
+         the region's keyword pool.
+      4. Merge small groups (< 3 articles) into ``"{region}-general"``.
+
+    Returns a dict mapping pseudo-cluster key -> list of briefs.
+    """
+    # Step 1: Bucket by region
+    region_buckets: Dict[str, List[ArticleBrief]] = defaultdict(list)
+    for b in unclustered_briefs:
+        region = (b.region or "unknown").lower().strip()
+        region_buckets[region].append(b)
+
+    pseudo_clusters: Dict[str, List[ArticleBrief]] = defaultdict(list)
+
+    for region, region_briefs in region_buckets.items():
+        # Step 2: Count keyword frequencies across all briefs in this region
+        region_kw_freq: Dict[str, int] = defaultdict(int)
+        brief_kw_map: Dict[int, List[str]] = {}  # brief.id -> keywords
+        for b in region_briefs:
+            kws = _get_brief_keywords(b)[:3]  # top 3 keywords per brief
+            brief_kw_map[b.id] = kws
+            for kw in kws:
+                region_kw_freq[kw] += 1
+
+        # Step 3: Assign each brief to a pseudo-cluster key
+        for b in region_briefs:
+            kws = brief_kw_map.get(b.id, [])
+            if kws:
+                # Pick the keyword from this brief that is most frequent
+                # in the region overall
+                best_kw = max(kws, key=lambda k: region_kw_freq.get(k, 0))
+                key = f"{region}-{best_kw.replace(' ', '-')}"
+            else:
+                key = f"{region}-general"
+            pseudo_clusters[key].append(b)
+
+        # Step 4: Merge small groups (< 3 articles) into "{region}-general"
+        general_key = f"{region}-general"
+        small_keys = [
+            k for k, v in pseudo_clusters.items()
+            if k.startswith(f"{region}-") and k != general_key and len(v) < 3
+        ]
+        for k in small_keys:
+            pseudo_clusters[general_key].extend(pseudo_clusters.pop(k))
+
+    return dict(pseudo_clusters)
+
+
 def update_narratives(briefs: List[ArticleBrief]) -> List[NarrativeTimeline]:
     """Group *briefs* by topic cluster and upsert NarrativeTimeline rows.
+
+    When briefs have ``topic_cluster_id = None`` (e.g. BERTopic is not
+    installed), they are grouped by **region + top keyword** instead of
+    being lumped into one ``"unclustered"`` narrative.  This produces
+    meaningful pseudo-clusters such as ``"middle-east-military"``,
+    ``"europe-sanctions"``, ``"east-asia-trade"``, etc.
 
     Each call appends/updates a row for today per narrative.
 
@@ -80,18 +177,45 @@ def update_narratives(briefs: List[ArticleBrief]) -> List[NarrativeTimeline]:
 
     today = date.today()
 
-    # Group briefs by topic_cluster_id
-    clusters: Dict[Optional[int], List[ArticleBrief]] = defaultdict(list)
-    for b in briefs:
-        clusters[b.topic_cluster_id].append(b)
+    # ---- Step 1: Separate clustered and unclustered briefs ----
+    clustered_briefs: Dict[int, List[ArticleBrief]] = defaultdict(list)
+    unclustered_briefs: List[ArticleBrief] = []
 
+    for b in briefs:
+        if b.topic_cluster_id is not None:
+            clustered_briefs[b.topic_cluster_id].append(b)
+        else:
+            unclustered_briefs.append(b)
+
+    # ---- Step 2: Build a unified work-list of (name, cluster_id, briefs) ----
+    #  Each entry is (narrative_name, topic_cluster_id, list_of_briefs)
+    work_items: List[Tuple[str, Optional[int], List[ArticleBrief]]] = []
+
+    # Clustered briefs: use existing logic (group by topic_cluster_id)
+    for cluster_id, cluster_briefs in clustered_briefs.items():
+        name = _narrative_name_for_cluster(cluster_id, cluster_briefs)
+        work_items.append((name, cluster_id, cluster_briefs))
+
+    # Unclustered briefs: group by region + top keyword
+    if unclustered_briefs:
+        pseudo_clusters = _group_unclustered_by_region_keyword(unclustered_briefs)
+        for pseudo_key, pseudo_briefs in pseudo_clusters.items():
+            name = _narrative_name_for_cluster(
+                None, pseudo_briefs, pseudo_key=pseudo_key,
+            )
+            work_items.append((name, None, pseudo_briefs))
+        logger.info(
+            "Grouped %d unclustered briefs into %d pseudo-clusters by region+keyword.",
+            len(unclustered_briefs),
+            len(pseudo_clusters),
+        )
+
+    # ---- Step 3: Upsert NarrativeTimeline rows ----
     session = get_session()
     updated: List[NarrativeTimeline] = []
 
     try:
-        for cluster_id, cluster_briefs in clusters.items():
-            narrative_name = _narrative_name_for_cluster(cluster_id, cluster_briefs)
-
+        for narrative_name, cluster_id, cluster_briefs in work_items:
             article_count = len(cluster_briefs)
             sources = {b.article.source for b in cluster_briefs if b.article}
             regions = {b.region for b in cluster_briefs}
@@ -335,15 +459,19 @@ def detect_runups(threshold: Optional[float] = None) -> List[RunUp]:
             if score < threshold:
                 continue
 
-            # Check for existing active RunUp
+            # Check for existing RunUp (active OR merged — don't recreate merged ones)
             existing: Optional[RunUp] = (
                 session.query(RunUp)
                 .filter(
                     RunUp.narrative_name == name,
-                    RunUp.status == "active",
+                    RunUp.status.in_(["active", "merged"]),
                 )
                 .first()
             )
+
+            # If already merged into another run-up, skip — the primary handles it
+            if existing and existing.status == "merged":
+                continue
 
             # Total article count for this narrative
             total_articles = (
@@ -353,7 +481,7 @@ def detect_runups(threshold: Optional[float] = None) -> List[RunUp]:
             ) or 0
 
             if existing:
-                # Update
+                # Update existing active run-up
                 prev_score = existing.current_score
                 existing.current_score = score
                 existing.acceleration_rate = round(score - prev_score, 2)
@@ -399,6 +527,170 @@ def detect_runups(threshold: Optional[float] = None) -> List[RunUp]:
 
     except Exception:
         logger.exception("Run-up detection failed.")
+        session.rollback()
+        return []
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Run-up consolidation
+# ---------------------------------------------------------------------------
+
+def _runup_keywords(narrative_name: str, session: Session) -> set:
+    """Collect all keywords associated with a narrative's briefs."""
+    rows = (
+        session.query(NarrativeTimeline)
+        .filter(NarrativeTimeline.narrative_name == narrative_name)
+        .all()
+    )
+    # Get all brief keywords for articles tracked under this narrative
+    from .db import ArticleBrief, Article
+    keywords: set = set()
+    briefs = (
+        session.query(ArticleBrief)
+        .join(Article)
+        .filter(
+            ArticleBrief.region.isnot(None),
+        )
+        .all()
+    )
+    # Match briefs to this narrative by checking if the narrative_name
+    # appears in the brief's region+keyword combo
+    parts = narrative_name.lower().split("-")
+    region_part = parts[0] if parts else ""
+    kw_parts = set(parts[1:]) if len(parts) > 1 else set()
+
+    for b in briefs:
+        b_region = (b.region or "").lower().strip()
+        if b_region != region_part and region_part not in b_region:
+            continue
+        b_kws = set(_get_brief_keywords(b))
+        if kw_parts and not kw_parts.intersection(b_kws):
+            continue
+        keywords.update(b_kws)
+    return keywords
+
+
+def _keyword_overlap(kws_a: set, kws_b: set) -> float:
+    """Return Jaccard-like overlap ratio between two keyword sets."""
+    if not kws_a or not kws_b:
+        return 0.0
+    intersection = kws_a & kws_b
+    smaller = min(len(kws_a), len(kws_b))
+    return len(intersection) / smaller if smaller else 0.0
+
+
+def _extract_region(narrative_name: str) -> str:
+    """Extract the region prefix from a narrative name like 'middle-east-iran'."""
+    # Known multi-word regions
+    known_regions = [
+        "middle-east", "east-asia", "south-asia", "southeast-asia",
+        "central-asia", "sub-saharan-africa", "north-africa", "latin-america",
+        "north-america", "eastern-europe", "western-europe",
+    ]
+    name_lower = narrative_name.lower()
+    for r in known_regions:
+        if name_lower.startswith(r):
+            return r
+    # Single-word region
+    return name_lower.split("-")[0] if "-" in name_lower else name_lower
+
+
+def consolidate_runups() -> List[RunUp]:
+    """Merge overlapping active run-ups into consolidated topics.
+
+    Run-ups with the same region AND ≥40% keyword overlap are merged.
+    The highest-scoring run-up becomes the primary; others get
+    ``status='merged'`` and ``merged_into_id`` set.
+
+    Returns the list of primary (non-merged) active run-ups.
+    """
+    session = get_session()
+    try:
+        active = (
+            session.query(RunUp)
+            .filter(RunUp.status == "active")
+            .order_by(RunUp.current_score.desc())
+            .all()
+        )
+
+        if len(active) <= 1:
+            return active
+
+        # Gather keywords per run-up
+        ru_keywords: Dict[int, set] = {}
+        ru_regions: Dict[int, str] = {}
+        for ru in active:
+            ru_keywords[ru.id] = _runup_keywords(ru.narrative_name, session)
+            ru_regions[ru.id] = _extract_region(ru.narrative_name)
+
+        # Build merge groups using union-find
+        parent: Dict[int, int] = {ru.id: ru.id for ru in active}
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        # Compare all pairs — same region + keyword overlap ≥ 40%
+        OVERLAP_THRESHOLD = 0.40
+        for i, ru_a in enumerate(active):
+            for ru_b in active[i + 1:]:
+                if ru_regions[ru_a.id] != ru_regions[ru_b.id]:
+                    continue
+                overlap = _keyword_overlap(
+                    ru_keywords[ru_a.id], ru_keywords[ru_b.id]
+                )
+                if overlap >= OVERLAP_THRESHOLD:
+                    union(ru_a.id, ru_b.id)
+
+        # Group by root
+        groups: Dict[int, List[RunUp]] = defaultdict(list)
+        for ru in active:
+            groups[find(ru.id)].append(ru)
+
+        primaries: List[RunUp] = []
+        merged_count = 0
+
+        for root_id, members in groups.items():
+            # Sort by score desc — first is primary
+            members.sort(key=lambda r: r.current_score, reverse=True)
+            primary = members[0]
+
+            # Aggregate article counts from merged members
+            total_articles = sum(m.article_count_total for m in members)
+            primary.article_count_total = total_articles
+
+            # Take the best score
+            best_score = max(m.current_score for m in members)
+            primary.current_score = best_score
+
+            primaries.append(primary)
+
+            # Merge the rest
+            for child in members[1:]:
+                child.status = "merged"
+                child.merged_into_id = primary.id
+                merged_count += 1
+
+        session.commit()
+        logger.info(
+            "Consolidation: %d active run-ups → %d topics (%d merged).",
+            len(active),
+            len(primaries),
+            merged_count,
+        )
+        return primaries
+
+    except Exception:
+        logger.exception("Run-up consolidation failed.")
         session.rollback()
         return []
     finally:

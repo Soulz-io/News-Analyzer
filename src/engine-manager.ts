@@ -213,17 +213,21 @@ export class EngineManager {
 
     const args = [
       "-m", "uvicorn",
-      "engine:app",
+      "engine.engine:app",
       "--host", "127.0.0.1",
       "--port", String(this.enginePort),
     ];
 
+    // Run from the plugin root (parent of engine/) so Python
+    // resolves `engine.engine` as a proper package with relative imports.
+    const pluginRoot = path.dirname(this.engineRoot);
+
     this.logger?.info?.(
-      `[engine-manager] Spawning: ${this.venvPython} ${args.join(" ")}`,
+      `[engine-manager] Spawning: ${this.venvPython} ${args.join(" ")} (cwd: ${pluginRoot})`,
     );
 
     this.process = spawn(this.venvPython, args, {
-      cwd: this.engineRoot,
+      cwd: pluginRoot,
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,

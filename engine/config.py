@@ -63,6 +63,16 @@ class EngineConfig:
             os.getenv("SIGNIFICANT_SHIFT_THRESHOLD", "0.10")
         )
 
+        # Tree generator (Claude API)
+        # Try .env file first, then environment variable
+        self._anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
+        self.tree_generator_model: str = os.getenv(
+            "TREE_GENERATOR_MODEL", "claude-haiku-4-5-20251001"
+        )
+        self.max_trees_per_cycle: int = int(
+            os.getenv("MAX_TREES_PER_CYCLE", "5")
+        )
+
         # Logging
         self.log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -104,6 +114,94 @@ class EngineConfig:
         except Exception:
             logger.exception("Failed to load feeds from %s", feeds_path)
             return []
+
+    # ------------------------------------------------------------------
+    # Combined feed list (default + user)
+    # ------------------------------------------------------------------
+    def get_all_active_feeds(self) -> List[Dict]:
+        """Return all active feeds: defaults from YAML plus enabled user feeds
+        from the database.
+
+        This performs a late import of ``db`` to avoid circular-import issues
+        (since ``db.py`` imports ``config``).
+        """
+        # Start with all default feeds (always considered active)
+        combined: List[Dict] = list(self.feeds)
+
+        # Add enabled user feeds from the database
+        try:
+            from .db import get_session, UserFeed
+
+            session = get_session()
+            try:
+                user_feeds = (
+                    session.query(UserFeed)
+                    .filter(UserFeed.enabled == True)
+                    .all()
+                )
+                for uf in user_feeds:
+                    combined.append({
+                        "name": uf.name,
+                        "url": uf.url,
+                        "region": uf.region or "global",
+                        "lang": uf.lang or "en",
+                    })
+                logger.info(
+                    "Combined feeds: %d default + %d user = %d total",
+                    len(self.feeds),
+                    len(user_feeds),
+                    len(combined),
+                )
+            finally:
+                session.close()
+        except Exception:
+            logger.exception(
+                "Failed to load user feeds from DB -- returning defaults only."
+            )
+
+        return combined
+
+    # ------------------------------------------------------------------
+    # Anthropic API key (from env, .env file, or DB settings)
+    # ------------------------------------------------------------------
+    @property
+    def anthropic_api_key(self) -> str:
+        """Return API key from env → DB settings → empty."""
+        if self._anthropic_api_key:
+            return self._anthropic_api_key
+        # Try loading from DB settings
+        try:
+            from .db import get_session, EngineSettings
+            session = get_session()
+            try:
+                setting = session.query(EngineSettings).get("anthropic_api_key")
+                if setting and setting.value:
+                    return setting.value
+            finally:
+                session.close()
+        except Exception:
+            pass
+        return ""
+
+    @anthropic_api_key.setter
+    def anthropic_api_key(self, value: str) -> None:
+        """Store API key in DB settings for persistence."""
+        self._anthropic_api_key = value
+        try:
+            from .db import get_session, EngineSettings
+            session = get_session()
+            try:
+                setting = session.query(EngineSettings).get("anthropic_api_key")
+                if setting:
+                    setting.value = value
+                else:
+                    setting = EngineSettings(key="anthropic_api_key", value=value)
+                    session.add(setting)
+                session.commit()
+            finally:
+                session.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Helpers

@@ -2,6 +2,7 @@ node_modules/
 control-ui-patched/
 engine/venv/
 engine/*.db
+engine/data/
 engine/__pycache__/
 engine/**/__pycache__/
 .env

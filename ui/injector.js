@@ -1,33 +1,132 @@
 /**
  * News Analyzer Dashboard — Tab Injector for OpenClaw Control UI
  *
- * Injects a "News Analyzer" tab into the Control UI sidebar (Shadow DOM).
- * Detects if a "Monitoring" nav-group already exists (e.g. from the subagents
- * plugin) and appends to it rather than creating a duplicate group.
- *
- * Uses MutationObserver on childList only (NO attributes) to avoid
- * infinite mutation loops that freeze the page.
+ * Injects a "News Analyzer" tab into the "Apps" nav-group in the
+ * Control UI sidebar (Shadow DOM). Uses the shared coordinator
+ * (window.__ocPluginTabs__) for cross-plugin tab coordination.
  */
 (function () {
   "use strict";
 
+  const PLUGIN_ID = "news-analyzer";
   const PLUGIN_URL = "/plugins/openclaw-news-analyzer/";
   const TAB_HASH = "#/news-analyzer";
   const INJECT_ATTR = "data-news-analyzer-dash";
+  const TAB_ATTR = "data-news-analyzer-tab";
 
   /* Newspaper / chart icon */
   const ICON_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2Zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2"/><path d="M18 14h-8"/><path d="M15 18h-5"/><path d="M10 6h8v4h-8z"/></svg>`;
 
-  let active = false;
   let iframeBox = null;
-  let mutationPending = false;
   let _root = null;
+  let mutationPending = false;
+
+  /* ── Shared coordinator ────────────────────────────────────── */
+
+  function ensureCoordinator(root) {
+    if (window.__ocPluginTabs__ && window.__ocPluginTabs__._v === 1) {
+      if (root && !window.__ocPluginTabs__._root) {
+        window.__ocPluginTabs__._root = root;
+      }
+      return window.__ocPluginTabs__;
+    }
+
+    const coord = {
+      _v: 1,
+      _plugins: {},
+      _activeId: null,
+      _setTabWrapped: false,
+      _popstateAttached: false,
+      _root: root || null,
+
+      register(id, opts) {
+        this._plugins[id] = opts;
+      },
+
+      activate(id) {
+        if (this._activeId === id) return;
+        if (!this._plugins[id]) return;
+        if (this._activeId && this._plugins[this._activeId]) {
+          this._plugins[this._activeId].deactivate();
+        }
+        this._restoreMainContent();
+        this._hideMainContent(this._plugins[id].injectAttr);
+        this._activeId = id;
+        this._plugins[id].activate();
+        const hash = this._plugins[id].hash;
+        if (location.hash !== hash) history.pushState(null, "", hash);
+      },
+
+      deactivateAll() {
+        if (!this._activeId) return;
+        if (this._plugins[this._activeId]) {
+          this._plugins[this._activeId].deactivate();
+        }
+        this._activeId = null;
+        this._restoreMainContent();
+      },
+
+      getActive() { return this._activeId; },
+
+      _hideMainContent(injectAttr) {
+        const r = this._root; if (!r) return;
+        const main = r.querySelector("main.content, main, .content");
+        if (!main) return;
+        for (const ch of main.children) {
+          if (ch.hasAttribute("data-oc-plugin-iframe")) {
+            ch.style.display = ch.getAttribute(injectAttr) === "iframe" ? "block" : "none";
+          } else {
+            if (ch.dataset._ocPrev === undefined) ch.dataset._ocPrev = ch.style.display;
+            ch.style.display = "none";
+          }
+        }
+      },
+
+      _restoreMainContent() {
+        const r = this._root; if (!r) return;
+        const main = r.querySelector("main.content, main, .content");
+        if (!main) return;
+        for (const ch of main.children) {
+          if (ch.hasAttribute("data-oc-plugin-iframe")) {
+            ch.style.display = "none";
+          } else if (ch.dataset._ocPrev !== undefined) {
+            ch.style.display = ch.dataset._ocPrev;
+            delete ch.dataset._ocPrev;
+          }
+        }
+      },
+
+      _wrapSetTab(app) {
+        if (this._setTabWrapped) return;
+        if (typeof app.setTab !== "function") return;
+        this._setTabWrapped = true;
+        const c = this;
+        const orig = app.setTab.bind(app);
+        app.setTab = function (t) { c.deactivateAll(); return orig(t); };
+      },
+
+      _attachPopstate() {
+        if (this._popstateAttached) return;
+        this._popstateAttached = true;
+        const c = this;
+        window.addEventListener("popstate", () => {
+          const hash = location.hash;
+          let matched = false;
+          for (const [id, opts] of Object.entries(c._plugins)) {
+            if (opts.hash === hash) { c.activate(id); matched = true; break; }
+          }
+          if (!matched && c._activeId) c.deactivateAll();
+        });
+      },
+    };
+
+    window.__ocPluginTabs__ = coord;
+    return coord;
+  }
 
   /* ── Helpers ────────────────────────────────────────────────── */
 
-  function getRoot(app) {
-    return app.shadowRoot || app;
-  }
+  function getRoot(app) { return app.shadowRoot || app; }
 
   function waitForApp(cb) {
     let n = 0;
@@ -45,55 +144,47 @@
 
   /* ── Tab injection ─────────────────────────────────────────── */
 
-  function injectTab(nav) {
-    // Already injected?
+  function injectTab(nav, coord) {
     if (nav.querySelector(`[${INJECT_ATTR}]`)) return;
 
-    // Check if a "Monitoring" nav-group already exists (e.g. from subagents plugin)
-    let monitoringGroup = null;
-    const existingGroups = nav.querySelectorAll(".nav-group");
-    for (const grp of existingGroups) {
-      const labelText = grp.querySelector(".nav-label__text");
-      if (labelText && labelText.textContent.trim() === "Monitoring") {
-        monitoringGroup = grp;
-        break;
-      }
+    // Look for existing "Apps" nav-group
+    let appsGroup = null;
+    for (const grp of nav.querySelectorAll(".nav-group")) {
+      const lt = grp.querySelector(".nav-label__text");
+      if (lt && lt.textContent.trim() === "Apps") { appsGroup = grp; break; }
     }
 
-    if (monitoringGroup) {
-      // Append our tab into the existing Monitoring group
-      const itemsContainer = monitoringGroup.querySelector(".nav-group__items");
-      if (itemsContainer) {
+    if (appsGroup) {
+      const items = appsGroup.querySelector(".nav-group__items");
+      if (items) {
         const link = document.createElement("a");
         link.href = TAB_HASH;
         link.className = "nav-item";
         link.title = "News Analyzer Dashboard";
-        link.setAttribute("data-news-analyzer-tab", "");
+        link.setAttribute(TAB_ATTR, "");
         link.setAttribute(INJECT_ATTR, "");
         link.innerHTML = `
           <span class="nav-item__icon" aria-hidden="true">${ICON_SVG}</span>
           <span class="nav-item__text">News Analyzer</span>`;
-        itemsContainer.appendChild(link);
-
+        items.appendChild(link);
         link.addEventListener("click", (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          activate();
+          e.preventDefault(); e.stopPropagation();
+          coord.activate(PLUGIN_ID);
         });
       }
     } else {
-      // Create a new Monitoring nav-group
+      // Fallback: create "Apps" nav-group
       const group = document.createElement("div");
       group.className = "nav-group";
       group.setAttribute(INJECT_ATTR, "");
       group.innerHTML = `
         <button class="nav-label" aria-expanded="true">
-          <span class="nav-label__text">Monitoring</span>
+          <span class="nav-label__text">Apps</span>
           <span class="nav-label__chevron">\u2212</span>
         </button>
         <div class="nav-group__items">
           <a href="${TAB_HASH}" class="nav-item" title="News Analyzer Dashboard"
-             data-news-analyzer-tab ${INJECT_ATTR}>
+             ${TAB_ATTR} ${INJECT_ATTR}>
             <span class="nav-item__icon" aria-hidden="true">${ICON_SVG}</span>
             <span class="nav-item__text">News Analyzer</span>
           </a>
@@ -103,7 +194,6 @@
       if (links) nav.insertBefore(group, links);
       else nav.appendChild(group);
 
-      // Collapse toggle
       const label = group.querySelector(".nav-label");
       const chevron = group.querySelector(".nav-label__chevron");
       const items = group.querySelector(".nav-group__items");
@@ -114,11 +204,9 @@
         chevron.textContent = collapsed ? "\u2212" : "+";
       });
 
-      // Tab click
-      group.querySelector("[data-news-analyzer-tab]").addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        activate();
+      group.querySelector(`[${TAB_ATTR}]`).addEventListener("click", (e) => {
+        e.preventDefault(); e.stopPropagation();
+        coord.activate(PLUGIN_ID);
       });
     }
   }
@@ -132,6 +220,7 @@
 
     iframeBox = document.createElement("div");
     iframeBox.setAttribute(INJECT_ATTR, "iframe");
+    iframeBox.setAttribute("data-oc-plugin-iframe", "");
     iframeBox.style.cssText =
       "display:none;position:absolute;inset:0;z-index:50;background:var(--bg,#12141a);";
 
@@ -148,46 +237,22 @@
     main.appendChild(iframeBox);
   }
 
-  /* ── Activate / Deactivate ─────────────────────────────────── */
+  /* ── Plugin-local activate / deactivate ────────────────────── */
 
-  function activate() {
-    if (active || !_root) return;
-    active = true;
+  function activateSelf() {
     ensureIframe();
-
-    const main = _root.querySelector("main.content, main, .content");
-    if (main) {
-      for (const ch of main.children) {
-        if (ch.getAttribute(INJECT_ATTR) === "iframe") ch.style.display = "block";
-        else { ch.dataset._naPrev = ch.style.display; ch.style.display = "none"; }
-      }
-    }
-
-    const nav = _root.querySelector("aside.nav, aside, .nav");
+    if (iframeBox) iframeBox.style.display = "block";
+    const nav = _root && _root.querySelector("aside.nav, aside, .nav");
     if (nav) {
       nav.querySelectorAll(".nav-item").forEach((el) => {
-        if (el.hasAttribute(INJECT_ATTR)) el.classList.add("active");
-        else el.classList.remove("active");
+        el.classList.toggle("active", el.hasAttribute(TAB_ATTR));
       });
     }
-    history.pushState(null, "", TAB_HASH);
   }
 
-  function deactivate() {
-    if (!active || !_root) return;
-    active = false;
+  function deactivateSelf() {
     if (iframeBox) iframeBox.style.display = "none";
-
-    const main = _root.querySelector("main.content, main, .content");
-    if (main) {
-      for (const ch of main.children) {
-        if (ch.getAttribute(INJECT_ATTR) !== "iframe" && ch.dataset._naPrev !== undefined) {
-          ch.style.display = ch.dataset._naPrev;
-          delete ch.dataset._naPrev;
-        }
-      }
-    }
-    const tab = _root.querySelector("[data-news-analyzer-tab]");
+    const tab = _root && _root.querySelector(`[${TAB_ATTR}]`);
     if (tab) tab.classList.remove("active");
   }
 
@@ -195,48 +260,43 @@
 
   waitForApp(function (app, root, nav) {
     _root = root;
-    injectTab(nav);
+    const coord = ensureCoordinator(root);
 
-    // Observe nav only, childList only — no attributes to avoid infinite loops
+    coord.register(PLUGIN_ID, {
+      activate: activateSelf,
+      deactivate: deactivateSelf,
+      hash: TAB_HASH,
+      injectAttr: INJECT_ATTR,
+    });
+
+    injectTab(nav, coord);
+
     const observer = new MutationObserver(() => {
       if (mutationPending) return;
       mutationPending = true;
       requestAnimationFrame(() => {
         mutationPending = false;
         const cur = root.querySelector("aside.nav, aside, .nav");
-        if (!cur) return;
-        if (!cur.querySelector(`[${INJECT_ATTR}]`)) injectTab(cur);
-        if (active) {
-          const other = cur.querySelector(".nav-item.active:not([data-news-analyzer-tab])");
-          if (other) deactivate();
-        }
+        if (cur && !cur.querySelector(`[${INJECT_ATTR}]`)) injectTab(cur, coord);
       });
     });
     observer.observe(nav, { childList: true, subtree: true });
 
-    // Watch for nav replacement by Lit
     const navParent = nav.parentElement;
     if (navParent) {
       new MutationObserver(() => {
         const newNav = root.querySelector("aside.nav, aside, .nav");
         if (newNav && !newNav.querySelector(`[${INJECT_ATTR}]`)) {
-          injectTab(newNav);
+          injectTab(newNav, coord);
           observer.disconnect();
           observer.observe(newNav, { childList: true, subtree: true });
         }
       }).observe(navParent, { childList: true });
     }
 
-    if (typeof app.setTab === "function") {
-      const orig = app.setTab.bind(app);
-      app.setTab = function (t) { deactivate(); return orig(t); };
-    }
+    coord._wrapSetTab(app);
+    coord._attachPopstate();
 
-    window.addEventListener("popstate", () => {
-      if (location.hash === TAB_HASH) activate();
-      else if (active) deactivate();
-    });
-
-    if (location.hash === TAB_HASH) setTimeout(activate, 150);
+    if (location.hash === TAB_HASH) setTimeout(() => coord.activate(PLUGIN_ID), 150);
   });
 })();

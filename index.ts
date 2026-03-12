@@ -57,7 +57,10 @@ const plugin = {
     registerGatewayMethods(api, enginePort);
 
     // ── Patch Control UI to inject the News Analyzer tab ───────
-    setupControlUiPatch({ logger: api.logger });
+    setupControlUiPatch({
+      logger: api.logger,
+      config: api.config as Record<string, any>,
+    });
 
     // ── Start the Newsroom orchestrator ────────────────────────
     const newsroom = new Newsroom({

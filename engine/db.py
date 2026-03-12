@@ -11,6 +11,7 @@ from typing import Optional, List, Any
 
 from sqlalchemy import (
     create_engine,
+    Boolean,
     Column,
     Integer,
     Float,
@@ -79,6 +80,23 @@ class Article(Base):
 
     def __repr__(self) -> str:
         return f"<Article id={self.id} source={self.source!r} title={self.title[:50]!r}>"
+
+
+class UserFeed(Base):
+    """A user-added custom RSS feed."""
+
+    __tablename__ = "user_feeds"
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    name: str = Column(String, nullable=False)
+    url: str = Column(String, nullable=False, unique=True)
+    region: str = Column(String, default="global")
+    lang: str = Column(String, default="en")
+    enabled: bool = Column(Boolean, default=True)
+    added_at: datetime = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<UserFeed id={self.id} name={self.name!r} url={self.url!r} enabled={self.enabled}>"
 
 
 class ArticleBrief(Base):
@@ -166,10 +184,20 @@ class RunUp(Base):
     acceleration_rate: float = Column(Float, nullable=False, default=0.0)
     article_count_total: int = Column(Integer, nullable=False, default=0)
     status: str = Column(String(32), nullable=False, default="active")
+    # When merged into another run-up, points to the primary
+    merged_into_id: Optional[int] = Column(
+        Integer, ForeignKey("run_ups.id"), nullable=True
+    )
 
     # Relationships
     decision_nodes = relationship("DecisionNode", back_populates="run_up")
     predictions = relationship("Prediction", back_populates="run_up")
+    merged_children = relationship(
+        "RunUp",
+        backref="merged_into",
+        remote_side="RunUp.id",
+        foreign_keys="RunUp.merged_into_id",
+    )
 
     def __repr__(self) -> str:
         return (
@@ -336,6 +364,41 @@ class Prediction(Base):
             f"<Prediction id={self.id} run_up={self.run_up_id} "
             f"outcome={self.outcome!r} confidence={self.confidence:.2f}>"
         )
+
+
+class TokenUsage(Base):
+    """Log of every Claude API call and its cost."""
+
+    __tablename__ = "token_usage"
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+    model: str = Column(String(64), nullable=False)
+    input_tokens: int = Column(Integer, nullable=False, default=0)
+    output_tokens: int = Column(Integer, nullable=False, default=0)
+    cost_eur: float = Column(Float, nullable=False, default=0.0)
+    purpose: str = Column(String(128), nullable=False, default="tree_generation")
+    run_up_id: Optional[int] = Column(Integer, ForeignKey("run_ups.id"), nullable=True)
+
+    def __repr__(self) -> str:
+        return (
+            f"<TokenUsage model={self.model!r} "
+            f"in={self.input_tokens} out={self.output_tokens} "
+            f"cost=\u20ac{self.cost_eur:.4f}>"
+        )
+
+
+class EngineSettings(Base):
+    """Key-value settings store (e.g. daily budget)."""
+
+    __tablename__ = "engine_settings"
+
+    key: str = Column(String(128), primary_key=True)
+    value: str = Column(Text, nullable=False, default="")
+    updated_at: datetime = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<EngineSettings {self.key!r}={self.value!r}>"
 
 
 # ---------------------------------------------------------------------------

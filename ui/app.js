@@ -17,6 +17,9 @@ let state = {
   activeTree: null,     // { id, root, consequences_yes, consequences_no, history }
   overview: {},          // { stats: { predictions, correct, incorrect, accuracy } }
   status: {},            // { engine, feeds, articles }
+  feeds: [],             // All RSS feeds (default + user)
+  budget: null,          // { daily_budget_eur, spent_today_eur, remaining_eur, percentage_used }
+  apiKeyStatus: null,    // { has_key, masked }
   loading: true,
   error: null,
 };
@@ -24,6 +27,8 @@ let state = {
 let activeTreeId = null; // which run-up is expanded
 let pollTimer = null;
 let treePollTimer = null;
+let feedsExpanded = false;
+let feedFormVisible = false;
 
 /* ── Region color mapping ────────────────────────────────────── */
 
@@ -135,6 +140,77 @@ async function fetchOverview() {
   render();
 }
 
+async function fetchFeeds() {
+  try {
+    const res = await fetch(`${API_BASE}/feeds`);
+    if (res.ok) {
+      state.feeds = await res.json();
+    }
+  } catch (err) {
+    console.warn("[news-analyzer] fetch feeds error:", err);
+  }
+}
+
+async function addFeed(name, url, region) {
+  try {
+    const res = await fetch(`${API_BASE}/feeds`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, url, region }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || `HTTP ${res.status}`);
+    }
+    await fetchFeeds();
+    render();
+  } catch (err) {
+    alert("Failed to add feed: " + err.message);
+  }
+}
+
+async function deleteFeed(feedId) {
+  try {
+    const res = await fetch(`${API_BASE}/feeds/${feedId}`, { method: "DELETE" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || `HTTP ${res.status}`);
+    }
+    await fetchFeeds();
+    render();
+  } catch (err) {
+    alert("Failed to delete feed: " + err.message);
+  }
+}
+
+async function fetchBudget() {
+  try {
+    const res = await fetch(`${API_BASE}/budget`);
+    if (res.ok) {
+      state.budget = await res.json();
+    }
+  } catch (err) {
+    console.warn("[news-analyzer] fetch budget error:", err);
+  }
+}
+
+async function updateBudget(amount) {
+  try {
+    const res = await fetch(`${API_BASE}/budget`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ daily_budget_eur: parseFloat(amount) }),
+    });
+    if (res.ok) {
+      state.budget = await res.json();
+      await fetchBudget();
+      render();
+    }
+  } catch (err) {
+    console.warn("[news-analyzer] update budget error:", err);
+  }
+}
+
 async function fetchTree(runUpId) {
   try {
     const res = await fetch(`${API_BASE}/dashboard/tree/${encodeURIComponent(runUpId)}`);
@@ -179,6 +255,12 @@ function render() {
   // Summary cards
   html += renderSummaryCards();
 
+  // Token budget section
+  html += renderBudgetSection();
+
+  // RSS Feeds section
+  html += renderFeedsSection();
+
   // Active run-ups
   html += renderRunUpSection();
 
@@ -187,6 +269,8 @@ function render() {
 
   app.innerHTML = html;
   bindOverviewEvents();
+  bindFeedEvents();
+  bindBudgetEvents();
 }
 
 /* ── Render: Header ──────────────────────────────────────────── */
@@ -237,11 +321,128 @@ function renderSummaryCards() {
       <div class="card__value">${pct(stats.accuracy || 0)}%</div>
       <div class="card__label">Accuracy</div>
     </div>
-    <div class="card card--feeds">
-      <div class="card__value">${pct(s.feeds || 0)}</div>
-      <div class="card__label">Feeds</div>
+    <div class="card card--feeds" style="cursor:pointer" data-scroll-feeds>
+      <div class="card__value" style="display:flex;align-items:center;gap:8px;">
+        <span style="width:24px;height:24px;display:inline-block;color:var(--orange)">${RSS_ICON}</span>
+        ${pct(s.feeds || state.feeds.length || 0)}
+      </div>
+      <div class="card__label">RSS Feeds</div>
+    </div>
+    <div class="card card--budget" style="cursor:pointer" data-scroll-budget>
+      <div class="card__value" style="display:flex;align-items:center;gap:6px;">
+        <span style="font-size:20px">💰</span>
+        €${state.budget ? state.budget.spent_today_eur.toFixed(2) : '0.00'}
+      </div>
+      <div class="card__label">/ €${state.budget ? state.budget.daily_budget_eur.toFixed(2) : '1.00'} budget</div>
     </div>
   </div>`;
+}
+
+/* ── Render: Budget Section ──────────────────────────────────── */
+
+function renderBudgetSection() {
+  const b = state.budget;
+  if (!b) return '';
+
+  const pctUsed = Math.min(b.percentage_used, 100);
+  const barColor = pctUsed > 80 ? 'var(--red, #f44)' : pctUsed > 50 ? 'var(--orange, #f90)' : 'var(--green, #4f4)';
+  const hasKey = state.apiKeyStatus && state.apiKeyStatus.has_key;
+  const keyMasked = state.apiKeyStatus ? state.apiKeyStatus.masked : '';
+
+  return `<div class="budget-section" id="budget-section">
+    <div class="budget-header">
+      <div class="budget-title">
+        <span style="font-size:18px">💰</span> Token Budget & API
+      </div>
+      <div class="budget-controls">
+        <label class="budget-label">Daily limit: €</label>
+        <input type="number" class="budget-input" id="budget-input"
+          value="${b.daily_budget_eur.toFixed(2)}" min="0" max="100" step="0.10" />
+        <button class="budget-save-btn" id="budget-save">Save</button>
+      </div>
+    </div>
+    <div class="budget-bar-container">
+      <div class="budget-bar" style="width:${pctUsed}%;background:${barColor}"></div>
+    </div>
+    <div class="budget-stats">
+      <span>Spent today: <strong>€${b.spent_today_eur.toFixed(4)}</strong></span>
+      <span>Remaining: <strong>€${b.remaining_eur.toFixed(4)}</strong></span>
+      <span>Used: <strong>${pctUsed.toFixed(1)}%</strong></span>
+    </div>
+    <div class="api-key-row">
+      <div class="api-key-status ${hasKey ? 'api-key--set' : 'api-key--missing'}">
+        ${hasKey
+          ? `<span class="api-key-dot api-key-dot--ok"></span> API Key: ${esc(keyMasked)}`
+          : `<span class="api-key-dot api-key-dot--missing"></span> No API Key set`}
+      </div>
+      <div class="api-key-form">
+        <input type="password" class="api-key-input" id="api-key-input"
+          placeholder="sk-ant-..." value="" />
+        <button class="budget-save-btn" id="api-key-save">
+          ${hasKey ? 'Update' : 'Set Key'}
+        </button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function bindBudgetEvents() {
+  const saveBtn = document.getElementById('budget-save');
+  if (saveBtn) {
+    saveBtn.addEventListener('click', () => {
+      const input = document.getElementById('budget-input');
+      if (input) {
+        const val = parseFloat(input.value);
+        if (!isNaN(val) && val >= 0) {
+          updateBudget(val);
+        }
+      }
+    });
+  }
+  // API key save
+  const keySaveBtn = document.getElementById('api-key-save');
+  if (keySaveBtn) {
+    keySaveBtn.addEventListener('click', async () => {
+      const input = document.getElementById('api-key-input');
+      if (input && input.value.trim()) {
+        try {
+          const res = await fetch(`${API_BASE}/settings/api-key`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_key: input.value.trim() }),
+          });
+          if (res.ok) {
+            input.value = '';
+            await fetchApiKeyStatus();
+            render();
+          } else {
+            alert('Failed to save API key');
+          }
+        } catch (err) {
+          alert('Error: ' + err.message);
+        }
+      }
+    });
+  }
+  // Scroll-to from summary card
+  const scrollBtn = document.querySelector('[data-scroll-budget]');
+  if (scrollBtn) {
+    scrollBtn.addEventListener('click', () => {
+      const section = document.getElementById('budget-section');
+      if (section) section.scrollIntoView({ behavior: 'smooth' });
+    });
+  }
+}
+
+async function fetchApiKeyStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/settings/api-key`);
+    if (res.ok) {
+      state.apiKeyStatus = await res.json();
+    }
+  } catch (err) {
+    console.warn("[news-analyzer] fetch api-key status error:", err);
+  }
 }
 
 /* ── Render: Run-Up Cards ────────────────────────────────────── */
@@ -497,6 +698,91 @@ function renderProbHistory(history) {
   return html;
 }
 
+/* ── RSS Icon SVG ────────────────────────────────────────────── */
+
+const RSS_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>`;
+
+const RSS_ICON_SM = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>`;
+
+/* ── Render: RSS Feeds Section ───────────────────────────────── */
+
+function renderFeedsSection() {
+  const feeds = state.feeds || [];
+  const defaultFeeds = feeds.filter(f => f.source === "default");
+  const userFeeds = feeds.filter(f => f.source === "user");
+  const totalCount = feeds.length;
+
+  const regions = [
+    "global", "middle-east", "east-asia", "south-asia", "southeast-asia",
+    "russia-cis", "europe", "north-america", "latam", "africa"
+  ];
+
+  let html = `<div class="feeds-section">
+    <div class="feeds-header">
+      <div class="feeds-header__left">
+        <span class="feeds-header__icon">${RSS_ICON}</span>
+        <span class="feeds-header__title">RSS Feeds</span>
+        <span class="feeds-header__count">${totalCount} feeds</span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="feeds-add-btn" data-feed-add-toggle>+ Add Feed</button>
+        <button class="feeds-toggle-btn" data-feeds-toggle>
+          ${feedsExpanded ? "Hide" : "Show"} feeds
+        </button>
+      </div>
+    </div>`;
+
+  // Add feed form
+  html += `<div class="feed-add-form ${feedFormVisible ? "feed-add-form--visible" : ""}" id="feed-add-form">
+    <input type="text" name="name" placeholder="Feed name" />
+    <input type="url" name="url" placeholder="https://example.com/rss.xml" />
+    <select name="region">
+      ${regions.map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join("")}
+    </select>
+    <div class="feed-add-form__actions">
+      <button class="feed-add-form__submit" data-feed-submit>Add</button>
+      <button class="feed-add-form__cancel" data-feed-cancel>Cancel</button>
+    </div>
+  </div>`;
+
+  // Feed list (collapsible)
+  html += `<div class="feeds-grid ${feedsExpanded ? "feeds-grid--expanded" : ""}">`;
+
+  // User feeds first (editable)
+  for (const f of userFeeds) {
+    html += `<div class="feed-item">
+      <span class="feed-item__icon">${RSS_ICON_SM}</span>
+      <div class="feed-item__info">
+        <div class="feed-item__name">${esc(f.name)}</div>
+        <div class="feed-item__url">${esc(f.url)}</div>
+      </div>
+      <div class="feed-item__badges">
+        <span class="region-badge ${regionClass(f.region)}">${esc(f.region)}</span>
+        <span class="feed-item__source-badge feed-item__source-badge--user">user</span>
+        <button class="feed-item__delete" data-feed-delete="${f.id}" title="Remove feed">&times;</button>
+      </div>
+    </div>`;
+  }
+
+  // Default feeds
+  for (const f of defaultFeeds) {
+    html += `<div class="feed-item">
+      <span class="feed-item__icon">${RSS_ICON_SM}</span>
+      <div class="feed-item__info">
+        <div class="feed-item__name">${esc(f.name)}</div>
+        <div class="feed-item__url">${esc(f.url)}</div>
+      </div>
+      <div class="feed-item__badges">
+        <span class="region-badge ${regionClass(f.region)}">${esc(f.region)}</span>
+        <span class="feed-item__source-badge feed-item__source-badge--default">default</span>
+      </div>
+    </div>`;
+  }
+
+  html += `</div></div>`;
+  return html;
+}
+
 /* ── Render: Scoreboard ──────────────────────────────────────── */
 
 function renderScoreboard() {
@@ -571,6 +857,7 @@ function bindOverviewEvents() {
       state.loading = true;
       render();
       fetchOverview();
+      fetchBudget();
     });
   }
 
@@ -602,6 +889,75 @@ function bindTreeEvents() {
   }
 }
 
+function bindFeedEvents() {
+  // Toggle feed list
+  const toggleBtn = document.querySelector("[data-feeds-toggle]");
+  if (toggleBtn) {
+    toggleBtn.addEventListener("click", () => {
+      feedsExpanded = !feedsExpanded;
+      render();
+    });
+  }
+
+  // Scroll feeds card click
+  const scrollBtn = document.querySelector("[data-scroll-feeds]");
+  if (scrollBtn) {
+    scrollBtn.addEventListener("click", () => {
+      feedsExpanded = true;
+      render();
+      setTimeout(() => {
+        const section = document.querySelector(".feeds-section");
+        if (section) section.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 50);
+    });
+  }
+
+  // Toggle add form
+  const addToggle = document.querySelector("[data-feed-add-toggle]");
+  if (addToggle) {
+    addToggle.addEventListener("click", () => {
+      feedFormVisible = !feedFormVisible;
+      feedsExpanded = true;
+      render();
+    });
+  }
+
+  // Submit new feed
+  const submitBtn = document.querySelector("[data-feed-submit]");
+  if (submitBtn) {
+    submitBtn.addEventListener("click", () => {
+      const form = document.getElementById("feed-add-form");
+      if (!form) return;
+      const name = form.querySelector('input[name="name"]').value.trim();
+      const url = form.querySelector('input[name="url"]').value.trim();
+      const region = form.querySelector('select[name="region"]').value;
+      if (!name || !url) { alert("Name and URL are required."); return; }
+      feedFormVisible = false;
+      addFeed(name, url, region);
+    });
+  }
+
+  // Cancel add form
+  const cancelBtn = document.querySelector("[data-feed-cancel]");
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", () => {
+      feedFormVisible = false;
+      render();
+    });
+  }
+
+  // Delete feed buttons
+  document.querySelectorAll("[data-feed-delete]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const feedId = btn.getAttribute("data-feed-delete");
+      if (feedId && confirm("Remove this feed?")) {
+        deleteFeed(feedId);
+      }
+    });
+  });
+}
+
 /* ── Polling ─────────────────────────────────────────────────── */
 
 function startPolling() {
@@ -629,6 +985,7 @@ document.addEventListener("visibilitychange", () => {
     stopTreePolling();
   } else {
     fetchOverview();
+    fetchBudget();
     startPolling();
     if (activeTreeId) {
       fetchTree(activeTreeId);
@@ -661,4 +1018,7 @@ function syncTheme() {
 
 syncTheme();
 fetchOverview();
+fetchFeeds();
+fetchBudget();
+fetchApiKeyStatus();
 startPolling();
