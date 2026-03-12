@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createHttpHandler } from "./src/http-handler.js";
@@ -41,16 +42,37 @@ const plugin = {
     });
     engineManager.start();
 
-    // ── HTTP routes: dashboard UI + API proxy ──────────────────
+    // ── HTTP routes ────────────────────────────────────────────
+    // Gateway only supports exact-path matching, so we register:
+    // 1. The dashboard HTML (self-contained bundle with inline JS/CSS)
+    // 2. The injector script (loaded by Control UI <script> tag)
     api.registerHttpRoute({
       path: "/plugins/openclaw-news-analyzer",
       auth: "plugin",
-      match: "prefix",
       handler: createHttpHandler({
         logger: api.logger,
         uiRoot,
         enginePort,
       }),
+    });
+
+    // Injector script — separate route since gateway does exact matching
+    const injectorPath = path.join(uiRoot, "injector.js");
+    api.registerHttpRoute({
+      path: "/plugins/openclaw-news-analyzer/injector.js",
+      auth: "plugin",
+      handler: async (_req, res) => {
+        try {
+          const content = fs.readFileSync(injectorPath, "utf8");
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+          res.end(content);
+        } catch {
+          res.statusCode = 404;
+          res.end("Not found");
+        }
+        return true;
+      },
     });
 
     // ── Gateway RPC methods for WebSocket consumers ────────────

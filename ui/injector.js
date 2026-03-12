@@ -9,7 +9,7 @@
   "use strict";
 
   const PLUGIN_ID = "news-analyzer";
-  const PLUGIN_URL = "/plugins/openclaw-news-analyzer/";
+  const PLUGIN_URL = "/plugins/openclaw-news-analyzer";
   const TAB_HASH = "#/news-analyzer";
   const INJECT_ATTR = "data-news-analyzer-dash";
   const TAB_ATTR = "data-news-analyzer-tab";

@@ -215,12 +215,49 @@ async function fetchTree(runUpId) {
   try {
     const res = await fetch(`${API_BASE}/dashboard/tree/${encodeURIComponent(runUpId)}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    state.activeTree = await res.json();
+    const data = await res.json();
+
+    // Transform API format { run_up, tree: [nodes] } into UI format
+    const nodes = data.tree || [];
+    const rootNode = nodes.find(n => n.branch === "root" || n.depth === 0) || nodes[0];
+
+    if (!rootNode) {
+      state.activeTree = null;
+    } else {
+      const yesCons = (rootNode.consequences || []).filter(c => c.branch === "yes").map(mapConsequence);
+      const noCons = (rootNode.consequences || []).filter(c => c.branch === "no").map(mapConsequence);
+
+      state.activeTree = {
+        root: {
+          question: rootNode.question || "",
+          probability: (rootNode.yes_probability || 0) * 100,
+          timeline: rootNode.timeline_estimate || "",
+          narrative: rootNode.question || "",
+        },
+        consequences_yes: yesCons,
+        consequences_no: noCons,
+        history: [],
+      };
+    }
   } catch (err) {
     console.warn("[news-analyzer] fetch tree error:", err);
     state.activeTree = null;
   }
   render();
+}
+
+function mapConsequence(c) {
+  const impacts = [];
+  if (c.impact_economic) impacts.push({ type: "Economic", detail: c.impact_economic });
+  if (c.impact_geopolitical) impacts.push({ type: "Geopolitical", detail: c.impact_geopolitical });
+  if (c.impact_social) impacts.push({ type: "Social", detail: c.impact_social });
+  return {
+    description: c.description || "",
+    probability: (c.probability || 0) * 100,
+    impacts: impacts,
+    keywords: c.keywords || [],
+    status: c.status || "predicted",
+  };
 }
 
 /* ── Render: Main ────────────────────────────────────────────── */
@@ -864,7 +901,7 @@ function bindOverviewEvents() {
   // Run-up card clicks
   document.querySelectorAll("[data-runup-id]").forEach((card) => {
     card.addEventListener("click", () => {
-      const id = card.getAttribute("data-runup-id");
+      const id = parseInt(card.getAttribute("data-runup-id"), 10);
       if (id) {
         activeTreeId = id;
         state.activeTree = null;
