@@ -13,6 +13,7 @@ from sqlalchemy import (
     create_engine,
     Boolean,
     Column,
+    Index,
     Integer,
     Float,
     String,
@@ -65,6 +66,10 @@ class Article(Base):
     """A single news article fetched from an RSS feed."""
 
     __tablename__ = "articles"
+    __table_args__ = (
+        Index("idx_article_pubdate", "pub_date"),
+        Index("idx_article_source", "source"),
+    )
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
     title: str = Column(String(512), nullable=False)
@@ -103,6 +108,11 @@ class ArticleBrief(Base):
     """NLP-enriched summary of an article."""
 
     __tablename__ = "article_briefs"
+    __table_args__ = (
+        Index("idx_brief_region", "region"),
+        Index("idx_brief_processed_at", "processed_at"),
+        Index("idx_brief_cluster", "topic_cluster_id"),
+    )
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
     article_id: int = Column(Integer, ForeignKey("articles.id"), nullable=False, unique=True)
@@ -114,6 +124,12 @@ class ArticleBrief(Base):
     summary: Optional[str] = Column(Text, nullable=True)
     topic_cluster_id: Optional[int] = Column(Integer, nullable=True)
     processed_at: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Extended analysis fields (v2)
+    urgency_score: float = Column(Float, nullable=False, default=0.0)
+    source_credibility: float = Column(Float, nullable=False, default=0.6)
+    key_actors_json: Optional[str] = Column(Text, nullable=True)
+    event_type: Optional[str] = Column(String(32), nullable=True)
 
     # Relationship back to article
     article = relationship("Article", back_populates="brief")
@@ -162,6 +178,7 @@ class NarrativeTimeline(Base):
 
     __table_args__ = (
         UniqueConstraint("narrative_name", "date", name="uq_narrative_date"),
+        Index("idx_nt_name_date", "narrative_name", "date"),
     )
 
     def __repr__(self) -> str:
@@ -175,6 +192,9 @@ class RunUp(Base):
     """A detected escalation / run-up in a narrative."""
 
     __tablename__ = "run_ups"
+    __table_args__ = (
+        Index("idx_runup_status", "status"),
+    )
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
     narrative_name: str = Column(String(256), nullable=False)
@@ -211,6 +231,9 @@ class DecisionNode(Base):
     """A node in a decision tree attached to a RunUp."""
 
     __tablename__ = "decision_nodes"
+    __table_args__ = (
+        Index("idx_dn_runup_status", "run_up_id", "status"),
+    )
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
     run_up_id: int = Column(Integer, ForeignKey("run_ups.id"), nullable=False)
@@ -267,6 +290,9 @@ class Consequence(Base):
     """A predicted consequence linked to a DecisionNode branch."""
 
     __tablename__ = "consequences"
+    __table_args__ = (
+        Index("idx_cons_node", "decision_node_id"),
+    )
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
     decision_node_id: int = Column(
@@ -375,6 +401,9 @@ class ProbabilityUpdate(Base):
     """Audit log for every Bayesian probability update."""
 
     __tablename__ = "probability_updates"
+    __table_args__ = (
+        Index("idx_pu_target", "target_type", "target_id"),
+    )
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
     target_type: str = Column(String(32), nullable=False)  # "node" or "consequence"
@@ -468,6 +497,28 @@ class EngineSettings(Base):
 
     def __repr__(self) -> str:
         return f"<EngineSettings {self.key!r}={self.value!r}>"
+
+
+class AnalysisReport(Base):
+    """Deep analysis report generated 2x daily from database patterns."""
+
+    __tablename__ = "analysis_reports"
+    __table_args__ = (
+        Index("idx_report_type_date", "report_type", "period_end"),
+    )
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    report_type: str = Column(String(64), nullable=False)  # "daily_briefing" | "weekly_briefing"
+    period_start: date = Column(Date, nullable=False)
+    period_end: date = Column(Date, nullable=False)
+    report_json: str = Column(Text, nullable=False)
+    created_at: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    def __repr__(self) -> str:
+        return (
+            f"<AnalysisReport type={self.report_type!r} "
+            f"period={self.period_start}..{self.period_end}>"
+        )
 
 
 # ---------------------------------------------------------------------------

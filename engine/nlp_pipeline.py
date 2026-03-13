@@ -41,6 +41,34 @@ THREAT_KEYWORDS: set = {
     "genocide", "chemical", "biological", "blockade", "siege",
 }
 
+# Urgency keywords for urgency scoring
+URGENCY_HIGH = {"breaking", "imminent", "just now", "hours ago", "urgent", "alert", "emergency", "developing"}
+URGENCY_ACTION = {"launched", "struck", "invaded", "attacked", "fired", "deployed", "seized", "bombed", "killed"}
+URGENCY_PLANNING = {"planned", "discussed", "proposed", "considered", "expected", "likely", "may", "could"}
+
+# Event type classification keywords
+EVENT_TYPES = {
+    "military_action": {"strike", "attack", "missile", "troops", "deployed", "invasion", "airstrike", "drone", "bombing", "shelling", "military operation"},
+    "diplomatic": {"talks", "summit", "agreement", "ceasefire", "negotiate", "treaty", "diplomacy", "mediation", "peace process", "dialogue"},
+    "economic": {"sanctions", "tariff", "trade", "embargo", "oil price", "inflation", "currency", "gdp", "recession", "investment"},
+    "social": {"protest", "demonstration", "unrest", "refugees", "humanitarian", "displacement", "riot", "civil unrest"},
+    "legal": {"indictment", "tribunal", "resolution", "icc", "court", "prosecution", "verdict", "ruling", "investigation"},
+}
+
+# Source credibility ratings (same as deep_analysis.py but used for per-article scoring)
+SOURCE_CREDIBILITY = {
+    "Reuters": 0.95, "AP News": 0.95, "AFP": 0.90,
+    "BBC": 0.90, "The Guardian": 0.88, "NPR": 0.88,
+    "Financial Times": 0.90, "Bloomberg": 0.88,
+    "CNN": 0.78, "CNBC": 0.80, "Fox News": 0.60,
+    "Al Jazeera English": 0.82, "Al Jazeera": 0.82,
+    "DW (Deutsche Welle)": 0.85, "France24": 0.83,
+    "Defense One": 0.82, "The War Zone": 0.80,
+    "RT (Russia Today)": 0.30, "TASS": 0.35,
+    "PressTV Iran": 0.35, "IRNA": 0.40, "Press TV": 0.35,
+    "Xinhua": 0.40, "CGTN": 0.38,
+}
+
 # GPE -> region mapping (lowercase keys)
 GPE_REGION_MAP: Dict[str, str] = {
     # Middle East
@@ -391,6 +419,92 @@ def classify_intensity(sentiment: float, text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Urgency scoring
+# ---------------------------------------------------------------------------
+
+def score_urgency(text: str, source: str = "") -> float:
+    """Score article urgency from 0 (background) to 1 (breaking/imminent).
+
+    Based on:
+      - Presence of urgency keywords (breaking, imminent, etc.)
+      - Action verbs vs planning verbs
+      - Source type (wire services score higher)
+    """
+    text_lower = text.lower()
+
+    # Urgency keyword count
+    urgency_hits = sum(1 for kw in URGENCY_HIGH if kw in text_lower)
+    action_hits = sum(1 for kw in URGENCY_ACTION if kw in text_lower)
+    planning_hits = sum(1 for kw in URGENCY_PLANNING if kw in text_lower)
+
+    # Base score from keywords
+    score = min(urgency_hits * 0.25 + action_hits * 0.15, 0.7)
+
+    # Reduce for planning language
+    if planning_hits > action_hits:
+        score *= 0.6
+
+    # Boost for wire service sources
+    wire_services = {"Reuters", "AP News", "AFP"}
+    if source in wire_services:
+        score = min(score + 0.15, 1.0)
+
+    return round(min(max(score, 0.0), 1.0), 2)
+
+
+# ---------------------------------------------------------------------------
+# Event type classification
+# ---------------------------------------------------------------------------
+
+def classify_event_type(text: str) -> str:
+    """Classify article into event type based on keyword matching."""
+    text_lower = text.lower()
+    type_scores = {}
+    for event_type, keywords in EVENT_TYPES.items():
+        hits = sum(1 for kw in keywords if kw in text_lower)
+        if hits > 0:
+            type_scores[event_type] = hits
+
+    if not type_scores:
+        return "general"
+    return max(type_scores, key=type_scores.get)
+
+
+# ---------------------------------------------------------------------------
+# Key actor extraction
+# ---------------------------------------------------------------------------
+
+def extract_key_actors(doc) -> list:
+    """Extract key actors (persons/orgs performing actions) from spaCy doc."""
+    actors = []
+    seen = set()
+
+    for ent in doc.ents:
+        if ent.label_ not in ("PERSON", "ORG"):
+            continue
+        name = ent.text.strip()
+        if not name or len(name) < 2 or name.lower() in seen:
+            continue
+
+        # Check if entity is subject of an action verb
+        action = None
+        for tok in ent:
+            if tok.dep_ in ("nsubj", "nsubjpass") and tok.head.pos_ == "VERB":
+                action = tok.head.lemma_
+                break
+
+        if action:
+            actors.append({
+                "name": name,
+                "type": ent.label_.lower(),
+                "action": action,
+            })
+            seen.add(name.lower())
+
+    return actors[:10]  # Limit to top 10 actors
+
+
+# ---------------------------------------------------------------------------
 # Single-article processing
 # ---------------------------------------------------------------------------
 
@@ -452,13 +566,18 @@ def process_article(article: Article, feed_region: str = "global") -> Optional[A
 # ---------------------------------------------------------------------------
 
 def process_batch(articles: List[Article]) -> List[ArticleBrief]:
-    """Process a batch of articles and perform topic clustering.
+    """Process a batch of articles with optimised spaCy batching.
+
+    Uses nlp.pipe() for 3-10x faster NER processing and ThreadPoolExecutor
+    for parallel language detection + translation.
 
     Steps:
-      1. Run ``process_article`` on each article.
-      2. Cluster all resulting briefs with BERTopic.
-      3. Assign ``topic_cluster_id`` on each brief.
-      4. Persist briefs to the database.
+      1. Pre-process: language detection + translation (parallel).
+      2. Batch NER with spaCy nlp.pipe().
+      3. Per-doc enrichment: keywords, sentiment, summary, geo, intensity,
+         urgency, event type, key actors, source credibility.
+      4. BERTopic clustering (if enough articles).
+      5. Persist briefs to database.
 
     Returns
     -------
@@ -475,24 +594,91 @@ def process_batch(articles: List[Article]) -> List[ArticleBrief]:
     for feed_def in config.feeds:
         feed_region_map[feed_def["name"]] = feed_def.get("region", "global")
 
-    # --- Per-article NLP ---
+    # --- Phase 1: Pre-process (language detection + translation) ---
+    # These are I/O-light CPU tasks that can run in threads
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _prepare(article):
+        raw_text = f"{article.title}. {article.description or ''}"
+        lang = detect_language(raw_text)
+        english_text = translate_to_english(raw_text, lang)
+        return {
+            "text": english_text[:100_000],
+            "lang": lang,
+            "feed_region": feed_region_map.get(article.source, "global"),
+        }
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        prep_results = list(pool.map(_prepare, articles))
+
+    # --- Phase 2: Batch NER with spaCy nlp.pipe() (3-10x faster) ---
+    nlp = _get_spacy()
+    english_texts = [r["text"] for r in prep_results]
+    docs = list(nlp.pipe(english_texts, batch_size=32))
+
+    # --- Phase 3: Per-doc enrichment ---
     briefs: List[ArticleBrief] = []
     texts_for_clustering: List[str] = []
 
-    for article in articles:
-        feed_region = feed_region_map.get(article.source, "global")
-        brief = process_article(article, feed_region)
-        if brief is not None:
-            briefs.append(brief)
-            texts_for_clustering.append(
-                f"{article.title}. {article.description or ''}"
+    for article, prep, doc in zip(articles, prep_results, docs):
+        try:
+            english_text = prep["text"]
+            feed_region = prep["feed_region"]
+
+            # Set original language on article
+            article.original_lang = prep["lang"]
+
+            # NER
+            entities = extract_entities(doc)
+
+            # Keywords
+            keywords = extract_keywords(english_text)
+
+            # Sentiment
+            sentiment = analyze_sentiment(english_text)
+
+            # Summary
+            summary = summarize(english_text)
+
+            # Geo-tagging
+            region = geolocate(entities, feed_region)
+
+            # Intensity
+            intensity = classify_intensity(sentiment, english_text)
+
+            # New analysis points (v2)
+            urgency = score_urgency(english_text, article.source)
+            credibility = SOURCE_CREDIBILITY.get(article.source, 0.60)
+            event_type = classify_event_type(english_text)
+            actors = extract_key_actors(doc)
+
+            brief = ArticleBrief(
+                article_id=article.id,
+                region=region,
+                entities_json=json.dumps(entities, ensure_ascii=False),
+                keywords_json=json.dumps(keywords, ensure_ascii=False),
+                sentiment=sentiment,
+                intensity=intensity,
+                summary=summary,
+                processed_at=datetime.utcnow(),
+                # v2 fields
+                urgency_score=urgency,
+                source_credibility=credibility,
+                key_actors_json=json.dumps(actors, ensure_ascii=False),
+                event_type=event_type,
             )
+            briefs.append(brief)
+            texts_for_clustering.append(f"{article.title}. {article.description or ''}")
+
+        except Exception:
+            logger.exception("NLP pipeline failed for article %s", article.id)
+            continue
 
     if not briefs:
         logger.warning("No briefs produced from batch.")
         return []
 
-    # --- BERTopic clustering ---
+    # --- Phase 4: BERTopic clustering ---
     if len(texts_for_clustering) >= 5:  # BERTopic needs a minimum corpus
         try:
             topic_model = _get_topic_model()
@@ -512,7 +698,7 @@ def process_batch(articles: List[Article]) -> List[ArticleBrief]:
             len(texts_for_clustering),
         )
 
-    # --- Persist briefs ---
+    # --- Phase 5: Persist briefs ---
     session = get_session()
     try:
         for brief in briefs:

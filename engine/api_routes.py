@@ -33,6 +33,7 @@ from .db import (
     UserFeed,
     TokenUsage,
     EngineSettings,
+    AnalysisReport,
 )
 from .narrative_tracker import update_narratives, detect_runups, consolidate_runups
 from .probability_engine import get_significant_shifts
@@ -53,6 +54,12 @@ def _get_db():
         yield session
     finally:
         session.close()
+
+
+def _get_engine_setting(db: Session, key: str, default: str = "") -> str:
+    """Read a value from EngineSettings."""
+    setting = db.query(EngineSettings).filter(EngineSettings.key == key).first()
+    return setting.value if setting and setting.value else default
 
 
 # ---------------------------------------------------------------------------
@@ -949,6 +956,12 @@ def dashboard_overview(db: Session = Depends(_get_db)):
         "active_runups": len(active_runup_rows),
         "last_24h_briefs": len(recent_briefs),
         "intensity_distribution": intensity_dist,
+        # Auto-scorer accuracy (from prediction_scorer)
+        "auto_scorer": {
+            "total": int(_get_engine_setting(db, "predictions_total", "0")),
+            "correct": int(_get_engine_setting(db, "predictions_correct", "0")),
+            "accuracy": float(_get_engine_setting(db, "prediction_accuracy", "0")),
+        },
     }
 
 
@@ -1138,6 +1151,62 @@ def trigger_polymarket_refresh():
     from .polymarket import update_polymarket_matches
     count = update_polymarket_matches()
     return {"status": "ok", "matches_updated": count}
+
+
+# ===========================================================================
+# Analysis & Scoring endpoints
+# ===========================================================================
+
+
+@router.get("/analysis/latest")
+def get_latest_analysis(db: Session = Depends(_get_db)):
+    """Return the most recent deep analysis report."""
+    from .db import AnalysisReport
+    report = (
+        db.query(AnalysisReport)
+        .order_by(desc(AnalysisReport.created_at))
+        .first()
+    )
+    if not report:
+        return {"status": "no_report", "message": "No analysis report available yet."}
+
+    try:
+        data = json.loads(report.report_json)
+    except Exception:
+        data = {}
+
+    return {
+        "id": report.id,
+        "report_type": report.report_type,
+        "period_start": str(report.period_start),
+        "period_end": str(report.period_end),
+        "created_at": report.created_at.isoformat() if report.created_at else None,
+        "data": data,
+    }
+
+
+@router.post("/analysis/run")
+def trigger_analysis():
+    """Manually trigger a deep analysis run."""
+    from .deep_analysis import run_deep_analysis
+    try:
+        report = run_deep_analysis(period_days=7)
+        return {"status": "ok", "report_id": report.id}
+    except Exception as e:
+        logger.exception("Manual analysis trigger failed.")
+        raise HTTPException(500, detail=str(e))
+
+
+@router.post("/predictions/score")
+def trigger_prediction_scoring():
+    """Manually trigger prediction auto-scoring."""
+    from .prediction_scorer import score_predictions
+    try:
+        count = score_predictions()
+        return {"status": "ok", "resolved": count}
+    except Exception as e:
+        logger.exception("Manual prediction scoring failed.")
+        raise HTTPException(500, detail=str(e))
 
 
 # ===========================================================================

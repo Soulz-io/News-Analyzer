@@ -225,6 +225,10 @@ class RSSFetcher:
 
         threshold = config.dedup_similarity_threshold * 100  # rapidfuzz uses 0-100
 
+        # Convert set to list for rapidfuzz batch API (C-optimized, 10-50x faster)
+        from rapidfuzz import process as rfprocess
+        recent_titles_list = list(recent_titles) if recent_titles else []
+
         final: List[Dict] = []
         for art in unique_by_link:
             title_lower = art["title"].lower()
@@ -233,17 +237,24 @@ class RSSFetcher:
             if title_lower in recent_titles:
                 continue
 
-            # Fuzzy match
-            is_dup = False
-            for existing_title in recent_titles:
-                if fuzz.ratio(title_lower, existing_title) >= threshold:
+            # Fuzzy match using rapidfuzz batch API (C++ optimized)
+            if recent_titles_list:
+                match = rfprocess.extractOne(
+                    title_lower,
+                    recent_titles_list,
+                    scorer=fuzz.ratio,
+                    score_cutoff=threshold,
+                )
+                if match is not None:
                     logger.debug(
-                        "Fuzzy dup: %r ~ %r", art["title"][:60], existing_title[:60]
+                        "Fuzzy dup: %r ~ %r (score=%.0f)",
+                        art["title"][:60],
+                        match[0][:60],
+                        match[1],
                     )
-                    is_dup = True
-                    break
-            if not is_dup:
-                final.append(art)
+                    continue
+
+            final.append(art)
 
         logger.info(
             "Title dedup: %d -> %d articles",

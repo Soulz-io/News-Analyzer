@@ -21,6 +21,7 @@ let state = {
   budget: null,          // { daily_budget_eur, spent_today_eur, remaining_eur, percentage_used }
   apiKeyStatus: null,    // { has_key, masked }
   polymarket: [],        // Polymarket matches for current tree
+  analysis: null,        // Latest deep analysis report
   loading: true,
   error: null,
 };
@@ -30,6 +31,7 @@ let pollTimer = null;
 let treePollTimer = null;
 let feedsExpanded = false;
 let feedFormVisible = false;
+let _lastView = null; // "overview" | "tree" — tracks view to preserve scroll on poll refresh
 
 /* ── Region color mapping ────────────────────────────────────── */
 
@@ -125,6 +127,7 @@ async function fetchOverview() {
       const data = await overviewRes.json();
       state.runups = data.runups || [];
       state.overview = data.stats || data.overview || {};
+      state.autoScorer = data.auto_scorer || null;
     }
 
     if (statusRes.ok) {
@@ -282,10 +285,16 @@ function render() {
   const app = document.getElementById("app");
   if (!app) return;
 
+  const currentView = activeTreeId ? "tree" : "overview";
+  const preserveScroll = (_lastView === currentView);
+  const scrollY = window.scrollY;
+
   // If a tree is active, show tree detail view
   if (activeTreeId) {
     app.innerHTML = renderTreeView();
     bindTreeEvents();
+    if (preserveScroll) window.scrollTo(0, scrollY);
+    _lastView = currentView;
     return;
   }
 
@@ -302,11 +311,15 @@ function render() {
       <div class="loading__text">Loading dashboard...</div>
     </div>`;
     app.innerHTML = html;
+    _lastView = currentView;
     return;
   }
 
   // Summary cards
   html += renderSummaryCards();
+
+  // Intelligence Briefing panel
+  html += renderBriefingPanel();
 
   // Token budget section
   html += renderBudgetSection();
@@ -322,8 +335,11 @@ function render() {
 
   app.innerHTML = html;
   bindOverviewEvents();
+  bindBriefingEvents();
   bindFeedEvents();
   bindBudgetEvents();
+  if (preserveScroll) window.scrollTo(0, scrollY);
+  _lastView = currentView;
 }
 
 /* ── Render: Header ──────────────────────────────────────────── */
@@ -496,6 +512,230 @@ async function fetchApiKeyStatus() {
   } catch (err) {
     console.warn("[news-analyzer] fetch api-key status error:", err);
   }
+}
+
+async function fetchAnalysis() {
+  try {
+    const res = await fetch(`${API_BASE}?_api=analysis`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.data && !data.status) {
+        state.analysis = data;
+      }
+    }
+  } catch (err) {
+    console.warn("[news-analyzer] fetch analysis error:", err);
+  }
+}
+
+async function triggerAnalysis() {
+  try {
+    const res = await fetch(`${API_BASE}?_api=analysis-run`, { method: "POST" });
+    if (res.ok) {
+      // Wait a moment then re-fetch
+      setTimeout(() => { fetchAnalysis().then(render); }, 2000);
+    }
+  } catch (err) {
+    console.warn("[news-analyzer] trigger analysis error:", err);
+  }
+}
+
+/* ── Render: Intelligence Briefing ────────────────────────────── */
+
+let briefingExpanded = false;
+
+function renderBriefingPanel() {
+  const a = state.analysis;
+  if (!a || !a.data) {
+    return `<div class="briefing-panel briefing-panel--empty">
+      <div class="briefing-header">
+        <div class="briefing-title"><span class="briefing-icon">&#x1F4CA;</span> Intelligence Briefing</div>
+        <button class="refresh-btn briefing-run-btn" data-run-analysis>Run Analysis Now</button>
+      </div>
+      <div class="briefing-empty">No analysis report yet. Click "Run Analysis Now" to generate one.</div>
+    </div>`;
+  }
+
+  const d = a.data;
+  const createdAt = a.created_at ? ago(new Date(a.created_at).getTime()) : "";
+
+  // Trending keywords (objects: {keyword, ratio})
+  let trendingHtml = "";
+  if (d.vocabulary && d.vocabulary.trending_keywords) {
+    const trending = d.vocabulary.trending_keywords.slice(0, 8);
+    trendingHtml = trending.map(item => {
+      const kw = item.keyword || item[0] || "";
+      const ratio = item.ratio || item[1] || 0;
+      const r = Math.round(ratio * 100);
+      const cls = r > 300 ? "briefing-kw--hot" : r > 200 ? "briefing-kw--warm" : "briefing-kw--mild";
+      return `<span class="briefing-kw ${cls}">${esc(kw)} <small>+${r}%</small></span>`;
+    }).join(" ");
+  }
+
+  // Most active sources
+  let sourcesHtml = "";
+  if (d.sources && d.sources.source_activity) {
+    const top = d.sources.source_activity.slice(0, 5);
+    sourcesHtml = top.map(s =>
+      `<span class="briefing-source">${esc(s.source)} <small>(${s.article_count})</small></span>`
+    ).join(" &middot; ");
+  }
+
+  // Regional threat levels
+  let regionsHtml = "";
+  if (d.regions && d.regions.regions) {
+    const regions = d.regions.regions.slice(0, 6);
+    regionsHtml = regions.map(r => {
+      const tl = r.threat_level || 0;
+      const dot = tl >= 0.7 ? "threat-dot--critical" : tl >= 0.4 ? "threat-dot--high" : "threat-dot--low";
+      return `<span class="briefing-region"><span class="threat-dot ${dot}"></span>${esc(r.region)} <small>(${(tl * 100).toFixed(0)}%)</small></span>`;
+    }).join(" ");
+  }
+
+  // Narrative connections
+  let narrativeHtml = "";
+  if (d.narratives && d.narratives.relationships) {
+    const rels = d.narratives.relationships.slice(0, 4);
+    narrativeHtml = rels.map(r =>
+      `<div class="briefing-relation">${esc(r.narrative_a)} &#8596; ${esc(r.narrative_b)} <small>(${(r.keyword_overlap * 100).toFixed(0)}% overlap)</small></div>`
+    ).join("");
+  }
+
+  // Temporal patterns
+  let temporalHtml = "";
+  if (d.temporal) {
+    const parts = [];
+    if (d.temporal.peak_hours && d.temporal.peak_hours.length > 0) {
+      const peaks = d.temporal.peak_hours.slice(0, 3).map(item => {
+        const h = item.hour != null ? item.hour : (item[0] != null ? item[0] : 0);
+        return `${String(h).padStart(2, "0")}:00`;
+      });
+      parts.push(`Peak: ${peaks.join(", ")} UTC`);
+    }
+    if (d.temporal.bursts && d.temporal.bursts.length > 0) {
+      const burst = d.temporal.bursts[0];
+      parts.push(`Burst: ${burst.date} (${burst.ratio}x)`);
+    }
+    if (d.temporal.avg_daily_articles) {
+      parts.push(`Avg: ${d.temporal.avg_daily_articles} articles/day`);
+    }
+    temporalHtml = parts.map(p => `<span class="briefing-temporal">${p}</span>`).join(" &middot; ");
+  }
+
+  // Threat words (objects: {keyword, avg_sentiment, count})
+  let threatHtml = "";
+  if (d.vocabulary && d.vocabulary.threat_associated_words && d.vocabulary.threat_associated_words.length > 0) {
+    const threats = d.vocabulary.threat_associated_words.slice(0, 6);
+    threatHtml = threats.map(item => {
+      const kw = item.keyword || item[0] || "";
+      const sent = item.avg_sentiment || item[1] || 0;
+      return `<span class="briefing-kw briefing-kw--threat">${esc(kw)} <small>${Number(sent).toFixed(2)}</small></span>`;
+    }).join(" ");
+  }
+
+  // Top keywords (objects: {keyword, count})
+  let topKwHtml = "";
+  if (d.vocabulary && d.vocabulary.top_keywords) {
+    const topKw = d.vocabulary.top_keywords.slice(0, 12);
+    topKwHtml = topKw.map(item => {
+      const kw = item.keyword || item[0] || "";
+      const count = item.count || item[1] || 0;
+      return `<span class="briefing-kw briefing-kw--top">${esc(kw)} <small>${count}</small></span>`;
+    }).join(" ");
+  }
+
+  // Expanded section: narrative trends
+  let narrativeTrendsHtml = "";
+  if (briefingExpanded && d.narratives && d.narratives.narratives) {
+    const narrs = d.narratives.narratives.slice(0, 10);
+    narrativeTrendsHtml = `<div class="briefing-section">
+      <div class="briefing-label">Narrative Trends</div>
+      <div class="briefing-narrative-list">
+        ${narrs.map(n => {
+          const t = trendArrow(n.trend);
+          return `<div class="briefing-narrative-item">
+            <span class="${t.cls}">${t.symbol}</span>
+            <span class="briefing-narr-name">${esc(n.narrative)}</span>
+            <small>${n.total_articles} articles &middot; sent ${n.avg_sentiment.toFixed(2)}</small>
+          </div>`;
+        }).join("")}
+      </div>
+    </div>`;
+  }
+
+  // Expanded section: source details
+  let sourceDetailsHtml = "";
+  if (briefingExpanded && d.sources && d.sources.source_activity) {
+    const srcs = d.sources.source_activity.slice(0, 10);
+    sourceDetailsHtml = `<div class="briefing-section">
+      <div class="briefing-label">Source Details</div>
+      <div class="briefing-source-list">
+        ${srcs.map(s => {
+          const cred = s.credibility || 0.6;
+          const credCls = cred >= 0.85 ? "cred--high" : cred >= 0.6 ? "cred--mid" : "cred--low";
+          return `<div class="briefing-source-item">
+            <span class="briefing-src-name">${esc(s.source)}</span>
+            <span class="briefing-src-stat">${s.article_count} articles</span>
+            <span class="briefing-src-stat">sent ${s.avg_sentiment.toFixed(2)}</span>
+            <span class="briefing-cred ${credCls}">${(cred * 100).toFixed(0)}%</span>
+          </div>`;
+        }).join("")}
+      </div>
+    </div>`;
+  }
+
+  return `<div class="briefing-panel">
+    <div class="briefing-header">
+      <div class="briefing-title">
+        <span class="briefing-icon">&#x1F4CA;</span> Intelligence Briefing
+        ${createdAt ? `<small class="briefing-age">${createdAt}</small>` : ""}
+      </div>
+      <div class="briefing-actions">
+        <button class="refresh-btn briefing-toggle-btn" data-briefing-toggle>${briefingExpanded ? "Collapse" : "Full Report"}</button>
+        <button class="refresh-btn briefing-run-btn" data-run-analysis>&#8635; Refresh</button>
+      </div>
+    </div>
+
+    <div class="briefing-grid">
+      ${trendingHtml ? `<div class="briefing-section">
+        <div class="briefing-label">&#x1F4C8; Trending Keywords</div>
+        <div class="briefing-content">${trendingHtml}</div>
+      </div>` : ""}
+
+      ${sourcesHtml ? `<div class="briefing-section">
+        <div class="briefing-label">&#x1F4F0; Most Active Sources</div>
+        <div class="briefing-content">${sourcesHtml}</div>
+      </div>` : ""}
+
+      ${regionsHtml ? `<div class="briefing-section">
+        <div class="briefing-label">&#x1F30D; Regional Threat Level</div>
+        <div class="briefing-content">${regionsHtml}</div>
+      </div>` : ""}
+
+      ${narrativeHtml ? `<div class="briefing-section">
+        <div class="briefing-label">&#x1F517; Narrative Connections</div>
+        <div class="briefing-content">${narrativeHtml}</div>
+      </div>` : ""}
+
+      ${temporalHtml ? `<div class="briefing-section">
+        <div class="briefing-label">&#x1F552; News Patterns</div>
+        <div class="briefing-content">${temporalHtml}</div>
+      </div>` : ""}
+
+      ${threatHtml ? `<div class="briefing-section">
+        <div class="briefing-label">&#x26A0; Threat-Associated Words</div>
+        <div class="briefing-content">${threatHtml}</div>
+      </div>` : ""}
+
+      ${briefingExpanded && topKwHtml ? `<div class="briefing-section">
+        <div class="briefing-label">&#x1F511; Top Keywords (7d)</div>
+        <div class="briefing-content">${topKwHtml}</div>
+      </div>` : ""}
+
+      ${narrativeTrendsHtml}
+      ${sourceDetailsHtml}
+    </div>
+  </div>`;
 }
 
 /* ── Render: Run-Up Cards ────────────────────────────────────── */
@@ -1024,6 +1264,24 @@ function bindTreeEvents() {
   }
 }
 
+function bindBriefingEvents() {
+  const runBtn = document.querySelector("[data-run-analysis]");
+  if (runBtn) {
+    runBtn.addEventListener("click", () => {
+      runBtn.textContent = "Running...";
+      runBtn.disabled = true;
+      triggerAnalysis();
+    });
+  }
+  const toggleBtn2 = document.querySelector("[data-briefing-toggle]");
+  if (toggleBtn2) {
+    toggleBtn2.addEventListener("click", () => {
+      briefingExpanded = !briefingExpanded;
+      render();
+    });
+  }
+}
+
 function bindFeedEvents() {
   // Toggle feed list
   const toggleBtn = document.querySelector("[data-feeds-toggle]");
@@ -1156,4 +1414,5 @@ fetchOverview();
 fetchFeeds();
 fetchBudget();
 fetchApiKeyStatus();
+fetchAnalysis();
 startPolling();

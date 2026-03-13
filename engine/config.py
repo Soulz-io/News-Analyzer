@@ -37,7 +37,7 @@ class EngineConfig:
 
         # Fetch settings
         self.fetch_interval_minutes: int = int(
-            os.getenv("FETCH_INTERVAL_MINUTES", "30")
+            os.getenv("FETCH_INTERVAL_MINUTES", "15")
         )
         self.feed_timeout_seconds: int = int(
             os.getenv("FEED_TIMEOUT_SECONDS", "30")

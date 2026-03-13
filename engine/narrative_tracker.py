@@ -8,6 +8,7 @@ Responsibilities:
 
 import json
 import logging
+import time
 from collections import defaultdict
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Optional, Tuple
@@ -33,6 +34,10 @@ W_SPIKE = 25
 # Look-back windows
 BASELINE_DAYS = 7
 RECENT_DAYS = 2
+
+# Score cache: narrative_name -> (score, timestamp)
+_runup_score_cache: Dict[str, Tuple[float, float]] = {}
+CACHE_TTL = 300  # 5 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +347,11 @@ def calculate_runup_score(narrative_name: str, session: Optional[Session] = None
     -------
     float  0-100
     """
+    # Check cache first
+    cached = _runup_score_cache.get(narrative_name)
+    if cached and (time.time() - cached[1]) < CACHE_TTL:
+        return cached[0]
+
     close_after = session is None
     if session is None:
         session = get_session()
@@ -413,6 +423,8 @@ def calculate_runup_score(narrative_name: str, session: Optional[Session] = None
         spike_score = min(max(spike_ratio - 1.0, 0), 1.0) * W_SPIKE
 
         total = volume_score + spread_score + sentiment_score + spike_score
+        # Store in cache before returning
+        _runup_score_cache[narrative_name] = (total, time.time())
         return round(min(total, 100.0), 2)
 
     finally:
@@ -424,7 +436,7 @@ def calculate_runup_score(narrative_name: str, session: Optional[Session] = None
 # Run-up detection
 # ---------------------------------------------------------------------------
 
-def detect_runups(threshold: Optional[float] = None) -> List[RunUp]:
+def detect_runups(threshold: Optional[float] = None, changed_narratives: Optional[List[str]] = None) -> List[RunUp]:
     """Detect narratives whose run-up score exceeds *threshold*.
 
     Creates new ``RunUp`` records for newly detected narratives and updates
@@ -451,6 +463,13 @@ def detect_runups(threshold: Optional[float] = None) -> List[RunUp]:
             .distinct()
             .all()
         ]
+
+        # If we know which narratives changed, invalidate their cache and only score those
+        if changed_narratives:
+            for cn in changed_narratives:
+                _runup_score_cache.pop(cn, None)
+            # Still check all names for threshold, but prioritize changed ones
+            # (cache will handle the non-changed ones efficiently)
 
         detected: List[RunUp] = []
 
@@ -531,6 +550,11 @@ def detect_runups(threshold: Optional[float] = None) -> List[RunUp]:
         return []
     finally:
         session.close()
+
+
+def clear_score_cache() -> None:
+    """Clear the run-up score cache (e.g. after a full analysis cycle)."""
+    _runup_score_cache.clear()
 
 
 # ---------------------------------------------------------------------------

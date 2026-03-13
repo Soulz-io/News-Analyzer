@@ -1667,3 +1667,289 @@ body {
   opacity: 0.3;
   flex-shrink: 0;
 }
+
+/* ══════════════════════════════════════════════════════════════
+   Intelligence Briefing Panel
+   ══════════════════════════════════════════════════════════════ */
+
+.briefing-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.briefing-panel--empty {
+  opacity: 0.7;
+}
+
+.briefing-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.briefing-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.briefing-icon {
+  font-size: 1.2rem;
+}
+
+.briefing-age {
+  font-size: 0.75rem;
+  font-weight: 400;
+  opacity: 0.5;
+  margin-left: 8px;
+}
+
+.briefing-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.briefing-toggle-btn,
+.briefing-run-btn {
+  font-size: 0.78rem;
+  padding: 4px 12px;
+}
+
+.briefing-empty {
+  font-size: 0.88rem;
+  color: var(--text-dim);
+  padding: 12px 0;
+}
+
+.briefing-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+@media (max-width: 800px) {
+  .briefing-grid { grid-template-columns: 1fr; }
+}
+
+.briefing-section {
+  background: var(--bg-inset);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.briefing-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.briefing-content {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  font-size: 0.88rem;
+}
+
+/* Keywords */
+.briefing-kw {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(91, 141, 239, 0.12);
+  color: var(--blue);
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 0.82rem;
+  font-weight: 500;
+}
+
+.briefing-kw small {
+  font-size: 0.72rem;
+  opacity: 0.7;
+}
+
+.briefing-kw--hot {
+  background: rgba(248, 113, 113, 0.18);
+  color: var(--red);
+  font-weight: 700;
+}
+
+.briefing-kw--warm {
+  background: rgba(251, 191, 36, 0.15);
+  color: var(--yellow);
+  font-weight: 600;
+}
+
+.briefing-kw--mild {
+  background: rgba(52, 211, 153, 0.12);
+  color: var(--green);
+}
+
+.briefing-kw--threat {
+  background: rgba(248, 113, 113, 0.12);
+  color: var(--red);
+}
+
+.briefing-kw--top {
+  background: rgba(167, 139, 250, 0.12);
+  color: var(--purple);
+}
+
+/* Sources */
+.briefing-source {
+  color: var(--text);
+  font-size: 0.88rem;
+}
+
+.briefing-source small {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}
+
+/* Regions & threat dots */
+.briefing-region {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.85rem;
+  margin-right: 10px;
+}
+
+.threat-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.threat-dot--critical {
+  background: var(--red);
+  box-shadow: 0 0 6px var(--red);
+}
+
+.threat-dot--high {
+  background: var(--yellow);
+  box-shadow: 0 0 4px var(--yellow);
+}
+
+.threat-dot--low {
+  background: var(--green);
+}
+
+.briefing-region small {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
+
+/* Narrative relations */
+.briefing-relation {
+  font-size: 0.85rem;
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+
+.briefing-relation:last-child {
+  border-bottom: none;
+}
+
+.briefing-relation small {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  margin-left: 6px;
+}
+
+/* Temporal */
+.briefing-temporal {
+  font-size: 0.85rem;
+  color: var(--cyan);
+}
+
+/* Expanded: Narrative list */
+.briefing-narrative-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.briefing-narrative-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  padding: 4px 0;
+}
+
+.briefing-narr-name {
+  font-weight: 500;
+}
+
+.briefing-narrative-item small {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
+
+/* Expanded: Source details */
+.briefing-source-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.briefing-source-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.83rem;
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+
+.briefing-source-item:last-child {
+  border-bottom: none;
+}
+
+.briefing-src-name {
+  font-weight: 500;
+  min-width: 140px;
+}
+
+.briefing-src-stat {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}
+
+.briefing-cred {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: auto;
+}
+
+.cred--high {
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--green);
+}
+
+.cred--mid {
+  background: rgba(251, 191, 36, 0.12);
+  color: var(--yellow);
+}
+
+.cred--low {
+  background: rgba(248, 113, 113, 0.12);
+  color: var(--red);
+}

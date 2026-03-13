@@ -142,6 +142,15 @@ export function createHttpHandler(params: HttpHandlerParams) {
     if (apiAction === "polymarket-refresh" && req.method === "POST") {
       return proxyToEngine("/api/polymarket/refresh", req, res);
     }
+    if (apiAction === "analysis" && req.method === "GET") {
+      return proxyToEngine("/api/analysis/latest", req, res);
+    }
+    if (apiAction === "analysis-run" && req.method === "POST") {
+      return proxyToEngine("/api/analysis/run", req, res);
+    }
+    if (apiAction === "prediction-score" && req.method === "POST") {
+      return proxyToEngine("/api/predictions/score", req, res);
+    }
 
     // ── HTML bundle ──────────────────────────────────────────
     const now = Date.now();

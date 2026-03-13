@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 from .config import config
 from .db import create_all, get_session
@@ -65,8 +66,9 @@ async def fetch_and_process() -> None:
         # --- 3. Narrative tracking ---
         from .narrative_tracker import update_narratives, detect_runups
 
-        update_narratives(briefs)
-        runups = detect_runups()
+        updated_timelines = update_narratives(briefs)
+        changed_names = [t.narrative_name for t in updated_timelines]
+        runups = detect_runups(changed_narratives=changed_names)
         logger.info("Active run-ups after detection: %d", len(runups))
 
         # --- 4. Probability updates ---
@@ -79,6 +81,32 @@ async def fetch_and_process() -> None:
         logger.exception("fetch_and_process cycle FAILED.")
     finally:
         logger.info("=== fetch_and_process cycle END ===")
+
+
+async def prediction_scoring() -> None:
+    """Recurring job: auto-score predictions using resolved Polymarket markets."""
+    logger.info("=== prediction_scoring cycle START ===")
+    try:
+        from .prediction_scorer import score_predictions
+        count = score_predictions()
+        logger.info("Prediction scoring: %d resolved.", count)
+    except Exception:
+        logger.exception("prediction_scoring cycle FAILED.")
+    finally:
+        logger.info("=== prediction_scoring cycle END ===")
+
+
+async def deep_analysis_job() -> None:
+    """Recurring job: run deep database analysis (2x daily)."""
+    logger.info("=== deep_analysis cycle START ===")
+    try:
+        from .deep_analysis import run_deep_analysis
+        report = run_deep_analysis(period_days=7)
+        logger.info("Deep analysis complete: report %d created.", report.id)
+    except Exception:
+        logger.exception("deep_analysis cycle FAILED.")
+    finally:
+        logger.info("=== deep_analysis cycle END ===")
 
 
 # ---------------------------------------------------------------------------
@@ -114,9 +142,28 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         max_instances=1,
     )
 
+    # Schedule prediction scoring (every 2 hours)
+    scheduler.add_job(
+        prediction_scoring,
+        trigger=IntervalTrigger(hours=2),
+        id="prediction_scoring",
+        name="Auto-score predictions",
+        replace_existing=True,
+        max_instances=1,
+    )
+    # Schedule deep analysis (2x daily at 08:00 and 20:00 UTC)
+    scheduler.add_job(
+        deep_analysis_job,
+        trigger=CronTrigger(hour="8,20", minute=0),
+        id="deep_analysis",
+        name="Deep database analysis",
+        replace_existing=True,
+        max_instances=1,
+    )
+
     scheduler.start()
     logger.info(
-        "Scheduler started -- fetch_and_process every %d min, polymarket every 1h.",
+        "Scheduler started -- fetch every %d min, polymarket 1h, scoring 2h, analysis 08:00+20:00 UTC.",
         config.fetch_interval_minutes,
     )
 
