@@ -271,6 +271,7 @@ function mapConsequence(c) {
       direction: si.direction || "bullish",
       magnitude: si.magnitude || "moderate",
       reasoning: si.reasoning || "",
+      available_on_bunq: si.available_on_bunq || false,
     })),
   };
 }
@@ -777,7 +778,11 @@ function renderConsequenceCard(c, num) {
       const dirCls = si.direction === "bullish" ? "stock-badge--bullish" : "stock-badge--bearish";
       const arrow = si.direction === "bullish" ? "&#9650;" : "&#9660;";
       const magCls = si.magnitude === "high" ? "stock-mag--high" : (si.magnitude === "extreme" ? "stock-mag--extreme" : "");
+      const bunqBadge = si.available_on_bunq
+        ? `<span class="stock-badge__bunq" title="Beschikbaar op bunq Stocks">bunq</span>`
+        : `<span class="stock-badge__no-bunq" title="Niet beschikbaar op bunq">&#8709;</span>`;
       html += `<div class="stock-badge ${dirCls}" title="${esc(si.reasoning)}">
+        ${bunqBadge}
         <span class="stock-badge__arrow">${arrow}</span>
         <span class="stock-badge__ticker">${esc(si.ticker)}</span>
         <span class="stock-badge__name">${esc(si.name)}</span>

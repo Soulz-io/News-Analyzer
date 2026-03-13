@@ -1274,6 +1274,7 @@ def _prediction_to_dict(p: Prediction) -> Dict:
 
 
 def _stock_impact_to_dict(si: StockImpact) -> Dict:
+    from .bunq_stocks import is_available_on_bunq
     return {
         "id": si.id,
         "consequence_id": si.consequence_id,
@@ -1283,6 +1284,7 @@ def _stock_impact_to_dict(si: StockImpact) -> Dict:
         "direction": si.direction,
         "magnitude": si.magnitude,
         "reasoning": si.reasoning,
+        "available_on_bunq": is_available_on_bunq(si.ticker),
     }
 
 

@@ -83,7 +83,10 @@ Analyze this news run-up and create a decision tree.
    - Geopolitical impact (1 sentence)
    - Social impact (1 sentence)
    - 3 tracking keywords (for automated monitoring)
-   - 1-3 affected stocks, ETFs, or commodities with ticker, direction (bullish/bearish), magnitude (low/moderate/high/extreme), and reasoning
+   - 2-4 affected stocks, ETFs, or commodities with ticker, direction (bullish/bearish), magnitude (low/moderate/high/extreme), and reasoning
+
+IMPORTANT: Only use tickers from this list (user's broker: bunq Stocks via Upvest/Ginmon):
+{available_tickers}
 
 Respond with this exact JSON structure:
 {{
@@ -524,6 +527,7 @@ def generate_tree(run_up_id: int) -> Optional[Dict]:
         days_active = (date.today() - run_up.start_date).days if run_up.start_date else 0
 
         # Build prompt context
+        from .bunq_stocks import get_bunq_stocks_prompt_snippet
         prompt_context = {
             "narrative_name": run_up.narrative_name,
             "score": run_up.current_score,
@@ -531,6 +535,7 @@ def generate_tree(run_up_id: int) -> Optional[Dict]:
             "days_active": days_active,
             "region": region,
             "article_summaries": summaries,
+            "available_tickers": get_bunq_stocks_prompt_snippet(),
         }
 
         # Call Claude (budget-aware)
