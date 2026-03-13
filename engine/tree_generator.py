@@ -367,7 +367,7 @@ def _call_claude(
         client = anthropic.Anthropic(api_key=config.anthropic_api_key)
         response = client.messages.create(
             model=config.tree_generator_model,
-            max_tokens=3000,
+            max_tokens=6000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
         )
