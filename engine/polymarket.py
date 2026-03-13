@@ -10,7 +10,7 @@ No extra Claude API calls are needed.
 import json
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 
 import httpx
@@ -22,6 +22,7 @@ from .db import (
     RunUp,
     DecisionNode,
     PolymarketMatch,
+    PolymarketPriceHistory,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,39 @@ logger = logging.getLogger(__name__)
 POLYMARKET_EVENTS_API = "https://gamma-api.polymarket.com/events"
 MATCH_THRESHOLD = 45  # minimum fuzzy match score (0-100)
 FETCH_TIMEOUT = 15
+
+# ---------------------------------------------------------------------------
+# Geopolitical market filter
+# ---------------------------------------------------------------------------
+
+GEOPOLITICAL_INCLUDE = {
+    "war", "military", "sanctions", "election", "president", "nato", "nuclear",
+    "invasion", "ceasefire", "troops", "missile", "conflict", "regime", "coup",
+    "alliance", "embargo", "territorial", "sovereignty", "genocide", "humanitarian",
+    "refugee", "terrorism", "insurgency", "strike", "bombing", "deployment",
+    "iran", "russia", "ukraine", "china", "taiwan", "israel", "gaza", "palestine",
+    "north korea", "syria", "yemen", "sudan", "myanmar", "houthi",
+    "oil", "energy", "opec", "commodity", "tariff", "trade war", "pipeline",
+    "diplomat", "treaty", "annexation", "mobilization", "escalation",
+    "federal reserve", "rate cut", "rate hike", "recession", "inflation",
+}
+
+GEOPOLITICAL_EXCLUDE = {
+    "super bowl", "nfl", "nba", "mlb", "premier league", "champions league",
+    "world cup", "basketball", "football score", "touchdown", "playoffs",
+    "world series", "stanley cup", "formula 1", "ufc", "boxing",
+    "oscars", "grammy", "emmy", "bachelor", "reality tv", "netflix",
+    "bitcoin etf", "memecoin", "nft", "solana price", "dogecoin",
+    "tiktok ban", "youtube", "twitch", "streaming", "spotify",
+}
+
+
+def is_geopolitical(market: Dict) -> bool:
+    """Check if a Polymarket market is geopolitically relevant."""
+    text = f"{market.get('question', '')} {market.get('_event_title', '')}".lower()
+    if any(kw in text for kw in GEOPOLITICAL_EXCLUDE):
+        return False
+    return any(kw in text for kw in GEOPOLITICAL_INCLUDE)
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +108,14 @@ def fetch_polymarket_markets(
 
     logger.info("Fetched %d markets from %d events.", len(all_markets),
                 len(set(m.get("_event_slug", "") for m in all_markets)))
-    return all_markets
+
+    # Filter to geopolitically relevant markets only
+    geo_markets = [m for m in all_markets if is_geopolitical(m)]
+    logger.info(
+        "Polymarket: %d markets fetched, %d geopolitically relevant.",
+        len(all_markets), len(geo_markets),
+    )
+    return geo_markets
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +247,36 @@ def calibrate_probability(
 
 
 # ---------------------------------------------------------------------------
+# Price drift detection
+# ---------------------------------------------------------------------------
+
+def detect_price_drift(
+    session: Session,
+    market_id: str,
+    current_price: float,
+    threshold: float = 0.05,
+) -> Optional[float]:
+    """Check if a Polymarket price moved >threshold over 24h.
+
+    Returns the drift magnitude (can be negative), or None if below threshold.
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    oldest = (
+        session.query(PolymarketPriceHistory)
+        .filter(
+            PolymarketPriceHistory.polymarket_id == market_id,
+            PolymarketPriceHistory.recorded_at >= cutoff,
+        )
+        .order_by(PolymarketPriceHistory.recorded_at.asc())
+        .first()
+    )
+    if oldest is None:
+        return None
+    drift = current_price - oldest.yes_price
+    return drift if abs(drift) >= threshold else None
+
+
+# ---------------------------------------------------------------------------
 # Main update loop
 # ---------------------------------------------------------------------------
 
@@ -327,6 +398,24 @@ def update_polymarket_matches() -> int:
 
         session.commit()
         logger.info("Polymarket: %d matches updated.", match_count)
+
+        # Record price history for drift detection
+        try:
+            for match in session.query(PolymarketMatch).filter(
+                PolymarketMatch.run_up_id.in_([ru.id for ru in active_runups])
+            ).all():
+                snapshot = PolymarketPriceHistory(
+                    polymarket_id=match.polymarket_id,
+                    question=match.polymarket_question[:500],
+                    yes_price=match.outcome_yes_price,
+                    volume=match.volume,
+                )
+                session.add(snapshot)
+            session.commit()
+            logger.info("Polymarket: recorded %d price snapshots.", len(active_runups))
+        except Exception:
+            session.rollback()
+            logger.exception("Failed to record Polymarket price history.")
 
     except Exception:
         logger.exception("Polymarket update cycle failed.")

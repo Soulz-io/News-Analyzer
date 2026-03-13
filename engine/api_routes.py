@@ -34,6 +34,7 @@ from .db import (
     TokenUsage,
     EngineSettings,
     AnalysisReport,
+    TradingSignal,
 )
 from .narrative_tracker import update_narratives, detect_runups, consolidate_runups
 from .probability_engine import get_significant_shifts
@@ -1209,6 +1210,98 @@ def trigger_prediction_scoring():
     except Exception as e:
         logger.exception("Manual prediction scoring failed.")
         raise HTTPException(500, detail=str(e))
+
+
+# ===========================================================================
+# Trading Signals
+# ===========================================================================
+
+
+@router.get("/signals")
+def get_trading_signals(
+    level: str = Query(None, description="WATCH, ALERT, BUY, STRONG_BUY"),
+    active_only: bool = Query(True),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(_get_db),
+):
+    """Return active trading signals sorted by confidence."""
+    q = db.query(TradingSignal)
+    if active_only:
+        q = q.filter(
+            TradingSignal.superseded_by_id.is_(None),
+            TradingSignal.expires_at >= datetime.utcnow(),
+        )
+    if level:
+        q = q.filter(TradingSignal.signal_level == level.upper())
+
+    signals = q.order_by(TradingSignal.confidence.desc()).limit(limit).all()
+
+    return [
+        {
+            "id": s.id,
+            "run_up_id": s.run_up_id,
+            "narrative_name": s.narrative_name,
+            "ticker": s.ticker,
+            "direction": s.direction,
+            "confidence": s.confidence,
+            "signal_level": s.signal_level,
+            "components": {
+                "runup_score": s.runup_score_component,
+                "x_signal": s.x_signal_component,
+                "polymarket_drift": s.polymarket_drift_component,
+                "news_acceleration": s.news_acceleration_component,
+                "source_convergence": s.source_convergence_component,
+            },
+            "x_signal_count": s.x_signal_count,
+            "news_count": s.news_count,
+            "polymarket_prob": s.polymarket_prob,
+            "reasoning": s.reasoning,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "expires_at": s.expires_at.isoformat() if s.expires_at else None,
+        }
+        for s in signals
+    ]
+
+
+@router.get("/signals/history")
+def get_signal_history(
+    narrative: str = Query(None),
+    days: int = Query(30, ge=1, le=365),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(_get_db),
+):
+    """Return historical trading signals for analysis."""
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    q = db.query(TradingSignal).filter(TradingSignal.created_at >= cutoff)
+    if narrative:
+        q = q.filter(TradingSignal.narrative_name == narrative)
+    signals = q.order_by(TradingSignal.created_at.desc()).limit(limit).all()
+    return [
+        {
+            "id": s.id,
+            "narrative_name": s.narrative_name,
+            "ticker": s.ticker,
+            "direction": s.direction,
+            "confidence": s.confidence,
+            "signal_level": s.signal_level,
+            "reasoning": s.reasoning,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+        }
+        for s in signals
+    ]
+
+
+@router.post("/signals/refresh")
+def trigger_confidence_scoring():
+    """Manually trigger confidence scoring for all active run-ups."""
+    from .confidence_scorer import update_trading_signals
+
+    signals = update_trading_signals()
+    return {
+        "status": "ok",
+        "signals_created": len(signals),
+        "buy_signals": sum(1 for s in signals if s.signal_level in ("BUY", "STRONG_BUY")),
+    }
 
 
 # ===========================================================================

@@ -22,6 +22,7 @@ let state = {
   apiKeyStatus: null,    // { has_key, masked }
   polymarket: [],        // Polymarket matches for current tree
   analysis: null,        // Latest deep analysis report
+  signals: [],           // Active trading signals
   loading: true,
   error: null,
 };
@@ -318,6 +319,9 @@ function render() {
   // Summary cards
   html += renderSummaryCards();
 
+  // Trading Signals panel
+  html += renderSignalsPanel();
+
   // Intelligence Briefing panel
   html += renderBriefingPanel();
 
@@ -335,6 +339,7 @@ function render() {
 
   app.innerHTML = html;
   bindOverviewEvents();
+  bindSignalEvents();
   bindBriefingEvents();
   bindFeedEvents();
   bindBudgetEvents();
@@ -540,6 +545,90 @@ async function triggerAnalysis() {
   }
 }
 
+async function fetchSignals() {
+  try {
+    const res = await fetch(`${API_BASE}?_api=signals`);
+    if (res.ok) {
+      state.signals = await res.json();
+    }
+  } catch (err) {
+    console.warn("[news-analyzer] fetch signals error:", err);
+  }
+}
+
+async function triggerSignalRefresh() {
+  try {
+    await fetch(`${API_BASE}?_api=signals-refresh`, { method: "POST" });
+    setTimeout(() => { fetchSignals().then(render); }, 1500);
+  } catch (err) {
+    console.warn("[news-analyzer] trigger signals error:", err);
+  }
+}
+
+/* ── Render: Trading Signals Panel ──────────────────────────── */
+
+function renderSignalsPanel() {
+  const sigs = state.signals || [];
+  if (!sigs.length) return "";
+
+  const levelOrder = { STRONG_BUY: 0, BUY: 1, ALERT: 2, WATCH: 3 };
+  const sorted = [...sigs].sort((a, b) => (levelOrder[a.signal_level] || 9) - (levelOrder[b.signal_level] || 9));
+
+  let rows = "";
+  for (const s of sorted.slice(0, 8)) {
+    const conf = Math.round(s.confidence * 100);
+    const lvl = s.signal_level || "WATCH";
+    const lvlCls = lvl === "STRONG_BUY" || lvl === "BUY" ? "sig--buy"
+                 : lvl === "ALERT" ? "sig--alert" : "sig--watch";
+    const barCls = lvl === "STRONG_BUY" ? "sig-bar--strong"
+                 : lvl === "BUY" ? "sig-bar--buy"
+                 : lvl === "ALERT" ? "sig-bar--alert" : "sig-bar--watch";
+
+    const arrow = s.direction === "bullish" ? "&#9650;" : (s.direction === "bearish" ? "&#9660;" : "");
+    const dirCls = s.direction === "bullish" ? "sig-dir--bull" : (s.direction === "bearish" ? "sig-dir--bear" : "");
+
+    // Component badges
+    const comps = s.components || {};
+    let compParts = [];
+    if (s.x_signal_count > 0) compParts.push(`<span class="sig-comp">&#x1F4E1; ${s.x_signal_count} tweets</span>`);
+    if (comps.polymarket_drift > 0.1 && s.polymarket_prob != null) compParts.push(`<span class="sig-comp">&#x1F4CA; PM ${Math.round(s.polymarket_prob * 100)}%</span>`);
+    if (s.news_count > 0) compParts.push(`<span class="sig-comp">&#x1F4F0; ${s.news_count} articles</span>`);
+    if (comps.source_convergence > 0.2) compParts.push(`<span class="sig-comp">&#x1F310; ${Math.round(comps.source_convergence * 8)} sources</span>`);
+    const compHtml = compParts.join(" ");
+
+    rows += `<div class="sig-row ${lvlCls}" title="${esc(s.reasoning || "")}">
+      <div class="sig-bar-wrap">
+        <div class="sig-bar ${barCls}" style="width:${conf}%"></div>
+        <span class="sig-bar-label">${conf}%</span>
+      </div>
+      <div class="sig-info">
+        <span class="sig-level">${lvl.replace("_", " ")}</span>
+        <span class="sig-narr">${esc(s.narrative_name || "")}</span>
+        ${s.ticker ? `<span class="sig-ticker ${dirCls}">${arrow} ${esc(s.ticker)}</span>` : ""}
+      </div>
+      <div class="sig-comps">${compHtml}</div>
+    </div>`;
+  }
+
+  return `<div class="signals-panel">
+    <div class="signals-header">
+      <div class="signals-title">&#x1F6A8; Trading Signals</div>
+      <button class="refresh-btn signals-refresh-btn" data-refresh-signals>&#8635; Refresh</button>
+    </div>
+    ${rows}
+  </div>`;
+}
+
+function bindSignalEvents() {
+  const refreshBtn = document.querySelector("[data-refresh-signals]");
+  if (refreshBtn) {
+    refreshBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      triggerSignalRefresh();
+    });
+  }
+}
+
 /* ── Render: Intelligence Briefing ────────────────────────────── */
 
 let briefingExpanded = false;
@@ -684,6 +773,132 @@ function renderBriefingPanel() {
     </div>`;
   }
 
+  // ── Strategic Outlook: Buy the Rumour, Sell the News ──
+  let strategicHtml = "";
+  const outlook = d.strategic_outlook;
+  const narrative = d.strategic_narrative;
+
+  if (outlook && (outlook.total_signals > 0 || narrative)) {
+    let worldHtml = "";
+    if (narrative && narrative.world_direction) {
+      worldHtml = `<div class="strategic-world">${esc(narrative.world_direction)}</div>`;
+    }
+
+    // Buy opportunities
+    let buyHtml = "";
+    const buyItems = (narrative && narrative.buy_opportunities) || [];
+    if (buyItems.length > 0) {
+      buyHtml = `<div class="strategic-sub">
+        <div class="strategic-sub-label">&#x1F4B0; Buy Opportunities <small>(rumour fase)</small></div>
+        ${buyItems.slice(0, 5).map(b => {
+          const urgCls = b.urgency === "high" ? "stock-pick--urgent" : "";
+          const bunq = `<span class="stock-badge__bunq" title="Beschikbaar op bunq">bunq</span>`;
+          return `<div class="stock-pick stock-pick--buy ${urgCls}" title="${esc(b.reasoning || "")}">
+            <span class="stock-pick__arrow">&#9650;</span>
+            <span class="stock-pick__ticker">${esc(b.ticker || "")}</span>
+            <span class="stock-pick__name">${esc(b.name || "")}</span>
+            ${bunq}
+            <span class="stock-pick__reason">${esc(b.reasoning || "")}</span>
+            ${b.timeframe ? `<span class="stock-pick__time">${esc(b.timeframe)}</span>` : ""}
+          </div>`;
+        }).join("")}
+      </div>`;
+    }
+
+    // Sell signals
+    let sellHtml = "";
+    const sellItems = (narrative && narrative.sell_signals) || [];
+    if (sellItems.length > 0) {
+      sellHtml = `<div class="strategic-sub">
+        <div class="strategic-sub-label">&#x1F4C9; Sell Signals <small>(news fase)</small></div>
+        ${sellItems.slice(0, 3).map(s =>
+          `<div class="stock-pick stock-pick--sell" title="${esc(s.reasoning || "")}">
+            <span class="stock-pick__arrow">&#9660;</span>
+            <span class="stock-pick__ticker">${esc(s.ticker || "")}</span>
+            <span class="stock-pick__name">${esc(s.name || "")}</span>
+            <span class="stock-pick__reason">${esc(s.reasoning || "")}</span>
+          </div>`
+        ).join("")}
+      </div>`;
+    }
+
+    // Sectors to watch
+    let sectorHtml = "";
+    const sectors = (narrative && narrative.sectors_to_watch) || [];
+    if (sectors.length > 0) {
+      sectorHtml = `<div class="strategic-sub">
+        <div class="strategic-sub-label">&#x1F3ED; Sectors</div>
+        <div class="sector-badges">
+          ${sectors.map(s => {
+            const cls = s.direction === "bullish" ? "sector-badge--bull" : "sector-badge--bear";
+            const arrow = s.direction === "bullish" ? "&#9650;" : "&#9660;";
+            return `<span class="sector-badge ${cls}" title="${esc(s.reasoning || "")}">${arrow} ${esc(s.sector || "")}</span>`;
+          }).join(" ")}
+        </div>
+      </div>`;
+    }
+
+    // Risk warning
+    let riskHtml = "";
+    if (narrative && narrative.risk_warning) {
+      riskHtml = `<div class="risk-warning">&#x26A0;&#xFE0F; ${esc(narrative.risk_warning)}</div>`;
+    }
+
+    // Fallback: pure data stock picks (when no Claude narrative)
+    let fallbackPicksHtml = "";
+    if (!narrative && outlook.top_picks && outlook.top_picks.length > 0) {
+      fallbackPicksHtml = `<div class="strategic-sub">
+        <div class="strategic-sub-label">&#x1F4CA; Top Stock Signals</div>
+        ${outlook.top_picks.slice(0, 8).map(p => {
+          const cls = p.direction === "bullish" ? "stock-pick--buy" : "stock-pick--sell";
+          const arrow = p.direction === "bullish" ? "&#9650;" : "&#9660;";
+          const bunq = p.available_on_bunq
+            ? `<span class="stock-badge__bunq">bunq</span>` : "";
+          const reason = (p.top_reasons && p.top_reasons[0])
+            ? p.top_reasons[0].reasoning : "";
+          return `<div class="stock-pick ${cls}" title="${esc(reason)}">
+            <span class="stock-pick__arrow">${arrow}</span>
+            <span class="stock-pick__ticker">${esc(p.ticker)}</span>
+            <span class="stock-pick__name">${esc(p.name)}</span>
+            ${bunq}
+            <span class="stock-pick__score">${p.net_score}</span>
+            <span class="stock-pick__narr">${esc((p.narratives || []).slice(0, 2).join(", "))}</span>
+          </div>`;
+        }).join("")}
+      </div>`;
+    }
+
+    // Phase indicators
+    let phaseHtml = "";
+    const rumours = outlook.rumour_phase || [];
+    const news = outlook.news_phase || [];
+    if (rumours.length > 0 || news.length > 0) {
+      const phaseItems = [];
+      for (const r of rumours.slice(0, 3)) {
+        const accel = r.acceleration > 1 ? " &#8593;&#8593;" : " &#8593;";
+        phaseItems.push(`<span class="phase-item phase-item--rumour">${esc(r.narrative)} <small>(${r.days_active}d${accel})</small></span>`);
+      }
+      for (const n of news.slice(0, 3)) {
+        phaseItems.push(`<span class="phase-item phase-item--news">${esc(n.narrative)} <small>(${n.days_active}d, ${(n.confirmed_ratio * 100).toFixed(0)}% confirmed)</small></span>`);
+      }
+      phaseHtml = `<div class="strategic-sub">
+        <div class="strategic-sub-label">&#x1F504; Narrative Phases</div>
+        <div class="phase-indicators">${phaseItems.join(" ")}</div>
+      </div>`;
+    }
+
+    strategicHtml = `<div class="strategic-section">
+      <div class="strategic-header">&#x1F3AF; Strategic Outlook &mdash; Buy the Rumour, Sell the News</div>
+      ${worldHtml}
+      ${buyHtml}
+      ${sellHtml}
+      ${fallbackPicksHtml}
+      ${sectorHtml}
+      ${riskHtml}
+      ${phaseHtml}
+    </div>`;
+  }
+
   return `<div class="briefing-panel">
     <div class="briefing-header">
       <div class="briefing-title">
@@ -695,6 +910,8 @@ function renderBriefingPanel() {
         <button class="refresh-btn briefing-run-btn" data-run-analysis>&#8635; Refresh</button>
       </div>
     </div>
+
+    ${strategicHtml}
 
     <div class="briefing-grid">
       ${trendingHtml ? `<div class="briefing-section">
@@ -1415,4 +1632,5 @@ fetchFeeds();
 fetchBudget();
 fetchApiKeyStatus();
 fetchAnalysis();
+fetchSignals();
 startPolling();

@@ -6,6 +6,7 @@ Runs 2x daily (08:00 and 20:00 UTC) and produces an AnalysisReport with:
   - Narrative analysis: growth/decline, inter-narrative relationships
   - Regional analysis: geopolitical heatmap with threat levels
   - Temporal analysis: publication patterns, burst detection
+  - Strategic outlook: "buy the rumour, sell the news" stock analysis
 """
 
 import json
@@ -21,8 +22,13 @@ from .db import (
     ArticleBrief,
     NarrativeTimeline,
     RunUp,
+    DecisionNode,
+    Consequence,
+    StockImpact,
     AnalysisReport,
+    TradingSignal,
 )
+from .bunq_stocks import is_available_on_bunq
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +92,26 @@ SOURCE_CREDIBILITY: Dict[str, float] = {
     "IISS": 0.85,
     "Carnegie": 0.85,
     "Chatham House": 0.85,
+    # X/Twitter OSINT accounts
+    "X/Twitter - @OSINTdefender": 0.72,
+    "X/Twitter - @sentdefender": 0.70,
+    "X/Twitter - @IntelCrab": 0.70,
+    "X/Twitter - @Nrg8000": 0.68,
+    "X/Twitter - @AuroraIntel": 0.72,
+    "X/Twitter - @Faytuks": 0.68,
+    "X/Twitter - @AircraftSpots": 0.74,
+    "X/Twitter - @RALee85": 0.78,
+    "X/Twitter - @oryxspioenkop": 0.80,
+    "X/Twitter - @Conflicts": 0.70,
+    "X/Twitter - @christaborowski": 0.68,
+    "X/Twitter - @ggreenwald": 0.75,
+    "X/Twitter - @MaxBlumenthal": 0.65,
+    "X/Twitter - @zerohedge": 0.55,
+    "X/Twitter - @wikileaks": 0.70,
+    "X/Twitter - @mtracey": 0.62,
+    "X/Twitter - @BenjaminNorton": 0.60,
+    "X/Twitter - @caitoz": 0.55,
+    "X/Twitter - @TheGrayzoneNews": 0.60,
 }
 
 DEFAULT_CREDIBILITY = 0.60
@@ -417,7 +443,340 @@ def _analyze_temporal(session, since_date) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# F. Main entry point
+# F. Strategic Outlook — "Buy the Rumour, Sell the News"
+# ---------------------------------------------------------------------------
+
+MAGNITUDE_WEIGHT = {"low": 1, "moderate": 2, "high": 4, "extreme": 8}
+
+
+def _analyze_strategic_outlook(session, since_date) -> Dict[str, Any]:
+    """Aggregate stock signals from active run-ups and classify rumour/news phases.
+
+    Walks the chain: RunUp → DecisionNode → Consequence → StockImpact
+    to build a weighted signal per ticker, then classifies each run-up
+    as rumour (early/buy), news (late/sell), or developing.
+    """
+    active_runups = (
+        session.query(RunUp)
+        .filter(RunUp.status == "active")
+        .all()
+    )
+
+    if not active_runups:
+        return {
+            "top_picks": [],
+            "rumour_phase": [],
+            "news_phase": [],
+            "total_signals": 0,
+        }
+
+    # --- A. Stock Impact Aggregation ---
+    stock_signals: Dict[str, Dict] = defaultdict(lambda: {
+        "bullish_score": 0.0, "bearish_score": 0.0,
+        "narratives": set(), "reasons": [],
+        "name": "", "asset_type": "",
+    })
+
+    for runup in active_runups:
+        runup_weight = (runup.current_score or 0) / 100.0
+        if runup_weight <= 0:
+            continue
+
+        for node in runup.decision_nodes:
+            if node.status != "open":
+                continue
+            yes_prob = node.yes_probability or 0.5
+            no_prob = node.no_probability or (1 - yes_prob)
+
+            for cons in node.consequences:
+                branch_prob = yes_prob if cons.branch == "yes" else no_prob
+                for si in cons.stock_impacts:
+                    s = stock_signals[si.ticker]
+                    s["name"] = si.name
+                    s["asset_type"] = si.asset_type or "stock"
+                    weight = (
+                        MAGNITUDE_WEIGHT.get(si.magnitude, 1)
+                        * branch_prob
+                        * runup_weight
+                    )
+                    if si.direction == "bullish":
+                        s["bullish_score"] += weight
+                    else:
+                        s["bearish_score"] += weight
+                    s["narratives"].add(runup.narrative_name)
+                    s["reasons"].append({
+                        "narrative": runup.narrative_name,
+                        "direction": si.direction,
+                        "magnitude": si.magnitude,
+                        "reasoning": si.reasoning or "",
+                        "branch_prob": round(branch_prob, 2),
+                    })
+
+    # --- B. Rumour vs News Phase Detection ---
+    rumour_phase: List[Dict] = []
+    news_phase: List[Dict] = []
+
+    for runup in active_runups:
+        total_nodes = len(runup.decision_nodes)
+        confirmed_nodes = sum(
+            1 for n in runup.decision_nodes
+            if n.status in ("confirmed_yes", "confirmed_no")
+        )
+        days_active = (
+            (date.today() - runup.start_date).days
+            if runup.start_date else 0
+        )
+        acceleration = runup.acceleration_rate or 0.0
+        confirmed_ratio = confirmed_nodes / max(total_nodes, 1)
+
+        phase_info = {
+            "narrative": runup.narrative_name,
+            "score": runup.current_score or 0,
+            "acceleration": round(acceleration, 2),
+            "days_active": days_active,
+            "article_count": runup.article_count_total or 0,
+            "confirmed_ratio": round(confirmed_ratio, 2),
+        }
+
+        # Rumour: early stage, high acceleration, few confirmed outcomes
+        if acceleration > 0.5 and confirmed_ratio < 0.3 and days_active < 7:
+            phase_info["phase"] = "rumour"
+            rumour_phase.append(phase_info)
+        # News: broadly covered, many confirmed nodes
+        elif confirmed_ratio > 0.5 or days_active > 10:
+            phase_info["phase"] = "news"
+            news_phase.append(phase_info)
+        else:
+            phase_info["phase"] = "developing"
+            rumour_phase.append(phase_info)  # Still a potential buy opportunity
+
+    # --- C. Top Picks ---
+    top_picks = []
+    for ticker, data in stock_signals.items():
+        net = data["bullish_score"] - data["bearish_score"]
+        direction = "bullish" if net > 0 else "bearish"
+        # Deduplicate reasons by narrative
+        seen_narratives = set()
+        unique_reasons = []
+        for r in sorted(
+            data["reasons"],
+            key=lambda r: MAGNITUDE_WEIGHT.get(r["magnitude"], 1),
+            reverse=True,
+        ):
+            if r["narrative"] not in seen_narratives:
+                seen_narratives.add(r["narrative"])
+                unique_reasons.append(r)
+            if len(unique_reasons) >= 3:
+                break
+
+        top_picks.append({
+            "ticker": ticker,
+            "name": data["name"],
+            "asset_type": data["asset_type"],
+            "direction": direction,
+            "net_score": round(abs(net), 2),
+            "bullish_signals": round(data["bullish_score"], 2),
+            "bearish_signals": round(data["bearish_score"], 2),
+            "narratives": sorted(data["narratives"]),
+            "top_reasons": unique_reasons,
+            "available_on_bunq": is_available_on_bunq(ticker),
+        })
+
+    # Sort: bunq-available first, then by signal strength
+    top_picks.sort(key=lambda x: (-int(x["available_on_bunq"]), -x["net_score"]))
+
+    logger.info(
+        "Strategic outlook: %d stock signals, %d rumour-phase, %d news-phase narratives.",
+        len(top_picks),
+        len(rumour_phase),
+        len(news_phase),
+    )
+
+    return {
+        "top_picks": top_picks[:15],
+        "rumour_phase": sorted(rumour_phase, key=lambda x: -x["acceleration"])[:10],
+        "news_phase": sorted(news_phase, key=lambda x: -x["confirmed_ratio"])[:10],
+        "total_signals": len(stock_signals),
+    }
+
+
+# ---------------------------------------------------------------------------
+# G. Claude Strategic Narrative
+# ---------------------------------------------------------------------------
+
+STRATEGIC_SYSTEM = """\
+You are a senior geopolitical investment strategist.
+You write concise, actionable market outlooks based on news intelligence data.
+Your philosophy: "Buy the rumour, sell the news" — identify opportunities
+BEFORE events fully materialize. Focus on bunq Stocks-available tickers.
+Write in Dutch. Be direct, no fluff. Use bullet points where helpful.
+Respond with valid JSON only. No markdown, no explanation outside JSON."""
+
+STRATEGIC_USER_TEMPLATE = """\
+Based on this intelligence data, write a strategic outlook.
+
+## Active Narratives (rumour phase — early, buy opportunities):
+{rumour_data}
+
+## Maturing Narratives (news phase — consider selling/avoiding):
+{news_data}
+
+## Top Stock Signals (aggregated from all decision trees):
+{stock_data}
+
+## Regional Threat Levels:
+{region_data}
+
+## Trending Keywords (what's accelerating):
+{trending_data}
+
+## Active Trading Signals (multi-source confidence scoring):
+{signals_data}
+
+Write a JSON response:
+{{
+  "world_direction": "2-3 zinnen over waar de wereld naartoe gaat — de grote trends",
+  "buy_opportunities": [
+    {{
+      "ticker": "XOM",
+      "name": "ExxonMobil",
+      "reasoning": "Waarom nu kopen — 1-2 zinnen",
+      "narrative": "welk narratief drijft dit",
+      "urgency": "high",
+      "timeframe": "korte termijn"
+    }}
+  ],
+  "sell_signals": [
+    {{
+      "ticker": "SPY",
+      "name": "S&P 500 ETF",
+      "reasoning": "Waarom overwegen te verkopen — 1 zin",
+      "narrative": "welk narratief",
+      "urgency": "medium"
+    }}
+  ],
+  "sectors_to_watch": [
+    {{
+      "sector": "Energy",
+      "direction": "bullish",
+      "reasoning": "Waarom — 1 zin"
+    }}
+  ],
+  "risk_warning": "Belangrijkste risico's — 1-2 zinnen"
+}}
+
+IMPORTANT: Only include tickers that appear in the stock data above.
+Keep buy_opportunities to max 5 and sell_signals to max 3.
+sectors_to_watch: max 4 sectors."""
+
+
+def _generate_strategic_narrative(
+    outlook_data: Dict[str, Any],
+    regions_data: Dict[str, Any],
+    vocabulary_data: Dict[str, Any],
+    signals_data: Optional[List[Dict]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Generate a strategic narrative via Claude Haiku.
+
+    Cost: ~€0.005-0.01 per call. Returns None if no API key,
+    budget exhausted, or on any error.
+    """
+    from .config import config
+
+    if not config.anthropic_api_key:
+        logger.info("No API key — skipping strategic narrative generation.")
+        return None
+
+    # Budget check (reuse from tree_generator)
+    try:
+        from .tree_generator import _check_budget, _log_usage
+    except ImportError:
+        logger.warning("Cannot import tree_generator budget functions.")
+        return None
+
+    if not _check_budget():
+        logger.info("Budget exhausted — skipping strategic narrative.")
+        return None
+
+    # Build prompt data
+    rumour_data = json.dumps(
+        outlook_data.get("rumour_phase", [])[:5], default=str, ensure_ascii=False
+    )
+    news_data = json.dumps(
+        outlook_data.get("news_phase", [])[:5], default=str, ensure_ascii=False
+    )
+    stock_data = json.dumps(
+        outlook_data.get("top_picks", [])[:10], default=str, ensure_ascii=False
+    )
+    region_data = json.dumps(
+        regions_data.get("regions", [])[:5], default=str, ensure_ascii=False
+    )
+    trending_data = json.dumps(
+        vocabulary_data.get("trending_keywords", [])[:10], default=str, ensure_ascii=False
+    )
+    signals_text = json.dumps(
+        signals_data[:5] if signals_data else [], default=str, ensure_ascii=False
+    )
+
+    user_prompt = STRATEGIC_USER_TEMPLATE.format(
+        rumour_data=rumour_data,
+        news_data=news_data,
+        stock_data=stock_data,
+        region_data=region_data,
+        trending_data=trending_data,
+        signals_data=signals_text,
+    )
+
+    try:
+        import anthropic
+    except ImportError:
+        logger.error("anthropic package not installed — pip install anthropic")
+        return None
+
+    try:
+        client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+        response = client.messages.create(
+            model=config.tree_generator_model,
+            max_tokens=2000,
+            system=STRATEGIC_SYSTEM,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+
+        # Log token usage
+        usage = response.usage
+        _log_usage(
+            model=config.tree_generator_model,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            purpose="strategic_outlook",
+        )
+
+        text = response.content[0].text.strip()
+        # Strip markdown fences if present
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            if text.endswith("```"):
+                text = text[:-3].strip()
+
+        result = json.loads(text)
+        logger.info(
+            "Strategic narrative generated: %d buy ops, %d sell signals, %d sectors.",
+            len(result.get("buy_opportunities", [])),
+            len(result.get("sell_signals", [])),
+            len(result.get("sectors_to_watch", [])),
+        )
+        return result
+
+    except json.JSONDecodeError as e:
+        logger.error("Failed to parse strategic narrative JSON: %s", e)
+        return None
+    except Exception:
+        logger.exception("Strategic narrative generation failed.")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# H. Main entry point
 # ---------------------------------------------------------------------------
 
 def run_deep_analysis(period_days: int = 7) -> Optional[AnalysisReport]:
@@ -438,13 +797,52 @@ def run_deep_analysis(period_days: int = 7) -> Optional[AnalysisReport]:
     try:
         logger.info("Starting deep analysis for period %s to %s...", since, date.today())
 
+        vocabulary_data = _analyze_vocabulary(session, since)
+        regions_data = _analyze_regions(session, since)
+
+        # Strategic outlook: stock signals + rumour/news phases
+        outlook_data = _analyze_strategic_outlook(session, since)
+
+        # Query active trading signals for strategic narrative context
+        active_signals = (
+            session.query(TradingSignal)
+            .filter(
+                TradingSignal.superseded_by_id.is_(None),
+                TradingSignal.expires_at >= datetime.utcnow(),
+            )
+            .order_by(TradingSignal.confidence.desc())
+            .limit(10)
+            .all()
+        )
+        signals_data = [
+            {
+                "narrative": s.narrative_name,
+                "confidence": s.confidence,
+                "level": s.signal_level,
+                "ticker": s.ticker,
+                "direction": s.direction,
+                "reasoning": s.reasoning,
+            }
+            for s in active_signals
+        ]
+
+        # Claude narrative (optional — gracefully None if no API key or budget)
+        strategic_narrative = None
+        if outlook_data.get("total_signals", 0) > 0:
+            strategic_narrative = _generate_strategic_narrative(
+                outlook_data, regions_data, vocabulary_data,
+                signals_data=signals_data,
+            )
+
         report_data = {
             "period": {"start": str(since), "end": str(date.today()), "days": period_days},
-            "vocabulary": _analyze_vocabulary(session, since),
+            "vocabulary": vocabulary_data,
             "sources": _analyze_sources(session, since),
             "narratives": _analyze_narratives(session, since),
-            "regions": _analyze_regions(session, since),
+            "regions": regions_data,
             "temporal": _analyze_temporal(session, since),
+            "strategic_outlook": outlook_data,
+            "strategic_narrative": strategic_narrative,
             "generated_at": datetime.utcnow().isoformat(),
         }
 
@@ -458,11 +856,12 @@ def run_deep_analysis(period_days: int = 7) -> Optional[AnalysisReport]:
         session.commit()
 
         logger.info(
-            "Deep analysis complete: %d keywords, %d sources, %d narratives, %d regions.",
+            "Deep analysis complete: %d keywords, %d sources, %d narratives, %d regions, %d stock signals.",
             len(report_data["vocabulary"].get("top_keywords", [])),
             report_data["sources"].get("total_sources", 0),
             len(report_data["narratives"].get("narratives", [])),
             len(report_data["regions"].get("regions", [])),
+            outlook_data.get("total_signals", 0),
         )
         return report
 

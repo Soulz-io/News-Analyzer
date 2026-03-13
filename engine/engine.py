@@ -164,9 +164,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         max_instances=1,
     )
 
+    # Schedule confidence scoring (every 30 min — pure Python, no API cost)
+    scheduler.add_job(
+        confidence_scoring,
+        trigger=IntervalTrigger(minutes=30),
+        id="confidence_scoring",
+        name="Confidence scoring & signal generation",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # Schedule X/Twitter OSINT fetch (if bearer token configured)
+    if config.twitter_enabled:
+        scheduler.add_job(
+            twitter_fetch_and_process,
+            trigger=IntervalTrigger(minutes=config.twitter_fetch_interval_minutes),
+            id="twitter_fetch",
+            name="X/Twitter OSINT fetch",
+            replace_existing=True,
+            max_instances=1,
+        )
+        logger.info(
+            "X/Twitter OSINT enabled — fetching every %d min.",
+            config.twitter_fetch_interval_minutes,
+        )
+    else:
+        logger.info("X/Twitter OSINT disabled — no bearer token configured.")
+
     scheduler.start()
     logger.info(
-        "Scheduler started -- fetch every %d min, polymarket 1h, scoring 2h, analysis 08:00+20:00 UTC.",
+        "Scheduler started -- fetch %dmin, polymarket 1h, scoring 2h, confidence 30min, analysis 08:00+20:00 UTC.",
         config.fetch_interval_minutes,
     )
 
@@ -191,6 +218,64 @@ async def polymarket_refresh() -> None:
         logger.exception("polymarket_refresh cycle FAILED.")
     finally:
         logger.info("=== polymarket_refresh cycle END ===")
+
+
+async def twitter_fetch_and_process() -> None:
+    """Recurring job: fetch tweets from OSINT accounts and process them."""
+    logger.info("=== twitter_fetch_and_process cycle START ===")
+    try:
+        from .twitter_fetcher import TwitterFetcher
+
+        fetcher = TwitterFetcher()
+        if not fetcher.is_configured:
+            logger.info("X: Twitter fetcher not configured — skipping.")
+            return
+        new_articles = await asyncio.to_thread(fetcher.fetch_and_save)
+
+        if not new_articles:
+            logger.info("X: no new tweets this cycle.")
+            return
+
+        logger.info("X: fetched %d new tweet-articles.", len(new_articles))
+
+        # Run through the same pipeline as RSS articles
+        from .nlp_pipeline import process_batch
+
+        briefs = process_batch(new_articles)
+        logger.info("X: produced %d briefs.", len(briefs))
+
+        if briefs:
+            from .narrative_tracker import update_narratives, detect_runups
+
+            updated = update_narratives(briefs)
+            changed = [t.narrative_name for t in updated]
+            detect_runups(changed_narratives=changed)
+
+            from .probability_engine import update_probabilities
+
+            update_probabilities(briefs)
+
+    except Exception:
+        logger.exception("twitter_fetch_and_process cycle FAILED.")
+    finally:
+        logger.info("=== twitter_fetch_and_process cycle END ===")
+
+
+async def confidence_scoring() -> None:
+    """Recurring job: score active run-ups and generate trading signals."""
+    logger.info("=== confidence_scoring cycle START ===")
+    try:
+        from .confidence_scorer import update_trading_signals
+
+        signals = update_trading_signals()
+        buy_plus = sum(1 for s in signals if s.signal_level in ("BUY", "STRONG_BUY"))
+        logger.info(
+            "Confidence scoring: %d signals (%d BUY+).", len(signals), buy_plus
+        )
+    except Exception:
+        logger.exception("confidence_scoring cycle FAILED.")
+    finally:
+        logger.info("=== confidence_scoring cycle END ===")
 
 
 async def _initial_fetch() -> None:

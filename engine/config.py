@@ -73,6 +73,15 @@ class EngineConfig:
             os.getenv("MAX_TREES_PER_CYCLE", "5")
         )
 
+        # Twitter / X API
+        self.twitter_bearer_token: str = os.getenv(
+            "X_BEARER_TOKEN", os.getenv("TWITTER_BEARER_TOKEN", "")
+        )
+        self.twitter_fetch_interval_minutes: int = int(
+            os.getenv("TWITTER_FETCH_INTERVAL_MINUTES", "120")
+        )
+        self.twitter_enabled: bool = bool(self.twitter_bearer_token)
+
         # Logging
         self.log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
 

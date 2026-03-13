@@ -486,6 +486,81 @@ class TokenUsage(Base):
         )
 
 
+class TradingSignal(Base):
+    """A generated trading signal when confidence crosses a threshold.
+
+    Combines run-up momentum, X/Twitter OSINT, Polymarket drift,
+    news acceleration, and source convergence into a composite confidence
+    score.  Signal levels: WATCH (>=0.40), ALERT (>=0.60), BUY (>=0.75),
+    STRONG_BUY (>=0.85).
+    """
+
+    __tablename__ = "trading_signals"
+    __table_args__ = (
+        Index("idx_ts_level", "signal_level"),
+        Index("idx_ts_created", "created_at"),
+        Index("idx_ts_runup", "run_up_id"),
+    )
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    run_up_id: int = Column(Integer, ForeignKey("run_ups.id"), nullable=False)
+    narrative_name: str = Column(String(256), nullable=False)
+    ticker: Optional[str] = Column(String(16), nullable=True)
+    direction: Optional[str] = Column(String(16), nullable=True)  # bullish/bearish
+    confidence: float = Column(Float, nullable=False)
+    signal_level: str = Column(String(16), nullable=False)  # WATCH/ALERT/BUY/STRONG_BUY
+
+    # Component scores (transparency)
+    runup_score_component: float = Column(Float, nullable=False, default=0.0)
+    x_signal_component: float = Column(Float, nullable=False, default=0.0)
+    polymarket_drift_component: float = Column(Float, nullable=False, default=0.0)
+    news_acceleration_component: float = Column(Float, nullable=False, default=0.0)
+    source_convergence_component: float = Column(Float, nullable=False, default=0.0)
+
+    # Context
+    x_signal_count: int = Column(Integer, nullable=False, default=0)
+    news_count: int = Column(Integer, nullable=False, default=0)
+    polymarket_prob: Optional[float] = Column(Float, nullable=True)
+    reasoning: Optional[str] = Column(Text, nullable=True)
+
+    created_at: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at: Optional[datetime] = Column(DateTime, nullable=True)
+    superseded_by_id: Optional[int] = Column(
+        Integer, ForeignKey("trading_signals.id"), nullable=True
+    )
+
+    run_up = relationship("RunUp", backref="trading_signals")
+
+    def __repr__(self) -> str:
+        return (
+            f"<TradingSignal [{self.signal_level}] "
+            f"{self.narrative_name} conf={self.confidence:.2f} "
+            f"ticker={self.ticker}>"
+        )
+
+
+class PolymarketPriceHistory(Base):
+    """Hourly price snapshots for Polymarket drift detection."""
+
+    __tablename__ = "polymarket_price_history"
+    __table_args__ = (
+        Index("idx_pmph_id_time", "polymarket_id", "recorded_at"),
+    )
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    polymarket_id: str = Column(String(64), nullable=False)
+    question: str = Column(Text, nullable=False)
+    yes_price: float = Column(Float, nullable=False)
+    volume: Optional[float] = Column(Float, nullable=True)
+    recorded_at: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    def __repr__(self) -> str:
+        return (
+            f"<PolymarketPriceHistory {self.polymarket_id} "
+            f"yes={self.yes_price:.2f} at={self.recorded_at}>"
+        )
+
+
 class EngineSettings(Base):
     """Key-value settings store (e.g. daily budget)."""
 

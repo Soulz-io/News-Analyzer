@@ -151,6 +151,15 @@ export function createHttpHandler(params: HttpHandlerParams) {
     if (apiAction === "prediction-score" && req.method === "POST") {
       return proxyToEngine("/api/predictions/score", req, res);
     }
+    if (apiAction === "signals" && req.method === "GET") {
+      return proxyToEngine("/api/signals", req, res);
+    }
+    if (apiAction === "signals-history" && req.method === "GET") {
+      return proxyToEngine("/api/signals/history", req, res);
+    }
+    if (apiAction === "signals-refresh" && req.method === "POST") {
+      return proxyToEngine("/api/signals/refresh", req, res);
+    }
 
     // ── HTML bundle ──────────────────────────────────────────
     const now = Date.now();

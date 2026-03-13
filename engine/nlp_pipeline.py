@@ -67,6 +67,26 @@ SOURCE_CREDIBILITY = {
     "RT (Russia Today)": 0.30, "TASS": 0.35,
     "PressTV Iran": 0.35, "IRNA": 0.40, "Press TV": 0.35,
     "Xinhua": 0.40, "CGTN": 0.38,
+    # X/Twitter OSINT accounts
+    "X/Twitter - @OSINTdefender": 0.72,
+    "X/Twitter - @sentdefender": 0.70,
+    "X/Twitter - @IntelCrab": 0.70,
+    "X/Twitter - @Nrg8000": 0.68,
+    "X/Twitter - @AuroraIntel": 0.72,
+    "X/Twitter - @Faytuks": 0.68,
+    "X/Twitter - @AircraftSpots": 0.74,
+    "X/Twitter - @RALee85": 0.78,
+    "X/Twitter - @oryxspioenkop": 0.80,
+    "X/Twitter - @Conflicts": 0.70,
+    "X/Twitter - @christaborowski": 0.68,
+    "X/Twitter - @ggreenwald": 0.75,
+    "X/Twitter - @MaxBlumenthal": 0.65,
+    "X/Twitter - @zerohedge": 0.55,
+    "X/Twitter - @wikileaks": 0.70,
+    "X/Twitter - @mtracey": 0.62,
+    "X/Twitter - @BenjaminNorton": 0.60,
+    "X/Twitter - @caitoz": 0.55,
+    "X/Twitter - @TheGrayzoneNews": 0.60,
 }
 
 # GPE -> region mapping (lowercase keys)
