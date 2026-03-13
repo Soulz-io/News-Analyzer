@@ -116,8 +116,8 @@ function ago(ms) {
 async function fetchOverview() {
   try {
     const [overviewRes, statusRes] = await Promise.all([
-      fetch(`${API_BASE}/dashboard/overview`),
-      fetch(`${API_BASE}/status`),
+      fetch(`${API_BASE}?_api=overview`),
+      fetch(`${API_BASE}?_api=status`),
     ]);
 
     if (overviewRes.ok) {
@@ -142,7 +142,7 @@ async function fetchOverview() {
 
 async function fetchFeeds() {
   try {
-    const res = await fetch(`${API_BASE}/feeds`);
+    const res = await fetch(`${API_BASE}?_api=feeds`);
     if (res.ok) {
       state.feeds = await res.json();
     }
@@ -153,7 +153,7 @@ async function fetchFeeds() {
 
 async function addFeed(name, url, region) {
   try {
-    const res = await fetch(`${API_BASE}/feeds`, {
+    const res = await fetch(`${API_BASE}?_api=feeds`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, url, region }),
@@ -171,7 +171,7 @@ async function addFeed(name, url, region) {
 
 async function deleteFeed(feedId) {
   try {
-    const res = await fetch(`${API_BASE}/feeds/${feedId}`, { method: "DELETE" });
+    const res = await fetch(`${API_BASE}?_api=feeds&id=${encodeURIComponent(feedId)}`, { method: "DELETE" });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       throw new Error(data.detail || `HTTP ${res.status}`);
@@ -185,7 +185,7 @@ async function deleteFeed(feedId) {
 
 async function fetchBudget() {
   try {
-    const res = await fetch(`${API_BASE}/budget`);
+    const res = await fetch(`${API_BASE}?_api=budget`);
     if (res.ok) {
       state.budget = await res.json();
     }
@@ -196,7 +196,7 @@ async function fetchBudget() {
 
 async function updateBudget(amount) {
   try {
-    const res = await fetch(`${API_BASE}/budget`, {
+    const res = await fetch(`${API_BASE}?_api=budget`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ daily_budget_eur: parseFloat(amount) }),
@@ -213,7 +213,7 @@ async function updateBudget(amount) {
 
 async function fetchTree(runUpId) {
   try {
-    const res = await fetch(`${API_BASE}/dashboard/tree/${encodeURIComponent(runUpId)}`);
+    const res = await fetch(`${API_BASE}?_api=tree&id=${encodeURIComponent(runUpId)}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
 
@@ -443,7 +443,7 @@ function bindBudgetEvents() {
       const input = document.getElementById('api-key-input');
       if (input && input.value.trim()) {
         try {
-          const res = await fetch(`${API_BASE}/settings/api-key`, {
+          const res = await fetch(`${API_BASE}?_api=apikey`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ api_key: input.value.trim() }),
@@ -473,7 +473,7 @@ function bindBudgetEvents() {
 
 async function fetchApiKeyStatus() {
   try {
-    const res = await fetch(`${API_BASE}/settings/api-key`);
+    const res = await fetch(`${API_BASE}?_api=apikey`);
     if (res.ok) {
       state.apiKeyStatus = await res.json();
     }

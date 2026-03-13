@@ -15,27 +15,22 @@ interface HttpHandlerParams {
 
 const PREFIX = "/plugins/openclaw-news-analyzer";
 
-const MIME: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "application/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-  ".ico": "image/x-icon",
-};
-
 /**
- * Serves the News Analyzer dashboard as a single self-contained HTML page.
- *
- * The OpenClaw gateway only supports exact-path matching for plugin routes,
- * so we bundle all UI assets (JS + CSS) inline and have the client-side JS
- * talk directly to the Python engine on localhost.
+ * Gateway only supports exact-path matching for plugin routes.
+ * This handler serves on the EXACT path `/plugins/openclaw-news-analyzer`:
+ *   - No query params → self-contained HTML bundle (inline JS+CSS)
+ *   - ?_api=overview   → proxy GET /api/dashboard/overview
+ *   - ?_api=status     → proxy GET /api/status
+ *   - ?_api=tree&id=N  → proxy GET /api/dashboard/tree/{N}
+ *   - ?_api=feeds      → proxy GET/POST /api/feeds
+ *   - ?_api=feeds&id=N → proxy DELETE /api/feeds/{N}
+ *   - ?_api=budget     → proxy GET/PUT /api/budget
+ *   - ?_api=apikey     → proxy GET/PUT /api/settings/api-key
  */
 export function createHttpHandler(params: HttpHandlerParams) {
   const { logger, uiRoot, enginePort } = params;
+  const ENGINE_BASE = `http://127.0.0.1:${enginePort}`;
 
-  // Cache the bundled HTML (rebuilt on first request and when files change)
   let bundledHtml: string | null = null;
   let lastBundleTime = 0;
 
@@ -46,10 +41,10 @@ export function createHttpHandler(params: HttpHandlerParams) {
     const css = fs.existsSync(cssPath) ? fs.readFileSync(cssPath, "utf8") : "";
     let js = fs.existsSync(jsPath) ? fs.readFileSync(jsPath, "utf8") : "";
 
-    // Replace the API_BASE constant to point directly to the Python engine
+    // Rewrite API_BASE to use query-parameter dispatch on the same URL
     js = js.replace(
       /const API_BASE\s*=\s*["'][^"']*["']/,
-      `const API_BASE = "http://127.0.0.1:${enginePort}/api"`,
+      `const API_BASE = "${PREFIX}"`,
     );
 
     return `<!doctype html>
@@ -67,6 +62,41 @@ export function createHttpHandler(params: HttpHandlerParams) {
 </html>`;
   }
 
+  async function proxyToEngine(
+    enginePath: string,
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<boolean> {
+    try {
+      const url = `${ENGINE_BASE}${enginePath}`;
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const method = req.method || "GET";
+
+      const fetchOpts: RequestInit = { method, headers };
+
+      if (method !== "GET" && method !== "HEAD") {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const body = Buffer.concat(chunks).toString("utf-8");
+        if (body) fetchOpts.body = body;
+      }
+
+      const engineRes = await fetch(url, fetchOpts);
+      const data = await engineRes.text();
+
+      res.writeHead(engineRes.status, {
+        "Content-Type": engineRes.headers.get("content-type") || "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+      res.end(data);
+    } catch (err) {
+      logger?.warn?.(`[openclaw-news-analyzer] Proxy error: ${err}`);
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `Engine proxy error: ${err}` }));
+    }
+    return true;
+  }
+
   return async function handler(
     req: IncomingMessage,
     res: ServerResponse,
@@ -74,10 +104,39 @@ export function createHttpHandler(params: HttpHandlerParams) {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     const pathname = url.pathname;
 
-    // Only handle our exact plugin path (gateway does exact matching only)
     if (pathname !== PREFIX) return false;
 
-    // Rebuild bundle if stale (check every 5 seconds)
+    // ── API dispatch via _api query param ────────────────────
+    const apiAction = url.searchParams.get("_api");
+
+    if (apiAction === "overview" && req.method === "GET") {
+      return proxyToEngine("/api/dashboard/overview", req, res);
+    }
+    if (apiAction === "status" && req.method === "GET") {
+      return proxyToEngine("/api/status", req, res);
+    }
+    if (apiAction === "tree" && req.method === "GET") {
+      const id = url.searchParams.get("id") || "";
+      return proxyToEngine(`/api/dashboard/tree/${encodeURIComponent(id)}`, req, res);
+    }
+    if (apiAction === "feeds") {
+      if (req.method === "GET") return proxyToEngine("/api/feeds", req, res);
+      if (req.method === "POST") return proxyToEngine("/api/feeds", req, res);
+      if (req.method === "DELETE") {
+        const id = url.searchParams.get("id") || "";
+        return proxyToEngine(`/api/feeds/${encodeURIComponent(id)}`, req, res);
+      }
+    }
+    if (apiAction === "budget") {
+      if (req.method === "GET") return proxyToEngine("/api/budget", req, res);
+      if (req.method === "PUT") return proxyToEngine("/api/budget", req, res);
+    }
+    if (apiAction === "apikey") {
+      if (req.method === "GET") return proxyToEngine("/api/settings/api-key", req, res);
+      if (req.method === "PUT") return proxyToEngine("/api/settings/api-key", req, res);
+    }
+
+    // ── HTML bundle ──────────────────────────────────────────
     const now = Date.now();
     if (!bundledHtml || now - lastBundleTime > 5000) {
       try {
