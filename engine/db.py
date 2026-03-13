@@ -192,6 +192,7 @@ class RunUp(Base):
     # Relationships
     decision_nodes = relationship("DecisionNode", back_populates="run_up")
     predictions = relationship("Prediction", back_populates="run_up")
+    polymarket_matches = relationship("PolymarketMatch", back_populates="run_up")
     merged_children = relationship(
         "RunUp",
         backref="merged_into",
@@ -283,9 +284,10 @@ class Consequence(Base):
     confirmed_at: Optional[datetime] = Column(DateTime, nullable=True)
     evidence: Optional[str] = Column(Text, nullable=True)
 
-    # Relationship
+    # Relationships
     decision_node = relationship("DecisionNode", back_populates="consequences")
     predictions = relationship("Prediction", back_populates="consequence")
+    stock_impacts = relationship("StockImpact", back_populates="consequence")
 
     @property
     def keywords(self) -> Any:
@@ -299,6 +301,73 @@ class Consequence(Base):
         return (
             f"<Consequence id={self.id} node={self.decision_node_id} "
             f"branch={self.branch!r} p={self.probability:.2f}>"
+        )
+
+
+class StockImpact(Base):
+    """A stock or ETF affected by a specific consequence."""
+
+    __tablename__ = "stock_impacts"
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    consequence_id: int = Column(
+        Integer, ForeignKey("consequences.id"), nullable=False
+    )
+    ticker: str = Column(String(16), nullable=False)
+    name: str = Column(String(256), nullable=False)
+    asset_type: str = Column(String(32), nullable=False, default="stock")
+    direction: str = Column(String(16), nullable=False)
+    magnitude: str = Column(String(16), nullable=False, default="moderate")
+    reasoning: str = Column(Text, nullable=False, default="")
+    created_at: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    consequence = relationship("Consequence", back_populates="stock_impacts")
+
+    def __repr__(self) -> str:
+        return (
+            f"<StockImpact id={self.id} ticker={self.ticker!r} "
+            f"dir={self.direction!r} mag={self.magnitude!r}>"
+        )
+
+
+class PolymarketMatch(Base):
+    """A Polymarket prediction market matched to a run-up question."""
+
+    __tablename__ = "polymarket_matches"
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    run_up_id: int = Column(Integer, ForeignKey("run_ups.id"), nullable=False)
+    decision_node_id: Optional[int] = Column(
+        Integer, ForeignKey("decision_nodes.id"), nullable=True
+    )
+    polymarket_id: str = Column(String(64), nullable=False)
+    polymarket_slug: Optional[str] = Column(String(256), nullable=True)
+    polymarket_question: str = Column(Text, nullable=False)
+    polymarket_url: Optional[str] = Column(String(512), nullable=True)
+    outcome_yes_price: float = Column(Float, nullable=False, default=0.5)
+    outcome_no_price: float = Column(Float, nullable=False, default=0.5)
+    volume: Optional[float] = Column(Float, nullable=True)
+    liquidity: Optional[float] = Column(Float, nullable=True)
+    end_date: Optional[datetime] = Column(DateTime, nullable=True)
+    match_score: float = Column(Float, nullable=False, default=0.0)
+    match_method: str = Column(String(32), nullable=False, default="keyword")
+    calibrated_probability: Optional[float] = Column(Float, nullable=True)
+    fetched_at: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: datetime = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("run_up_id", "polymarket_id", name="uq_runup_polymarket"),
+    )
+
+    run_up = relationship("RunUp", back_populates="polymarket_matches")
+    decision_node = relationship("DecisionNode", backref="polymarket_matches")
+
+    def __repr__(self) -> str:
+        return (
+            f"<PolymarketMatch id={self.id} run_up={self.run_up_id} "
+            f"yes={self.outcome_yes_price:.2f} score={self.match_score:.1f}>"
         )
 
 

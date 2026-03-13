@@ -26,6 +26,8 @@ from .db import (
     RunUp,
     DecisionNode,
     Consequence,
+    StockImpact,
+    PolymarketMatch,
     ProbabilityUpdate,
     Prediction,
     UserFeed,
@@ -972,15 +974,40 @@ def dashboard_tree(run_up_id: int, db: Session = Depends(_get_db)):
             .order_by(Consequence.order)
             .all()
         )
+        cons_dicts = []
+        for c in consequences:
+            cd = _consequence_to_dict(c)
+            # Add branch_probability and effective_probability
+            branch_prob = n.yes_probability if c.branch == "yes" else n.no_probability
+            cd["branch_probability"] = round(branch_prob, 4)
+            cd["effective_probability"] = round(branch_prob * c.probability, 4)
+            # Attach stock impacts
+            impacts = (
+                db.query(StockImpact)
+                .filter(StockImpact.consequence_id == c.id)
+                .all()
+            )
+            cd["stock_impacts"] = [_stock_impact_to_dict(si) for si in impacts]
+            cons_dicts.append(cd)
+
         tree_nodes.append({
             **_node_to_dict(n),
-            "consequences": [_consequence_to_dict(c) for c in consequences],
+            "consequences": cons_dicts,
             "children_ids": [ch.id for ch in n.children] if n.children else [],
         })
+
+    # Polymarket matches for this run-up
+    poly_matches = (
+        db.query(PolymarketMatch)
+        .filter(PolymarketMatch.run_up_id == run_up_id)
+        .order_by(PolymarketMatch.match_score.desc())
+        .all()
+    )
 
     return {
         "run_up": _runup_to_dict(ru),
         "tree": tree_nodes,
+        "polymarket": [_polymarket_to_dict(m) for m in poly_matches],
     }
 
 
@@ -1086,6 +1113,31 @@ def get_status(db: Session = Depends(_get_db)):
         "total_briefs": brief_count,
         "fetch_interval_minutes": config.fetch_interval_minutes,
     }
+
+
+# ===========================================================================
+# Polymarket endpoints
+# ===========================================================================
+
+
+@router.get("/polymarket/{run_up_id}")
+def get_polymarket_matches(run_up_id: int, db: Session = Depends(_get_db)):
+    """Return Polymarket matches for a run-up."""
+    matches = (
+        db.query(PolymarketMatch)
+        .filter(PolymarketMatch.run_up_id == run_up_id)
+        .order_by(PolymarketMatch.match_score.desc())
+        .all()
+    )
+    return [_polymarket_to_dict(m) for m in matches]
+
+
+@router.post("/polymarket/refresh")
+def trigger_polymarket_refresh():
+    """Manually trigger a Polymarket data refresh."""
+    from .polymarket import update_polymarket_matches
+    count = update_polymarket_matches()
+    return {"status": "ok", "matches_updated": count}
 
 
 # ===========================================================================
@@ -1218,6 +1270,41 @@ def _prediction_to_dict(p: Prediction) -> Dict:
         "outcome": p.outcome,
         "verified_at": p.verified_at.isoformat() if p.verified_at else None,
         "evidence": p.evidence,
+    }
+
+
+def _stock_impact_to_dict(si: StockImpact) -> Dict:
+    return {
+        "id": si.id,
+        "consequence_id": si.consequence_id,
+        "ticker": si.ticker,
+        "name": si.name,
+        "asset_type": si.asset_type,
+        "direction": si.direction,
+        "magnitude": si.magnitude,
+        "reasoning": si.reasoning,
+    }
+
+
+def _polymarket_to_dict(m: PolymarketMatch) -> Dict:
+    return {
+        "id": m.id,
+        "run_up_id": m.run_up_id,
+        "decision_node_id": m.decision_node_id,
+        "polymarket_id": m.polymarket_id,
+        "polymarket_slug": m.polymarket_slug,
+        "polymarket_question": m.polymarket_question,
+        "polymarket_url": m.polymarket_url,
+        "outcome_yes_price": m.outcome_yes_price,
+        "outcome_no_price": m.outcome_no_price,
+        "volume": m.volume,
+        "liquidity": m.liquidity,
+        "end_date": m.end_date.isoformat() if m.end_date else None,
+        "match_score": m.match_score,
+        "match_method": m.match_method,
+        "calibrated_probability": m.calibrated_probability,
+        "fetched_at": m.fetched_at.isoformat() if m.fetched_at else None,
+        "updated_at": m.updated_at.isoformat() if m.updated_at else None,
     }
 
 

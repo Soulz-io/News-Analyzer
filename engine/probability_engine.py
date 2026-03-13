@@ -62,8 +62,10 @@ def find_relevant_briefs(
     briefs: List[ArticleBrief],
     min_overlap: int = 0,
 ) -> List[ArticleBrief]:
-    """Return briefs whose keywords overlap with *keywords* by at least
-    *min_overlap* terms.
+    """Return briefs whose keywords overlap with *keywords*.
+
+    Uses both exact keyword match and substring matching for multi-word
+    keywords (e.g. "ceasefire agreement" matches brief keyword "ceasefire").
 
     Parameters
     ----------
@@ -82,15 +84,55 @@ def find_relevant_briefs(
         return []
 
     target_set = set(keywords)
+    # Extract individual significant words from multi-word keywords
+    target_words = set()
+    for kw in keywords:
+        for w in kw.split():
+            if len(w) > 3:
+                target_words.add(w)
+
     matches: List[ArticleBrief] = []
 
     for brief in briefs:
         bkw = _brief_keywords(brief)
-        overlap = target_set & bkw
-        if len(overlap) >= min_overlap:
+        # Exact keyword overlap
+        overlap = len(target_set & bkw)
+        # Also count partial word matches (brief keyword contains target word or vice versa)
+        if overlap < min_overlap:
+            brief_words = set()
+            for k in bkw:
+                for w in k.split():
+                    if len(w) > 3:
+                        brief_words.add(w)
+            word_overlap = len(target_words & brief_words)
+            # Each 2 word matches counts as 1 keyword overlap
+            overlap += word_overlap // 2
+
+        if overlap >= min_overlap:
             matches.append(brief)
 
     return matches
+
+
+def _word_overlap(brief_kw: Set[str], target_kw: List[str]) -> float:
+    """Count keyword overlap including partial word matches."""
+    target_set = set(target_kw)
+    exact = len(brief_kw & target_set)
+
+    # Also check individual words from multi-word keywords
+    brief_words = set()
+    for k in brief_kw:
+        for w in k.split():
+            if len(w) > 3:
+                brief_words.add(w)
+    target_words = set()
+    for k in target_kw:
+        for w in k.split():
+            if len(w) > 3:
+                target_words.add(w)
+
+    word_matches = len(brief_words & target_words)
+    return exact + word_matches * 0.5
 
 
 def score_evidence(brief: ArticleBrief, yes_keywords: List[str], no_keywords: List[str]) -> float:
@@ -106,8 +148,8 @@ def score_evidence(brief: ArticleBrief, yes_keywords: List[str], no_keywords: Li
       - brief intensity (higher intensity = stronger signal)
     """
     bkw = _brief_keywords(brief)
-    yes_overlap = len(bkw & set(yes_keywords))
-    no_overlap = len(bkw & set(no_keywords))
+    yes_overlap = _word_overlap(bkw, yes_keywords)
+    no_overlap = _word_overlap(bkw, no_keywords)
 
     if yes_overlap == 0 and no_overlap == 0:
         return 0.0
@@ -277,7 +319,7 @@ def update_probabilities(new_briefs: List[ArticleBrief]) -> List[ProbabilityUpda
             total_score = 0.0
             for brief in relevant:
                 bkw = _brief_keywords(brief)
-                overlap = len(bkw & set(cons_kw))
+                overlap = _word_overlap(bkw, cons_kw)
                 intensity_mult = {
                     "low": 0.4, "moderate": 0.7, "high-threat": 1.0, "critical": 1.3,
                 }.get(brief.intensity, 0.5)

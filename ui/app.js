@@ -20,6 +20,7 @@ let state = {
   feeds: [],             // All RSS feeds (default + user)
   budget: null,          // { daily_budget_eur, spent_today_eur, remaining_eur, percentage_used }
   apiKeyStatus: null,    // { has_key, masked }
+  polymarket: [],        // Polymarket matches for current tree
   loading: true,
   error: null,
 };
@@ -217,9 +218,12 @@ async function fetchTree(runUpId) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
 
-    // Transform API format { run_up, tree: [nodes] } into UI format
+    // Transform API format { run_up, tree: [nodes], polymarket: [...] } into UI format
     const nodes = data.tree || [];
     const rootNode = nodes.find(n => n.branch === "root" || n.depth === 0) || nodes[0];
+
+    // Polymarket data comes inline from the tree endpoint
+    state.polymarket = data.polymarket || [];
 
     if (!rootNode) {
       state.activeTree = null;
@@ -242,6 +246,7 @@ async function fetchTree(runUpId) {
   } catch (err) {
     console.warn("[news-analyzer] fetch tree error:", err);
     state.activeTree = null;
+    state.polymarket = [];
   }
   render();
 }
@@ -254,9 +259,19 @@ function mapConsequence(c) {
   return {
     description: c.description || "",
     probability: (c.probability || 0) * 100,
+    branch_probability: (c.branch_probability || 0) * 100,
+    effective_probability: (c.effective_probability || 0) * 100,
     impacts: impacts,
     keywords: c.keywords || [],
     status: c.status || "predicted",
+    stock_impacts: (c.stock_impacts || []).map(si => ({
+      ticker: si.ticker || "",
+      name: si.name || "",
+      asset_type: si.asset_type || "stock",
+      direction: si.direction || "bullish",
+      magnitude: si.magnitude || "moderate",
+      reasoning: si.reasoning || "",
+    })),
   };
 }
 
@@ -589,6 +604,57 @@ function renderTreeView() {
     </div>
   </div>`;
 
+  // Polymarket calibration panel
+  const polyMatches = state.polymarket || [];
+  if (polyMatches.length > 0) {
+    html += `<div class="polymarket-panel">
+      <div class="polymarket-panel__header">
+        <span class="polymarket-logo">PM</span>
+        Polymarket Calibration
+      </div>`;
+
+    for (const pm of polyMatches) {
+      const pmProb = Math.round((pm.outcome_yes_price || 0) * 100);
+      const ourProb = pct(rootProb);
+      const calProb = pm.calibrated_probability
+        ? Math.round(pm.calibrated_probability * 100)
+        : null;
+      const diff = pmProb - ourProb;
+      const diffCls = diff > 5 ? "poly-diff--higher"
+        : diff < -5 ? "poly-diff--lower"
+        : "poly-diff--aligned";
+      const volume = pm.volume ? `$${(pm.volume / 1000).toFixed(0)}K` : "";
+
+      html += `<div class="polymarket-match">
+        <div class="polymarket-match__question">${esc(pm.polymarket_question)}</div>
+        <div class="polymarket-match__probs">
+          <div class="prob-compare">
+            <span class="prob-compare__label">Our estimate:</span>
+            <span class="prob-compare__value">${ourProb}%</span>
+          </div>
+          <div class="prob-compare">
+            <span class="prob-compare__label">Polymarket:</span>
+            <span class="prob-compare__value">${pmProb}%</span>
+          </div>
+          ${calProb !== null ? `
+          <div class="prob-compare prob-compare--calibrated">
+            <span class="prob-compare__label">Calibrated:</span>
+            <span class="prob-compare__value">${calProb}%</span>
+          </div>` : ""}
+        </div>
+        <div class="polymarket-match__meta">
+          <span class="poly-diff ${diffCls}">
+            ${diff > 0 ? "+" : ""}${diff}pp difference
+          </span>
+          ${volume ? `<span class="poly-volume">Vol: ${volume}</span>` : ""}
+          ${pm.polymarket_url ? `<a href="${esc(pm.polymarket_url)}" target="_blank" rel="noopener" class="poly-link">View on Polymarket &#8599;</a>` : ""}
+        </div>
+      </div>`;
+    }
+
+    html += `</div>`;
+  }
+
   // Connector
   html += `<div class="tree-connector"><div class="tree-connector__line"></div></div>`;
 
@@ -596,11 +662,16 @@ function renderTreeView() {
   const yesConsequences = tree.consequences_yes || tree.consequences?.yes || [];
   const noConsequences = tree.consequences_no || tree.consequences?.no || [];
 
+  const yesProb = pct(rootProb);
+  const noProb = pct(100 - rootProb);
+
   html += `<div class="tree-branches">`;
 
   // YES branch
   html += `<div class="tree-branch">
-    <div class="tree-branch__header tree-branch__header--yes">&#10003; Yes</div>
+    <div class="tree-branch__header tree-branch__header--yes">
+      &#10003; Yes <span class="tree-branch__prob">${yesProb}%</span>
+    </div>
     <div class="tree-branch__body">`;
   if (yesConsequences.length === 0) {
     html += `<div class="text-dim" style="padding:12px;font-size:0.82rem;">No consequences mapped yet.</div>`;
@@ -612,7 +683,9 @@ function renderTreeView() {
 
   // NO branch
   html += `<div class="tree-branch">
-    <div class="tree-branch__header tree-branch__header--no">&#10007; No</div>
+    <div class="tree-branch__header tree-branch__header--no">
+      &#10007; No <span class="tree-branch__prob">${noProb}%</span>
+    </div>
     <div class="tree-branch__body">`;
   if (noConsequences.length === 0) {
     html += `<div class="text-dim" style="padding:12px;font-size:0.82rem;">No consequences mapped yet.</div>`;
@@ -637,8 +710,9 @@ function renderTreeView() {
 /* ── Render: Consequence Card ────────────────────────────────── */
 
 function renderConsequenceCard(c, num) {
-  const prob = c.probability || 0;
-  const isNearCertain = prob >= 90;
+  const condProb = c.probability || 0;
+  const effProb = c.effective_probability || 0;
+  const isNearCertain = effProb >= 70;
   const impacts = c.impacts || c.impact_tags || [];
   const keywords = c.keywords || [];
   const statusVal = c.status || "";
@@ -653,10 +727,11 @@ function renderConsequenceCard(c, num) {
     <div class="consequence-card__prob">
       <div class="prob-bar">
         <div class="prob-bar__track">
-          <div class="prob-bar__fill" style="width:${pct(prob)}%"></div>
+          <div class="prob-bar__fill" style="width:${pct(effProb)}%"></div>
         </div>
-        <div class="prob-bar__label">${pct(prob)}%</div>
+        <div class="prob-bar__label">${pct(effProb)}%</div>
       </div>
+      <div class="prob-bar__detail">Effective probability &middot; <span class="text-dim">if this path: ${pct(condProb)}%</span></div>
     </div>`;
 
   // Near-certainty badge
@@ -690,6 +765,24 @@ function renderConsequenceCard(c, num) {
     html += `<div class="keyword-tags">`;
     for (const kw of keywords) {
       html += `<span class="keyword-tag">${esc(kw)}</span>`;
+    }
+    html += `</div>`;
+  }
+
+  // Stock impacts
+  const stocks = c.stock_impacts || [];
+  if (stocks.length > 0) {
+    html += `<div class="stock-impacts">`;
+    for (const si of stocks) {
+      const dirCls = si.direction === "bullish" ? "stock-badge--bullish" : "stock-badge--bearish";
+      const arrow = si.direction === "bullish" ? "&#9650;" : "&#9660;";
+      const magCls = si.magnitude === "high" ? "stock-mag--high" : (si.magnitude === "extreme" ? "stock-mag--extreme" : "");
+      html += `<div class="stock-badge ${dirCls}" title="${esc(si.reasoning)}">
+        <span class="stock-badge__arrow">${arrow}</span>
+        <span class="stock-badge__ticker">${esc(si.ticker)}</span>
+        <span class="stock-badge__name">${esc(si.name)}</span>
+        <span class="stock-badge__mag ${magCls}">${esc(si.magnitude)}</span>
+      </div>`;
     }
     html += `</div>`;
   }

@@ -24,6 +24,7 @@ from .db import (
     RunUp,
     DecisionNode,
     Consequence,
+    StockImpact,
     NarrativeTimeline,
     ArticleBrief,
     Article,
@@ -82,6 +83,7 @@ Analyze this news run-up and create a decision tree.
    - Geopolitical impact (1 sentence)
    - Social impact (1 sentence)
    - 3 tracking keywords (for automated monitoring)
+   - 1-3 affected stocks, ETFs, or commodities with ticker, direction (bullish/bearish), magnitude (low/moderate/high/extreme), and reasoning
 
 Respond with this exact JSON structure:
 {{
@@ -98,7 +100,17 @@ Respond with this exact JSON structure:
         "impact_economic": "Economic effect",
         "impact_geopolitical": "Geopolitical effect",
         "impact_social": "Social effect",
-        "keywords": ["track1", "track2", "track3"]
+        "keywords": ["track1", "track2", "track3"],
+        "stock_impacts": [
+          {{
+            "ticker": "XOM",
+            "name": "ExxonMobil",
+            "asset_type": "stock",
+            "direction": "bullish",
+            "magnitude": "high",
+            "reasoning": "Oil supply disruption fears drive energy stocks up"
+          }}
+        ]
       }}
     ],
     "no": [
@@ -108,7 +120,17 @@ Respond with this exact JSON structure:
         "impact_economic": "Economic effect",
         "impact_geopolitical": "Geopolitical effect",
         "impact_social": "Social effect",
-        "keywords": ["track1", "track2", "track3"]
+        "keywords": ["track1", "track2", "track3"],
+        "stock_impacts": [
+          {{
+            "ticker": "SPY",
+            "name": "S&P 500 ETF",
+            "asset_type": "etf",
+            "direction": "bullish",
+            "magnitude": "low",
+            "reasoning": "Market relief on de-escalation"
+          }}
+        ]
       }}
     ]
   }}
@@ -413,7 +435,7 @@ def _store_tree(run_up_id: int, tree_data: Dict, session: Session) -> DecisionNo
     session.add(root)
     session.flush()  # get root.id
 
-    # Create consequences for YES branch
+    # Create consequences for YES and NO branches
     consequences = tree_data.get("consequences", {})
     for branch_name in ("yes", "no"):
         branch_cons = consequences.get(branch_name, [])
@@ -431,6 +453,23 @@ def _store_tree(run_up_id: int, tree_data: Dict, session: Session) -> DecisionNo
                 status="predicted",
             )
             session.add(cons)
+            session.flush()  # need cons.id for stock impacts
+
+            # Store stock impacts for this consequence
+            for si_data in cons_data.get("stock_impacts", []):
+                ticker = si_data.get("ticker", "").strip().upper()
+                if not ticker:
+                    continue
+                si = StockImpact(
+                    consequence_id=cons.id,
+                    ticker=ticker,
+                    name=si_data.get("name", ticker),
+                    asset_type=si_data.get("asset_type", "stock"),
+                    direction=si_data.get("direction", "bullish"),
+                    magnitude=si_data.get("magnitude", "moderate"),
+                    reasoning=si_data.get("reasoning", ""),
+                )
+                session.add(si)
 
     session.flush()
     logger.info(

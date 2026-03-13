@@ -1474,3 +1474,176 @@ body {
   white-space: nowrap;
   border: 0;
 }
+
+
+/* ══════════════════════════════════════════════════════════════
+   Stock Impact Badges
+   ══════════════════════════════════════════════════════════════ */
+
+.stock-impacts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.stock-badge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  transition: border-color 0.15s;
+}
+
+.stock-badge:hover { border-color: var(--accent); }
+
+.stock-badge--bullish {
+  border-color: rgba(52, 211, 153, 0.4);
+  color: var(--green);
+}
+
+.stock-badge--bearish {
+  border-color: rgba(248, 113, 113, 0.4);
+  color: var(--red);
+}
+
+.stock-badge__arrow { font-size: 0.7rem; }
+
+.stock-badge__ticker {
+  font-weight: 700;
+  font-family: var(--mono);
+  letter-spacing: 0.02em;
+}
+
+.stock-badge__name {
+  opacity: 0.7;
+  font-size: 0.72rem;
+}
+
+.stock-badge__mag {
+  font-size: 0.68rem;
+  opacity: 0.6;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.stock-mag--high { color: var(--yellow); opacity: 1; }
+.stock-mag--extreme { color: var(--red); opacity: 1; font-weight: 600; }
+
+.stock-badge__reason {
+  font-size: 0.72rem;
+  opacity: 0.6;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+
+/* ══════════════════════════════════════════════════════════════
+   Polymarket Calibration Panel
+   ══════════════════════════════════════════════════════════════ */
+
+.polymarket-panel {
+  margin: 20px 0;
+  padding: 18px;
+  border-radius: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+}
+
+.polymarket-panel__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  margin-bottom: 14px;
+  font-size: 0.92rem;
+}
+
+.polymarket-logo {
+  background: #5b21b6;
+  color: #fff;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.polymarket-match {
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+
+.polymarket-match:first-of-type { border-top: none; padding-top: 0; }
+
+.polymarket-match__question {
+  font-size: 0.85rem;
+  margin-bottom: 10px;
+  line-height: 1.4;
+}
+
+.polymarket-match__probs {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.prob-compare {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.prob-compare__label {
+  font-size: 0.78rem;
+  opacity: 0.7;
+}
+
+.prob-compare__value {
+  font-weight: 700;
+  font-family: var(--mono);
+  font-size: 0.9rem;
+}
+
+.prob-compare--calibrated .prob-compare__value { color: var(--blue); }
+
+.polymarket-match__meta {
+  display: flex;
+  gap: 14px;
+  margin-top: 6px;
+  font-size: 0.78rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.poly-diff--higher { color: var(--green); }
+.poly-diff--lower { color: var(--red); }
+.poly-diff--aligned { color: var(--text-dim); }
+.poly-volume { opacity: 0.6; }
+.poly-link { color: var(--blue); text-decoration: none; }
+.poly-link:hover { text-decoration: underline; }
+
+
+/* ══════════════════════════════════════════════════════════════
+   Branch probability badge + effective probability
+   ══════════════════════════════════════════════════════════════ */
+
+.tree-branch__prob {
+  float: right;
+  font-family: var(--mono);
+  font-size: 0.92rem;
+  opacity: 0.9;
+}
+
+.prob-bar__detail {
+  font-size: 0.72rem;
+  margin-top: 3px;
+  opacity: 0.7;
+}

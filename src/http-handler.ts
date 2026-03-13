@@ -135,6 +135,13 @@ export function createHttpHandler(params: HttpHandlerParams) {
       if (req.method === "GET") return proxyToEngine("/api/settings/api-key", req, res);
       if (req.method === "PUT") return proxyToEngine("/api/settings/api-key", req, res);
     }
+    if (apiAction === "polymarket" && req.method === "GET") {
+      const id = url.searchParams.get("id") || "";
+      return proxyToEngine(`/api/polymarket/${encodeURIComponent(id)}`, req, res);
+    }
+    if (apiAction === "polymarket-refresh" && req.method === "POST") {
+      return proxyToEngine("/api/polymarket/refresh", req, res);
+    }
 
     // ── HTML bundle ──────────────────────────────────────────
     const now = Date.now();

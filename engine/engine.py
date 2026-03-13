@@ -104,9 +104,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         replace_existing=True,
         max_instances=1,
     )
+    # Schedule Polymarket data refresh (every hour)
+    scheduler.add_job(
+        polymarket_refresh,
+        trigger=IntervalTrigger(hours=1),
+        id="polymarket_refresh",
+        name="Polymarket data refresh",
+        replace_existing=True,
+        max_instances=1,
+    )
+
     scheduler.start()
     logger.info(
-        "Scheduler started -- fetch_and_process every %d min.",
+        "Scheduler started -- fetch_and_process every %d min, polymarket every 1h.",
         config.fetch_interval_minutes,
     )
 
@@ -118,6 +128,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # --- Shutdown ---
     scheduler.shutdown(wait=False)
     logger.info("Scheduler shut down.")
+
+
+async def polymarket_refresh() -> None:
+    """Recurring job: fetch and match Polymarket prediction market data."""
+    logger.info("=== polymarket_refresh cycle START ===")
+    try:
+        from .polymarket import update_polymarket_matches
+        count = update_polymarket_matches()
+        logger.info("Polymarket refresh: %d matches updated.", count)
+    except Exception:
+        logger.exception("polymarket_refresh cycle FAILED.")
+    finally:
+        logger.info("=== polymarket_refresh cycle END ===")
 
 
 async def _initial_fetch() -> None:
