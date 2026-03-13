@@ -102,7 +102,10 @@ async def deep_analysis_job() -> None:
     try:
         from .deep_analysis import run_deep_analysis
         report = run_deep_analysis(period_days=7)
-        logger.info("Deep analysis complete: report %d created.", report.id)
+        if report:
+            logger.info("Deep analysis complete: report %d created.", report.id)
+        else:
+            logger.warning("Deep analysis returned None — check logs for errors.")
     except Exception:
         logger.exception("deep_analysis cycle FAILED.")
     finally:

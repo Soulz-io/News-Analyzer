@@ -1191,6 +1191,8 @@ def trigger_analysis():
     from .deep_analysis import run_deep_analysis
     try:
         report = run_deep_analysis(period_days=7)
+        if report is None:
+            raise HTTPException(500, detail="Analysis returned no report — check engine logs.")
         return {"status": "ok", "report_id": report.id}
     except Exception as e:
         logger.exception("Manual analysis trigger failed.")

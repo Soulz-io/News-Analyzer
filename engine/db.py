@@ -570,7 +570,50 @@ def get_session() -> Session:
 
 
 def create_all() -> None:
-    """Create all tables if they do not exist."""
+    """Create all tables if they do not exist, and run lightweight migrations."""
     engine = _get_engine()
     Base.metadata.create_all(bind=engine)
+
+    # Lightweight column migrations for SQLite (ALTER TABLE ADD COLUMN).
+    # SQLAlchemy's create_all() creates new tables but won't add columns
+    # to existing ones.  We handle that here.
+    _migrate_columns(engine)
+
     logger.info("Database tables created / verified.")
+
+
+def _migrate_columns(engine) -> None:
+    """Add missing columns to existing tables (SQLite ALTER TABLE ADD COLUMN)."""
+    import sqlite3
+
+    # Only applies to SQLite
+    if "sqlite" not in str(engine.url):
+        return
+
+    db_path = str(engine.url).replace("sqlite:///", "")
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Check article_briefs for new v2 columns
+        cursor.execute("PRAGMA table_info(article_briefs)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+
+        migrations = {
+            "urgency_score": "FLOAT DEFAULT 0.0",
+            "source_credibility": "FLOAT DEFAULT 0.6",
+            "key_actors_json": "TEXT DEFAULT NULL",
+            "event_type": "VARCHAR(32) DEFAULT NULL",
+        }
+
+        for col_name, col_type in migrations.items():
+            if col_name not in existing_cols:
+                cursor.execute(
+                    f"ALTER TABLE article_briefs ADD COLUMN {col_name} {col_type}"
+                )
+                logger.info("Migration: added column article_briefs.%s", col_name)
+
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("Column migration failed (non-fatal).")
