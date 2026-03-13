@@ -174,6 +174,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         max_instances=1,
     )
 
+    # Schedule GDELT global events fetch (every 30 min)
+    scheduler.add_job(
+        gdelt_fetch_and_process,
+        trigger=IntervalTrigger(minutes=30),
+        id="gdelt_fetch",
+        name="GDELT global events fetch",
+        replace_existing=True,
+        max_instances=1,
+    )
+
     # Schedule X/Twitter OSINT fetch (if bearer token configured)
     if config.twitter_enabled:
         scheduler.add_job(
@@ -193,7 +203,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
     scheduler.start()
     logger.info(
-        "Scheduler started -- fetch %dmin, polymarket 1h, scoring 2h, confidence 30min, analysis 08:00+20:00 UTC.",
+        "Scheduler started -- fetch %dmin, polymarket 1h, scoring 2h, confidence 30min, GDELT 30min, analysis 08:00+20:00 UTC.",
         config.fetch_interval_minutes,
     )
 
@@ -259,6 +269,44 @@ async def twitter_fetch_and_process() -> None:
         logger.exception("twitter_fetch_and_process cycle FAILED.")
     finally:
         logger.info("=== twitter_fetch_and_process cycle END ===")
+
+
+async def gdelt_fetch_and_process() -> None:
+    """Recurring job: fetch articles from GDELT global events database."""
+    logger.info("=== gdelt_fetch_and_process cycle START ===")
+    try:
+        from .gdelt_fetcher import GdeltFetcher
+
+        fetcher = GdeltFetcher()
+        new_articles = await asyncio.to_thread(fetcher.fetch_and_save)
+
+        if not new_articles:
+            logger.info("GDELT: no new articles this cycle.")
+            return
+
+        logger.info("GDELT: fetched %d new articles.", len(new_articles))
+
+        # Run through the same NLP pipeline as RSS articles
+        from .nlp_pipeline import process_batch
+
+        briefs = process_batch(new_articles)
+        logger.info("GDELT: produced %d briefs.", len(briefs))
+
+        if briefs:
+            from .narrative_tracker import update_narratives, detect_runups
+
+            updated = update_narratives(briefs)
+            changed = [t.narrative_name for t in updated]
+            detect_runups(changed_narratives=changed)
+
+            from .probability_engine import update_probabilities
+
+            update_probabilities(briefs)
+
+    except Exception:
+        logger.exception("gdelt_fetch_and_process cycle FAILED.")
+    finally:
+        logger.info("=== gdelt_fetch_and_process cycle END ===")
 
 
 async def confidence_scoring() -> None:

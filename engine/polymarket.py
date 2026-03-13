@@ -417,6 +417,13 @@ def update_polymarket_matches() -> int:
             session.rollback()
             logger.exception("Failed to record Polymarket price history.")
 
+        # Auto-confirm nodes where Polymarket has resolved (≥97%)
+        try:
+            _auto_confirm_resolved_markets(session)
+        except Exception:
+            session.rollback()
+            logger.exception("Auto-confirmation pass failed (non-fatal).")
+
     except Exception:
         logger.exception("Polymarket update cycle failed.")
         session.rollback()
@@ -424,3 +431,115 @@ def update_polymarket_matches() -> int:
         session.close()
 
     return match_count
+
+
+# ---------------------------------------------------------------------------
+# Auto-confirmation of resolved markets
+# ---------------------------------------------------------------------------
+
+def _auto_confirm_resolved_markets(session: Session) -> int:
+    """Auto-confirm decision nodes when their matched Polymarket reaches >=97%.
+
+    For YES confirmation: outcome_yes_price >= 0.97
+    For NO confirmation:  outcome_yes_price <= 0.03 (i.e. outcome_no_price >= 0.97)
+
+    After confirming a node, attempts to generate a cascading child tree for
+    the next level of analysis.
+
+    Returns the number of nodes confirmed.
+    """
+    confirmed_count = 0
+
+    # --- YES branch: market strongly says YES ---
+    yes_matches = (
+        session.query(PolymarketMatch)
+        .filter(PolymarketMatch.outcome_yes_price >= 0.97)
+        .filter(PolymarketMatch.decision_node_id.isnot(None))
+        .all()
+    )
+
+    for match in yes_matches:
+        node = (
+            session.query(DecisionNode)
+            .filter(DecisionNode.id == match.decision_node_id)
+            .first()
+        )
+        if node is None or node.status != "open":
+            continue
+
+        node.status = "confirmed_yes"
+        node.confirmed_at = datetime.utcnow()
+        node.evidence = (
+            f"Polymarket '{match.polymarket_question}' reached "
+            f"{match.outcome_yes_price:.0%} — auto-confirmed"
+        )
+        confirmed_count += 1
+        logger.info(
+            "Auto-confirmed YES: node %d (question=%r) — Polymarket at %.0f%%",
+            node.id, node.question[:80], match.outcome_yes_price * 100,
+        )
+
+    # --- NO branch: market strongly says NO ---
+    no_matches = (
+        session.query(PolymarketMatch)
+        .filter(PolymarketMatch.outcome_yes_price <= 0.03)
+        .filter(PolymarketMatch.decision_node_id.isnot(None))
+        .all()
+    )
+
+    for match in no_matches:
+        node = (
+            session.query(DecisionNode)
+            .filter(DecisionNode.id == match.decision_node_id)
+            .first()
+        )
+        if node is None or node.status != "open":
+            continue
+
+        node.status = "confirmed_no"
+        node.confirmed_at = datetime.utcnow()
+        node.evidence = (
+            f"Polymarket '{match.polymarket_question}' reached "
+            f"{match.outcome_no_price:.0%} NO — auto-confirmed"
+        )
+        confirmed_count += 1
+        logger.info(
+            "Auto-confirmed NO: node %d (question=%r) — Polymarket NO at %.0f%%",
+            node.id, node.question[:80], match.outcome_no_price * 100,
+        )
+
+    if confirmed_count > 0:
+        session.commit()
+        logger.info("Auto-confirmed %d decision nodes from Polymarket.", confirmed_count)
+
+        # Trigger cascading child-tree generation for each confirmed node
+        confirmed_nodes = (
+            session.query(DecisionNode)
+            .filter(DecisionNode.status.in_(["confirmed_yes", "confirmed_no"]))
+            .filter(DecisionNode.confirmed_at.isnot(None))
+            .all()
+        )
+        for node in confirmed_nodes:
+            # Only generate children if this node doesn't already have child nodes
+            has_children = (
+                session.query(DecisionNode)
+                .filter(DecisionNode.parent_node_id == node.id)
+                .first()
+            )
+            if has_children:
+                continue
+            try:
+                from .tree_generator import generate_child_tree
+                result = generate_child_tree(node.id)
+                if result:
+                    logger.info(
+                        "Generated child tree for confirmed node %d: %s",
+                        node.id, result.get("status", "?"),
+                    )
+            except Exception:
+                logger.exception(
+                    "Child tree generation failed for node %d (non-fatal).",
+                    node.id,
+                )
+
+    return confirmed_count

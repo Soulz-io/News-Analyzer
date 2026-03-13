@@ -54,6 +54,10 @@ export function createHttpHandler(params: HttpHandlerParams) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>News Analyzer</title>
   <style>${css}</style>
+  <script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="https://unpkg.com/dagre@0.8/dist/dagre.min.js"></script>
+  <script src="https://unpkg.com/cytoscape@3/dist/cytoscape.min.js"></script>
+  <script src="https://unpkg.com/cytoscape-dagre@2/cytoscape-dagre.js"></script>
 </head>
 <body>
   <div id="app"></div>
@@ -159,6 +163,18 @@ export function createHttpHandler(params: HttpHandlerParams) {
     }
     if (apiAction === "signals-refresh" && req.method === "POST") {
       return proxyToEngine("/api/signals/refresh", req, res);
+    }
+    if (apiAction === "price" && req.method === "GET") {
+      const ticker = url.searchParams.get("ticker") || "";
+      return proxyToEngine(`/api/price/${encodeURIComponent(ticker)}`, req, res);
+    }
+    if (apiAction === "price-chart" && req.method === "GET") {
+      const ticker = url.searchParams.get("ticker") || "";
+      const period = url.searchParams.get("period") || "3mo";
+      return proxyToEngine(`/api/price/${encodeURIComponent(ticker)}/chart?period=${encodeURIComponent(period)}`, req, res);
+    }
+    if (apiAction === "indicators" && req.method === "GET") {
+      return proxyToEngine("/api/indicators", req, res);
     }
 
     // ── HTML bundle ──────────────────────────────────────────

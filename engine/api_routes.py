@@ -1305,6 +1305,44 @@ def trigger_confidence_scoring():
 
 
 # ===========================================================================
+# Price Data & Market Indicators
+# ===========================================================================
+
+
+@router.get("/price/{ticker}")
+def get_price(ticker: str):
+    """Get current price + 24h change for a stock/ETF ticker."""
+    from .price_fetcher import get_price_fetcher
+
+    fetcher = get_price_fetcher()
+    return fetcher.get_quote(ticker.upper())
+
+
+@router.get("/price/{ticker}/chart")
+def get_price_chart(
+    ticker: str,
+    period: str = Query("3mo", description="1mo, 3mo, 6mo, 1y, 2y"),
+):
+    """Get OHLCV candlestick data for charting."""
+    allowed = {"1mo", "3mo", "6mo", "1y", "2y"}
+    if period not in allowed:
+        period = "3mo"
+    from .price_fetcher import get_price_fetcher
+
+    fetcher = get_price_fetcher()
+    return fetcher.get_chart_data(ticker.upper(), period)
+
+
+@router.get("/indicators")
+def get_market_indicators():
+    """Get BTC + Gold + VIX market indicators."""
+    from .price_fetcher import get_price_fetcher
+
+    fetcher = get_price_fetcher()
+    return fetcher.get_market_indicators()
+
+
+# ===========================================================================
 # Serialisation helpers
 # ===========================================================================
 

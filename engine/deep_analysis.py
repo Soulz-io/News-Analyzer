@@ -582,8 +582,9 @@ def _analyze_strategic_outlook(session, since_date) -> Dict[str, Any]:
             "available_on_bunq": is_available_on_bunq(ticker),
         })
 
-    # Sort: bunq-available first, then by signal strength
-    top_picks.sort(key=lambda x: (-int(x["available_on_bunq"]), -x["net_score"]))
+    # Filter to bunq-available only, then sort by signal strength
+    top_picks = [p for p in top_picks if p["available_on_bunq"]]
+    top_picks.sort(key=lambda x: -x["net_score"])
 
     logger.info(
         "Strategic outlook: %d stock signals, %d rumour-phase, %d news-phase narratives.",
@@ -608,8 +609,8 @@ STRATEGIC_SYSTEM = """\
 You are a senior geopolitical investment strategist.
 You write concise, actionable market outlooks based on news intelligence data.
 Your philosophy: "Buy the rumour, sell the news" — identify opportunities
-BEFORE events fully materialize. Focus on bunq Stocks-available tickers.
-Write in Dutch. Be direct, no fluff. Use bullet points where helpful.
+BEFORE events fully materialize. Focus on bunq Stocks-available tickers only.
+Write in English. Be direct, no fluff. Use bullet points where helpful.
 Respond with valid JSON only. No markdown, no explanation outside JSON."""
 
 STRATEGIC_USER_TEMPLATE = """\
@@ -635,23 +636,23 @@ Based on this intelligence data, write a strategic outlook.
 
 Write a JSON response:
 {{
-  "world_direction": "2-3 zinnen over waar de wereld naartoe gaat — de grote trends",
+  "world_direction": "2-3 sentences on where the world is heading — the big trends",
   "buy_opportunities": [
     {{
       "ticker": "XOM",
       "name": "ExxonMobil",
-      "reasoning": "Waarom nu kopen — 1-2 zinnen",
-      "narrative": "welk narratief drijft dit",
+      "reasoning": "Why buy now — 1-2 sentences",
+      "narrative": "which narrative drives this",
       "urgency": "high",
-      "timeframe": "korte termijn"
+      "timeframe": "short term"
     }}
   ],
   "sell_signals": [
     {{
       "ticker": "SPY",
       "name": "S&P 500 ETF",
-      "reasoning": "Waarom overwegen te verkopen — 1 zin",
-      "narrative": "welk narratief",
+      "reasoning": "Why consider selling — 1 sentence",
+      "narrative": "which narrative",
       "urgency": "medium"
     }}
   ],
@@ -659,10 +660,10 @@ Write a JSON response:
     {{
       "sector": "Energy",
       "direction": "bullish",
-      "reasoning": "Waarom — 1 zin"
+      "reasoning": "Why — 1 sentence"
     }}
   ],
-  "risk_warning": "Belangrijkste risico's — 1-2 zinnen"
+  "risk_warning": "Key risks — 1-2 sentences"
 }}
 
 IMPORTANT: Only include tickers that appear in the stock data above.

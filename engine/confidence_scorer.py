@@ -586,12 +586,12 @@ def _find_primary_ticker(
         if not ticker_scores:
             return None, None
 
-        # Sort by (bunq_available, score) -- prefer bunq tickers
-        best = max(
-            ticker_scores.keys(),
-            key=lambda t: (is_available_on_bunq(t), ticker_scores[t]),
-        )
+        # Only consider bunq-available tickers
+        bunq_tickers = {t for t in ticker_scores if is_available_on_bunq(t)}
+        if not bunq_tickers:
+            return None, None
 
+        best = max(bunq_tickers, key=lambda t: ticker_scores[t])
         direction = "bullish" if ticker_direction[best] > 0 else "bearish"
         return best, direction
 
