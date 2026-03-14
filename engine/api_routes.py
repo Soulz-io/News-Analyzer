@@ -995,6 +995,22 @@ def dashboard_tree(run_up_id: int, db: Session = Depends(_get_db)):
             branch_prob = n.yes_probability if c.branch == "yes" else n.no_probability
             cd["branch_probability"] = round(branch_prob, 4)
             cd["effective_probability"] = round(branch_prob * c.probability, 4)
+            # Proximity tracking
+            cd["proximity_pct"] = c.proximity_pct
+            if c.proximity_pct is not None and c.price_thresholds_json:
+                try:
+                    thresholds = json.loads(c.price_thresholds_json or "[]")
+                    if thresholds:
+                        th = thresholds[0]
+                        asset = th.get("asset", "?")
+                        direction = th.get("direction", "above")
+                        target = th.get("value", 0)
+                        arrow = "\u2192"
+                        cd["proximity_display"] = f"{asset} {arrow} ${target:.0f} ({c.proximity_pct:.0f}%)"
+                except Exception:
+                    cd["proximity_display"] = None
+            else:
+                cd["proximity_display"] = None
             # Attach stock impacts
             impacts = (
                 db.query(StockImpact)

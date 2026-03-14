@@ -606,7 +606,7 @@ function renderIndicatorBar() {
   const ind = state.indicators;
   if (!ind) return "";
 
-  function fmtInd(label, data, prefix) {
+  function fmtInd(label, data, prefix, suffix) {
     if (!data || data.error) return `<div class="ind-item"><span class="ind-label">${label}</span><span class="ind-val">--</span></div>`;
     const price = data.price != null ? data.price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "--";
     const chg = data.change_pct != null ? data.change_pct : 0;
@@ -614,14 +614,15 @@ function renderIndicatorBar() {
     const chgStr = (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%";
     return `<div class="ind-item">
       <span class="ind-label">${label}</span>
-      <span class="ind-val">${prefix || ""}${price}</span>
+      <span class="ind-val">${prefix || ""}${price}${suffix || ""}</span>
       <span class="ind-chg ${chgCls}">${chgStr}</span>
     </div>`;
   }
 
   return `<div class="indicator-bar">
-    ${fmtInd("BTC", ind.bitcoin, "$")}
-    ${fmtInd("Gold", ind.gold, "$")}
+    ${fmtInd("BTC", ind.bitcoin, "\u20ac")}
+    ${fmtInd("Gold", ind.gold, "\u20ac", "/kg")}
+    ${fmtInd("Oil", ind.oil, "$")}
     ${fmtInd("VIX", ind.vix, "")}
   </div>`;
 }
@@ -751,15 +752,6 @@ async function _renderPriceModal(ticker, period) {
 
 /* ── Render: Trading Signals Panel ──────────────────────────── */
 
-const _expandedSignals = new Set();
-
-const LEVEL_EXPLAIN = {
-  WATCH: "Monitoring \u2014 early signals detected, situation developing",
-  ALERT: "Elevated \u2014 multiple independent sources confirm escalation",
-  BUY: "Buy signal \u2014 high multi-source convergence, act before news breaks",
-  STRONG_BUY: "Strong buy \u2014 very high certainty across all signal sources",
-};
-
 function renderSignalsPanel() {
   const sigs = state.signals || [];
   if (!sigs.length) return "";
@@ -769,110 +761,63 @@ function renderSignalsPanel() {
 
   let rows = "";
   for (const s of sorted.slice(0, 10)) {
-    const conf = Math.round(s.confidence * 100);
     const lvl = s.signal_level || "WATCH";
     const lvlCls = lvl === "STRONG_BUY" || lvl === "BUY" ? "sig--buy"
                  : lvl === "ALERT" ? "sig--alert" : "sig--watch";
-    const barCls = lvl === "STRONG_BUY" ? "sig-bar--strong"
-                 : lvl === "BUY" ? "sig-bar--buy"
-                 : lvl === "ALERT" ? "sig-bar--alert" : "sig-bar--watch";
 
     const arrow = s.direction === "bullish" ? "&#9650;" : (s.direction === "bearish" ? "&#9660;" : "");
     const dirCls = s.direction === "bullish" ? "sig-dir--bull" : (s.direction === "bearish" ? "sig-dir--bear" : "");
-    const isExpanded = _expandedSignals.has(s.id);
-
-    // Expanded detail: component breakdown with explanations
-    let detailHtml = "";
-    if (isExpanded) {
-      const comps = s.components || {};
-      const runupPct = Math.round((comps.runup_score || 0) * 100);
-      const xPct = Math.round((comps.x_signal || 0) * 100);
-      const polyPct = Math.round((comps.polymarket_drift || 0) * 100);
-      const newsPct = Math.round((comps.news_acceleration || 0) * 100);
-      const srcPct = Math.round((comps.source_convergence || 0) * 100);
-
-      detailHtml = `<div class="sig-detail">
-        <div class="sig-detail__level-explain">${LEVEL_EXPLAIN[lvl] || ""}</div>
-        <div class="sig-detail__components">
-          <div class="sig-detail__comp">
-            <div class="sig-detail__comp-bar"><div class="sig-detail__comp-fill sig-detail__comp-fill--runup" style="width:${runupPct}%"></div></div>
-            <span class="sig-detail__comp-label">Run-up Score: ${runupPct}%</span>
-            <span class="sig-detail__comp-desc">Narrative escalation momentum (weight: 25%)</span>
-          </div>
-          <div class="sig-detail__comp">
-            <div class="sig-detail__comp-bar"><div class="sig-detail__comp-fill sig-detail__comp-fill--x" style="width:${xPct}%"></div></div>
-            <span class="sig-detail__comp-label">OSINT Signal: ${xPct}%${s.x_signal_count > 0 ? ` \u2014 ${s.x_signal_count} tweets` : ""}</span>
-            <span class="sig-detail__comp-desc">X/Twitter intelligence density (weight: 20%)</span>
-          </div>
-          <div class="sig-detail__comp">
-            <div class="sig-detail__comp-bar"><div class="sig-detail__comp-fill sig-detail__comp-fill--poly" style="width:${polyPct}%"></div></div>
-            <span class="sig-detail__comp-label">Polymarket: ${polyPct}%${s.polymarket_prob != null ? ` \u2014 market at ${Math.round(s.polymarket_prob * 100)}%` : ""}</span>
-            <span class="sig-detail__comp-desc">Prediction market price drift (weight: 25%)</span>
-          </div>
-          <div class="sig-detail__comp">
-            <div class="sig-detail__comp-bar"><div class="sig-detail__comp-fill sig-detail__comp-fill--news" style="width:${newsPct}%"></div></div>
-            <span class="sig-detail__comp-label">News Acceleration: ${newsPct}%${s.news_count > 0 ? ` \u2014 ${s.news_count} articles` : ""}</span>
-            <span class="sig-detail__comp-desc">Article volume vs 5-day baseline (weight: 15%)</span>
-          </div>
-          <div class="sig-detail__comp">
-            <div class="sig-detail__comp-bar"><div class="sig-detail__comp-fill sig-detail__comp-fill--src" style="width:${srcPct}%"></div></div>
-            <span class="sig-detail__comp-label">Source Convergence: ${srcPct}%</span>
-            <span class="sig-detail__comp-desc">Independent sources covering this narrative (weight: 15%)</span>
-          </div>
-        </div>
-      </div>`;
-    }
 
     const tickerHtml = s.ticker
       ? `<span class="sig-ticker ${dirCls}" data-chart-ticker="${esc(s.ticker)}">${arrow} ${esc(s.ticker)}</span>`
       : "";
 
-    rows += `<div class="sig-row ${lvlCls}${isExpanded ? " sig-row--expanded" : ""}" data-sig-id="${s.id}">
-      <div class="sig-row__header" data-sig-toggle="${s.id}">
-        <div class="sig-bar-wrap">
-          <div class="sig-bar ${barCls}" style="width:${conf}%"></div>
-          <span class="sig-bar-label">${conf}%</span>
-        </div>
-        <div class="sig-info">
-          <span class="sig-level">${lvl.replace("_", " ")}</span>
-          <span class="sig-narr">${esc(s.narrative_name || "")}</span>
-          ${tickerHtml}
-          <span class="sig-expand-icon">${isExpanded ? "&#9650;" : "&#9660;"}</span>
-        </div>
+    // Build one-line summary with available data points
+    const meta = [];
+    if (s.news_count > 0) meta.push(`${s.news_count} sources`);
+    if (s.polymarket_prob != null) meta.push(`Polymarket ${Math.round(s.polymarket_prob * 100)}%`);
+    if (s.x_signal_count > 0) meta.push(`${s.x_signal_count} tweets`);
+    const metaStr = meta.length ? meta.join(" &middot; ") : "Monitoring";
+
+    rows += `<div class="sig-row ${lvlCls}">
+      <div class="sig-row__main">
+        <span class="sig-level">${lvl.replace("_", " ")}</span>
+        <span class="sig-narr">${esc(s.narrative_name || "")}</span>
+        ${tickerHtml}
       </div>
-      ${detailHtml}
+      <div class="sig-row__meta">${metaStr}</div>
     </div>`;
   }
 
   return `<div class="signals-panel">
     <div class="signals-header">
-      <div class="signals-title">Convergence Signals</div>
-      <span class="signals-subtitle">Multi-source signals combining news momentum, OSINT intelligence, and prediction markets</span>
-      <button class="refresh-btn signals-refresh-btn" data-refresh-signals>&#8635; Refresh</button>
+      <div class="signals-title">Signals</div>
+      <button class="refresh-btn signals-refresh-btn" data-refresh-signals>&#8635;</button>
     </div>
     ${rows}
   </div>`;
 }
 
 function bindSignalEvents() {
-  // Refresh button
   const refreshBtn = document.querySelector("[data-refresh-signals]");
   if (refreshBtn) {
-    refreshBtn.addEventListener("click", (e) => {
-      e.preventDefault();
-      triggerSignalRefresh();
+    refreshBtn.addEventListener("click", async () => {
+      refreshBtn.disabled = true;
+      refreshBtn.textContent = "...";
+      try {
+        const res = await fetch(`${API_BASE}?_api=signals`);
+        if (res.ok) {
+          state.signals = await res.json();
+          renderApp();
+        }
+      } catch (err) {
+        console.warn("[signals] refresh failed:", err);
+      }
+      refreshBtn.disabled = false;
+      refreshBtn.textContent = "↻";
     });
   }
-  // Expand/collapse signal rows
-  document.querySelectorAll("[data-sig-toggle]").forEach((el) => {
-    el.addEventListener("click", (e) => {
-      const id = parseInt(el.dataset.sigToggle, 10);
-      if (_expandedSignals.has(id)) _expandedSignals.delete(id);
-      else _expandedSignals.add(id);
-      render();
-    });
-  });
-  // Ticker click → price chart
+  // Ticker click -> price chart
   document.querySelectorAll("[data-chart-ticker]").forEach((el) => {
     el.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -1344,10 +1289,10 @@ function initTreeCanvas() {
     style: getCytoscapeStylesheet(),
     layout: {
       name: "dagre",
-      rankDir: "TB",
-      nodeSep: 50,
-      rankSep: 80,
-      padding: 30,
+      rankDir: "LR",
+      nodeSep: 60,
+      rankSep: 180,
+      padding: 40,
     },
     minZoom: 0.2,
     maxZoom: 3,
@@ -1606,18 +1551,19 @@ function getCytoscapeStylesheet() {
       selector: "node[type='decision']",
       style: {
         "shape": "round-rectangle",
-        "width": 220,
-        "height": 70,
+        "width": 260,
+        "height": 90,
         "background-color": "#1a1d25",
         "border-color": "#5b8def",
         "border-width": 2,
         "label": "data(label)",
         "text-wrap": "wrap",
-        "text-max-width": 200,
+        "text-max-width": 230,
         "color": "#e0e0e6",
         "font-size": 11,
         "text-valign": "center",
         "text-halign": "center",
+        "padding": "10px",
       },
     },
     // Confirmed YES decision
@@ -1643,17 +1589,18 @@ function getCytoscapeStylesheet() {
       selector: "node[type='consequence']",
       style: {
         "shape": "round-rectangle",
-        "width": 180,
-        "height": 50,
+        "width": 220,
+        "height": 65,
         "background-color": "#22262f",
         "border-width": 1,
         "label": "data(label)",
         "text-wrap": "wrap",
-        "text-max-width": 160,
+        "text-max-width": 195,
         "color": "#e0e0e6",
         "font-size": 10,
         "text-valign": "center",
         "text-halign": "center",
+        "padding": "8px",
       },
     },
     // YES consequence border
@@ -1704,8 +1651,7 @@ function getCytoscapeStylesheet() {
       selector: "edge",
       style: {
         "width": 2,
-        "curve-style": "taxi",
-        "taxi-direction": "downward",
+        "curve-style": "bezier",
         "target-arrow-shape": "triangle",
         "arrow-scale": 0.8,
         "line-color": "#444",
@@ -1718,12 +1664,13 @@ function getCytoscapeStylesheet() {
       style: {
         "line-color": "#34d399",
         "target-arrow-color": "#34d399",
-        "label": "data(label)",
+        "label": "YES",
         "font-size": 9,
+        "font-weight": "bold",
         "color": "#34d399",
         "text-background-color": "#12141a",
         "text-background-opacity": 0.8,
-        "text-background-padding": "2px",
+        "text-background-padding": "3px",
       },
     },
     // NO branch edges
@@ -1732,12 +1679,13 @@ function getCytoscapeStylesheet() {
       style: {
         "line-color": "#f87171",
         "target-arrow-color": "#f87171",
-        "label": "data(label)",
+        "label": "NO",
         "font-size": 9,
+        "font-weight": "bold",
         "color": "#f87171",
         "text-background-color": "#12141a",
         "text-background-opacity": 0.8,
-        "text-background-padding": "2px",
+        "text-background-padding": "3px",
       },
     },
     // Stock edges
@@ -1824,124 +1772,73 @@ function showNodeDetailPanel(nodeData) {
   const fullData = nodeData.fullData || {};
   const question = nodeData.fullQuestion || fullData.question || "";
   const yesProb = nodeData.yes_prob || 0;
-  const noProb = nodeData.no_prob || 0;
   const timeline = nodeData.timeline || fullData.timeline_estimate || "";
   const status = nodeData.status || "open";
   const evidence = fullData.evidence || fullData.confirmation_evidence || "";
 
+  const statusLabel = status === "confirmed_yes" ? "Confirmed YES"
+    : status === "confirmed_no" ? "Confirmed NO" : "Open";
+  const statusCls = status === "confirmed_yes" ? "node-detail-status--yes"
+    : status === "confirmed_no" ? "node-detail-status--no" : "node-detail-status--open";
+
   let html = `<div class="node-detail-panel__inner">
     <button class="node-detail-panel__close" data-panel-close>&times;</button>
-    <div class="node-detail-panel__title">Decision Node</div>
     <div class="node-detail-panel__question">${esc(question)}</div>
-
-    <div class="node-detail-panel__probs">
-      <div class="node-detail-prob">
-        <div class="node-detail-prob__label">YES</div>
-        <div class="node-detail-prob__bar">
-          <div class="node-detail-prob__fill node-detail-prob__fill--yes" style="width:${yesProb}%"></div>
-        </div>
-        <div class="node-detail-prob__value">${yesProb}%</div>
-      </div>
-      <div class="node-detail-prob">
-        <div class="node-detail-prob__label">NO</div>
-        <div class="node-detail-prob__bar">
-          <div class="node-detail-prob__fill node-detail-prob__fill--no" style="width:${noProb}%"></div>
-        </div>
-        <div class="node-detail-prob__value">${noProb}%</div>
-      </div>
+    <div class="node-detail-panel__meta">
+      <span class="node-detail-status ${statusCls}">${esc(statusLabel)}</span>
+      <span class="ndp-meta-item">Likelihood: ${yesProb}%</span>
+      ${timeline ? `<span class="ndp-meta-item">${esc(timeline)}</span>` : ""}
     </div>`;
-
-  if (timeline) {
-    html += `<div class="node-detail-panel__row">
-      <span class="node-detail-panel__row-label">Timeline:</span>
-      <span>${esc(timeline)}</span>
-    </div>`;
-  }
-
-  // Status
-  const statusLabel = status === "confirmed_yes" ? "Confirmed YES"
-    : status === "confirmed_no" ? "Confirmed NO"
-    : "Open";
-  const statusCls = status === "confirmed_yes" ? "node-detail-status--yes"
-    : status === "confirmed_no" ? "node-detail-status--no"
-    : "node-detail-status--open";
-  html += `<div class="node-detail-panel__row">
-    <span class="node-detail-panel__row-label">Status:</span>
-    <span class="node-detail-status ${statusCls}">${esc(statusLabel)}</span>
-  </div>`;
 
   if (evidence) {
-    html += `<div class="node-detail-panel__row">
-      <span class="node-detail-panel__row-label">Evidence:</span>
-      <span class="node-detail-panel__evidence">${esc(evidence)}</span>
-    </div>`;
+    html += `<div class="ndp-evidence">${esc(evidence)}</div>`;
   }
 
-  // Polymarket matches
-  const polyMatches = state.polymarket || [];
-  if (polyMatches.length > 0) {
-    html += `<div class="node-detail-panel__section">
-      <div class="node-detail-panel__section-title">Polymarket</div>`;
-    for (const pm of polyMatches) {
-      const pmProb = Math.round((pm.outcome_yes_price || 0) * 100);
-      const volume = pm.volume ? `$${(pm.volume / 1000).toFixed(0)}K` : "";
-      html += `<div class="node-detail-poly">
-        <div class="node-detail-poly__q">${esc(pm.polymarket_question || "")}</div>
-        <div class="node-detail-poly__prob">PM: ${pmProb}% ${volume ? `(Vol: ${volume})` : ""}</div>
-        ${pm.polymarket_url ? `<a href="${esc(pm.polymarket_url)}" target="_blank" rel="noopener" class="node-detail-poly__link">View on Polymarket</a>` : ""}
-      </div>`;
-    }
-    html += `</div>`;
-  }
-
-  // Consequences
+  // Consequences grouped by branch
   const consequences = fullData.consequences || [];
-  if (consequences.length > 0) {
-    html += `<div class="node-detail-panel__section">
-      <div class="node-detail-panel__section-title">Consequences</div>`;
-    for (const c of consequences) {
-      const branch = c.branch || "yes";
-      const branchCls = branch === "yes" ? "node-detail-cons--yes" : "node-detail-cons--no";
-      const effProb = Math.round((c.effective_probability || 0) * 100);
-      html += `<div class="node-detail-cons ${branchCls}">
-        <div class="node-detail-cons__branch">${branch.toUpperCase()}</div>
-        <div class="node-detail-cons__desc">${esc(c.description || "")}</div>
-        <div class="node-detail-cons__prob">${effProb}% eff.</div>
-      </div>`;
+  const yesCons = consequences.filter(c => c.branch === "yes");
+  const noCons = consequences.filter(c => c.branch === "no");
 
-      // Stock impacts inside consequence
-      const stocks = c.stock_impacts || [];
-      for (const si of stocks) {
-        const dirCls = si.direction === "bullish" ? "node-detail-stock--bullish" : "node-detail-stock--bearish";
-        const arrow = si.direction === "bullish" ? "\u25B2" : "\u25BC";
-        html += `<div class="node-detail-stock ${dirCls}" data-chart-ticker="${esc(si.ticker)}">
-          <span>${arrow} ${esc(si.ticker)}</span>
-          <span class="node-detail-stock__mag">${esc(si.magnitude || "")}</span>
-          <span class="node-detail-stock__reason">${esc(si.reasoning || "")}</span>
-        </div>`;
+  for (const [branchLabel, branchCons, cls] of [["If YES", yesCons, "ndp-branch--yes"], ["If NO", noCons, "ndp-branch--no"]]) {
+    if (!branchCons.length) continue;
+    html += `<div class="ndp-branch ${cls}"><div class="ndp-branch__label">${branchLabel}</div>`;
+    for (const c of branchCons) {
+      html += `<div class="ndp-cons"><div class="ndp-cons__desc">${esc(c.description || "")}</div>`;
+      if (c.proximity_display) {
+        html += `<div class="ndp-proximity">${esc(c.proximity_display)}</div>`;
       }
+      const stocks = c.stock_impacts || [];
+      if (stocks.length) {
+        html += `<div class="ndp-stocks">`;
+        for (const si of stocks) {
+          const arrow = si.direction === "bullish" ? "\u25B2" : "\u25BC";
+          const dc = si.direction === "bullish" ? "stock-pill--bull" : "stock-pill--bear";
+          html += `<span class="stock-pill ${dc}" data-chart-ticker="${esc(si.ticker)}" title="${esc(si.reasoning || "")}">${arrow} ${esc(si.ticker)}</span>`;
+        }
+        html += `</div>`;
+      }
+      html += `</div>`;
     }
     html += `</div>`;
+  }
+
+  // Polymarket
+  const polyMatches = state.polymarket || [];
+  for (const pm of polyMatches) {
+    const pmProb = Math.round((pm.outcome_yes_price || 0) * 100);
+    const vol = pm.volume ? ` · $${(pm.volume / 1000).toFixed(0)}K vol` : "";
+    html += `<div class="ndp-poly">Polymarket: ${pmProb}%${vol}${pm.polymarket_url ? ` <a href="${esc(pm.polymarket_url)}" target="_blank" rel="noopener">View &rarr;</a>` : ""}</div>`;
   }
 
   html += `</div>`;
-
   panel.innerHTML = html;
   panel.classList.add("node-detail-panel--open");
 
-  // Bind close button
-  const closeBtn = panel.querySelector("[data-panel-close]");
-  if (closeBtn) {
-    closeBtn.addEventListener("click", closeNodeDetailPanel);
-  }
-
-  // Bind stock ticker clicks in the panel
-  panel.querySelectorAll("[data-chart-ticker]").forEach((el) => {
+  panel.querySelector("[data-panel-close]")?.addEventListener("click", closeNodeDetailPanel);
+  panel.querySelectorAll("[data-chart-ticker]").forEach(el => {
     el.addEventListener("click", () => {
-      const ticker = el.getAttribute("data-chart-ticker");
-      if (ticker && typeof openPriceChart === "function") {
-        openPriceChart(ticker);
-      }
+      const t = el.getAttribute("data-chart-ticker");
+      if (t) openPriceChart(t);
     });
   });
 }
@@ -1952,51 +1849,37 @@ function showConsequenceDetailPanel(nodeData) {
 
   const fullData = nodeData.fullData || {};
   const branch = nodeData.branch || "yes";
-  const branchCls = branch === "yes" ? "node-detail-cons--yes" : "node-detail-cons--no";
-  const probability = nodeData.probability || 0;
+  const brCls = branch === "yes" ? "ndp-branch--yes" : "ndp-branch--no";
 
   let html = `<div class="node-detail-panel__inner">
     <button class="node-detail-panel__close" data-panel-close>&times;</button>
-    <div class="node-detail-panel__title">Consequence <span class="node-detail-cons__branch ${branchCls}">${branch.toUpperCase()}</span></div>
-    <div class="node-detail-panel__question">${esc(fullData.description || "")}</div>
-    <div class="node-detail-panel__row">
-      <span class="node-detail-panel__row-label">Effective Probability:</span>
-      <span>${probability}%</span>
-    </div>`;
+    <div class="ndp-branch__label" style="margin-bottom:8px">${branch.toUpperCase()} outcome</div>
+    <div class="node-detail-panel__question">${esc(fullData.description || "")}</div>`;
 
-  // Stock impacts
+  if (fullData.proximity_display) {
+    html += `<div class="ndp-proximity">${esc(fullData.proximity_display)}</div>`;
+  }
+
   const stocks = fullData.stock_impacts || [];
-  if (stocks.length > 0) {
-    html += `<div class="node-detail-panel__section">
-      <div class="node-detail-panel__section-title">Stock Impacts</div>`;
+  if (stocks.length) {
+    html += `<div class="ndp-stocks" style="margin-top:12px">`;
     for (const si of stocks) {
-      const dirCls = si.direction === "bullish" ? "node-detail-stock--bullish" : "node-detail-stock--bearish";
       const arrow = si.direction === "bullish" ? "\u25B2" : "\u25BC";
-      html += `<div class="node-detail-stock ${dirCls}" data-chart-ticker="${esc(si.ticker)}">
-        <span>${arrow} ${esc(si.ticker)} ${esc(si.name || "")}</span>
-        <span class="node-detail-stock__mag">${esc(si.magnitude || "")}</span>
-        <span class="node-detail-stock__reason">${esc(si.reasoning || "")}</span>
-      </div>`;
+      const dc = si.direction === "bullish" ? "stock-pill--bull" : "stock-pill--bear";
+      html += `<span class="stock-pill ${dc}" data-chart-ticker="${esc(si.ticker)}" title="${esc(si.reasoning || "")}">${arrow} ${esc(si.ticker)}</span>`;
     }
     html += `</div>`;
   }
 
   html += `</div>`;
-
   panel.innerHTML = html;
   panel.classList.add("node-detail-panel--open");
 
-  const closeBtn = panel.querySelector("[data-panel-close]");
-  if (closeBtn) {
-    closeBtn.addEventListener("click", closeNodeDetailPanel);
-  }
-
-  panel.querySelectorAll("[data-chart-ticker]").forEach((el) => {
+  panel.querySelector("[data-panel-close]")?.addEventListener("click", closeNodeDetailPanel);
+  panel.querySelectorAll("[data-chart-ticker]").forEach(el => {
     el.addEventListener("click", () => {
-      const ticker = el.getAttribute("data-chart-ticker");
-      if (ticker && typeof openPriceChart === "function") {
-        openPriceChart(ticker);
-      }
+      const t = el.getAttribute("data-chart-ticker");
+      if (t) openPriceChart(t);
     });
   });
 }

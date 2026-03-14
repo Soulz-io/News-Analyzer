@@ -570,10 +570,12 @@ def generate_tree(run_up_id: int) -> Optional[Dict]:
 
 CHILD_TREE_SYSTEM = """\
 You are a geopolitical game theory analyst. A previous decision point has been
-CONFIRMED — it actually happened. Your job is to analyze the NEXT critical
-yes/no decision that follows from this confirmation.
+CONFIRMED — it actually happened. Your job is to analyze the 5 MOST LIKELY
+next decision points that follow from this confirmation.
 
-What must we watch for now? What is the next domino that could fall?
+Each scenario should explore a DIFFERENT dimension: military, diplomatic,
+economic, energy/commodity, or social/political. Think like a chess player —
+what are all the possible next moves?
 
 You ALWAYS respond with valid JSON only. No markdown, no explanation outside JSON."""
 
@@ -597,73 +599,62 @@ A previous decision point has been CONFIRMED. Analyze what comes next.
 
 ## Instructions:
 
-Based on the confirmed outcome and its key consequence, formulate the NEXT
-critical yes/no question. What is the next decision point to watch?
+Based on the confirmed outcome and its key consequence, generate exactly 5
+distinct "what happens next?" scenarios. Each should be a DIFFERENT type of
+development (military, diplomatic, economic, energy, social/political).
 
-1. Formulate ONE specific yes/no question with a clear timeline
+For EACH scenario, provide:
+1. A specific yes/no question with a clear timeline
 2. Estimate the probability of YES (between 0.05 and 0.95)
-3. List 5 keywords that would indicate YES is happening, and 5 for NO
-4. For each branch (YES and NO), describe 3-5 consequences with:
+3. List 5 keywords that would indicate YES, and 5 for NO
+4. For each consequence, include a "price_target" if it involves a measurable
+   price threshold (oil above $X, gold below $Y, etc.)
+5. For each branch (YES and NO), describe 2-3 consequences with:
    - Description (1-2 sentences)
-   - Probability of this consequence occurring IF the branch happens (0.0-1.0)
-   - Economic impact (1 sentence)
-   - Geopolitical impact (1 sentence)
-   - Social impact (1 sentence)
-   - 3 tracking keywords (for automated monitoring)
-   - 2-4 affected stocks, ETFs, or commodities with ticker, direction (bullish/bearish), magnitude (low/moderate/high/extreme), and reasoning
+   - Probability (0.0-1.0)
+   - Economic, geopolitical, social impact (1 sentence each)
+   - 3 tracking keywords
+   - 2-3 affected stocks/ETFs with ticker, direction, magnitude, reasoning
+   - Optional price_target: {{"asset": "CL=F", "direction": "above", "value": 120.0}}
 
-IMPORTANT: Only use tickers from this list (user's broker: bunq Stocks via Upvest/Ginmon):
+IMPORTANT: Only use tickers from this list (user's broker: bunq Stocks):
 {available_tickers}
 
 Respond with this exact JSON structure:
 {{
-  "question": "Will X happen within Y?",
-  "timeline_estimate": "2 weeks",
-  "yes_probability": 0.65,
-  "yes_keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"],
-  "no_keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"],
-  "consequences": {{
-    "yes": [
-      {{
-        "description": "What happens if YES",
-        "probability": 0.8,
-        "impact_economic": "Economic effect",
-        "impact_geopolitical": "Geopolitical effect",
-        "impact_social": "Social effect",
-        "keywords": ["track1", "track2", "track3"],
-        "stock_impacts": [
+  "scenarios": [
+    {{
+      "question": "Will X happen within Y?",
+      "timeline_estimate": "2 weeks",
+      "yes_probability": 0.65,
+      "yes_keywords": ["kw1", "kw2", "kw3", "kw4", "kw5"],
+      "no_keywords": ["kw1", "kw2", "kw3", "kw4", "kw5"],
+      "consequences": {{
+        "yes": [
           {{
-            "ticker": "XOM",
-            "name": "ExxonMobil",
-            "asset_type": "stock",
-            "direction": "bullish",
-            "magnitude": "high",
-            "reasoning": "Oil supply disruption fears drive energy stocks up"
+            "description": "What happens if YES",
+            "probability": 0.8,
+            "impact_economic": "Economic effect",
+            "impact_geopolitical": "Geopolitical effect",
+            "impact_social": "Social effect",
+            "keywords": ["track1", "track2", "track3"],
+            "price_target": {{"asset": "CL=F", "direction": "above", "value": 120.0}},
+            "stock_impacts": [
+              {{
+                "ticker": "XOM",
+                "name": "ExxonMobil",
+                "asset_type": "stock",
+                "direction": "bullish",
+                "magnitude": "high",
+                "reasoning": "Oil supply disruption fears"
+              }}
+            ]
           }}
-        ]
+        ],
+        "no": [...]
       }}
-    ],
-    "no": [
-      {{
-        "description": "What happens if NO",
-        "probability": 0.7,
-        "impact_economic": "Economic effect",
-        "impact_geopolitical": "Geopolitical effect",
-        "impact_social": "Social effect",
-        "keywords": ["track1", "track2", "track3"],
-        "stock_impacts": [
-          {{
-            "ticker": "SPY",
-            "name": "S&P 500 ETF",
-            "asset_type": "etf",
-            "direction": "bullish",
-            "magnitude": "low",
-            "reasoning": "Market relief on de-escalation"
-          }}
-        ]
-      }}
-    ]
-  }}
+    }}
+  ]
 }}"""
 
 
@@ -689,6 +680,15 @@ def generate_child_tree(parent_node_id: int) -> Optional[Dict]:
                 parent_node_id, parent.status,
             )
             return None
+
+        # Prevent exponential growth
+        MAX_TREE_DEPTH = 4
+        if parent.depth >= MAX_TREE_DEPTH:
+            logger.info(
+                "Node %d at depth %d — max depth %d reached. Skipping child generation.",
+                parent_node_id, parent.depth, MAX_TREE_DEPTH,
+            )
+            return {"status": "max_depth", "depth": parent.depth}
 
         # Check if child tree already exists
         existing_child = (
@@ -767,29 +767,43 @@ def generate_child_tree(parent_node_id: int) -> Optional[Dict]:
         if tree_data is None:
             return None
 
-        # 8. Store the child tree, reusing _store_tree but overriding parent/depth
-        child_root = _store_child_tree(
-            run_up_id=run_up.id,
-            tree_data=tree_data,
-            parent_node_id=parent.id,
-            parent_depth=parent.depth,
-            session=session,
-        )
+        # 8. Store all child scenarios (5 nodes)
+        scenarios = tree_data.get("scenarios", [])
+        if not scenarios:
+            # Fallback: if Claude returned old single-node format
+            scenarios = [tree_data]
+
+        child_roots = []
+        for scenario in scenarios[:5]:  # Cap at 5
+            child_root = _store_child_tree(
+                run_up_id=run_up.id,
+                tree_data=scenario,
+                parent_node_id=parent.id,
+                parent_depth=parent.depth,
+                session=session,
+            )
+            child_roots.append(child_root)
+
         session.commit()
 
         logger.info(
-            "Generated child tree for node %d: child_root=%d, question=%r",
-            parent_node_id, child_root.id, child_root.question[:80],
+            "Generated %d child scenarios for node %d (run-up %d)",
+            len(child_roots), parent_node_id, run_up.id,
         )
         return {
             "status": "created",
             "run_up_id": run_up.id,
             "parent_node_id": parent_node_id,
-            "root_node_id": child_root.id,
-            "question": child_root.question,
-            "yes_probability": child_root.yes_probability,
-            "timeline": child_root.timeline_estimate,
-            "depth": child_root.depth,
+            "child_count": len(child_roots),
+            "children": [
+                {
+                    "node_id": c.id,
+                    "question": c.question,
+                    "yes_probability": c.yes_probability,
+                    "depth": c.depth,
+                }
+                for c in child_roots
+            ],
         }
 
     except Exception:
@@ -824,7 +838,7 @@ def _call_claude_child(
         client = anthropic.Anthropic(api_key=config.anthropic_api_key)
         response = client.messages.create(
             model=config.tree_generator_model,
-            max_tokens=6000,
+            max_tokens=12000,
             system=CHILD_TREE_SYSTEM,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -913,6 +927,14 @@ def _store_child_tree(
             )
             session.add(cons)
             session.flush()
+
+            # Extract price targets from consequence data
+            price_target = cons_data.get("price_target")
+            if price_target and isinstance(price_target, dict):
+                try:
+                    cons.price_thresholds_json = json.dumps([price_target])
+                except Exception:
+                    pass
 
             for si_data in cons_data.get("stock_impacts", []):
                 ticker = si_data.get("ticker", "").strip().upper()

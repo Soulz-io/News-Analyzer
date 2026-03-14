@@ -184,6 +184,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         max_instances=1,
     )
 
+    # Schedule proximity tracking update (every 5 min)
+    scheduler.add_job(
+        proximity_update,
+        trigger=IntervalTrigger(minutes=5),
+        id="proximity_update",
+        name="Proximity threshold tracking",
+        replace_existing=True,
+        max_instances=1,
+    )
+
     # Schedule X/Twitter OSINT fetch (if bearer token configured)
     if config.twitter_enabled:
         scheduler.add_job(
@@ -307,6 +317,68 @@ async def gdelt_fetch_and_process() -> None:
         logger.exception("gdelt_fetch_and_process cycle FAILED.")
     finally:
         logger.info("=== gdelt_fetch_and_process cycle END ===")
+
+
+async def proximity_update() -> None:
+    """Recurring job: update proximity percentages for consequence price thresholds."""
+    logger.info("=== proximity_update cycle START ===")
+    try:
+        import json as _json
+        from .db import Consequence
+        from .price_fetcher import get_price_fetcher
+
+        session = get_session()
+        fetcher = get_price_fetcher()
+
+        # Find consequences with price thresholds
+        consequences = (
+            session.query(Consequence)
+            .filter(Consequence.price_thresholds_json.isnot(None))
+            .filter(Consequence.status == "predicted")
+            .all()
+        )
+
+        updated = 0
+        for cons in consequences:
+            try:
+                thresholds = _json.loads(cons.price_thresholds_json or "[]")
+                if not thresholds:
+                    continue
+
+                for th in thresholds:
+                    asset = th.get("asset", "")
+                    direction = th.get("direction", "above")
+                    target = float(th.get("value", 0))
+                    if not asset or target <= 0:
+                        continue
+
+                    # Fetch current price
+                    quote = await asyncio.to_thread(fetcher.get_quote, asset)
+                    if "error" in quote:
+                        continue
+
+                    current = quote["price"]
+                    if direction == "above":
+                        pct = min(100.0, (current / target) * 100)
+                    else:  # "below"
+                        pct = min(100.0, (target / current) * 100) if current > 0 else 0
+
+                    cons.proximity_pct = round(pct, 1)
+                    updated += 1
+                    break  # Use first threshold
+
+            except Exception:
+                continue
+
+        if updated:
+            session.commit()
+            logger.info("Proximity: updated %d consequences.", updated)
+        session.close()
+
+    except Exception:
+        logger.exception("proximity_update cycle FAILED.")
+    finally:
+        logger.info("=== proximity_update cycle END ===")
 
 
 async def confidence_scoring() -> None:

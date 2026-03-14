@@ -309,6 +309,9 @@ class Consequence(Base):
     status: str = Column(String(32), nullable=False, default="predicted")
     confirmed_at: Optional[datetime] = Column(DateTime, nullable=True)
     evidence: Optional[str] = Column(Text, nullable=True)
+    # Proximity tracking
+    price_thresholds_json: Optional[str] = Column(Text, nullable=True)
+    proximity_pct: Optional[float] = Column(Float, nullable=True)
 
     # Relationships
     decision_node = relationship("DecisionNode", back_populates="consequences")
@@ -322,6 +325,14 @@ class Consequence(Base):
     @keywords.setter
     def keywords(self, value: Any) -> None:
         self.keywords_json = _json_dumps(value)
+
+    @property
+    def price_thresholds(self) -> Any:
+        return _json_loads(self.price_thresholds_json)
+
+    @price_thresholds.setter
+    def price_thresholds(self, value: Any) -> None:
+        self.price_thresholds_json = _json_dumps(value)
 
     def __repr__(self) -> str:
         return (
@@ -687,6 +698,21 @@ def _migrate_columns(engine) -> None:
                     f"ALTER TABLE article_briefs ADD COLUMN {col_name} {col_type}"
                 )
                 logger.info("Migration: added column article_briefs.%s", col_name)
+
+        # Check consequences for proximity tracking columns
+        cursor.execute("PRAGMA table_info(consequences)")
+        cons_cols = {row[1] for row in cursor.fetchall()}
+
+        cons_migrations = {
+            "price_thresholds_json": "TEXT DEFAULT NULL",
+            "proximity_pct": "FLOAT DEFAULT NULL",
+        }
+        for col_name, col_type in cons_migrations.items():
+            if col_name not in cons_cols:
+                cursor.execute(
+                    f"ALTER TABLE consequences ADD COLUMN {col_name} {col_type}"
+                )
+                logger.info("Migration: added column consequences.%s", col_name)
 
         conn.commit()
         conn.close()

@@ -159,11 +159,11 @@ class PriceFetcher:
     # Bitcoin price (CoinGecko primary, yfinance fallback)
     # ------------------------------------------------------------------
     def get_bitcoin_price(self) -> Dict[str, Any]:
-        """Fetch current BTC/USD price via CoinGecko free API.
+        """Fetch current BTC/EUR price via CoinGecko free API.
 
-        Falls back to yfinance ``BTC-USD`` if CoinGecko is unavailable.
+        Falls back to yfinance ``BTC-EUR`` if CoinGecko is unavailable.
         Returns: ``{"price": float, "change_24h_pct": float,
-        "currency": "USD"}``.
+        "currency": "EUR"}``.
         """
         # --- try CoinGecko first ---
         try:
@@ -171,7 +171,7 @@ class PriceFetcher:
 
             url = (
                 "https://api.coingecko.com/api/v3/simple/price"
-                "?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
+                "?ids=bitcoin&vs_currencies=eur&include_24hr_change=true"
             )
             logger.info("Fetching Bitcoin price from CoinGecko")
             resp = httpx.get(url, timeout=10)
@@ -180,9 +180,9 @@ class PriceFetcher:
 
             btc = data["bitcoin"]
             result: Dict[str, Any] = {
-                "price": float(btc["usd"]),
-                "change_24h_pct": round(float(btc.get("usd_24h_change", 0)), 2),
-                "currency": "USD",
+                "price": float(btc["eur"]),
+                "change_24h_pct": round(float(btc.get("eur_24h_change", 0)), 2),
+                "currency": "EUR",
             }
             return result
 
@@ -196,8 +196,8 @@ class PriceFetcher:
         try:
             import yfinance as yf
 
-            logger.info("Fetching Bitcoin price from yfinance (BTC-USD)")
-            t = yf.Ticker("BTC-USD")
+            logger.info("Fetching Bitcoin price from yfinance (BTC-EUR)")
+            t = yf.Ticker("BTC-EUR")
             info = t.fast_info
 
             current_price = float(info["lastPrice"])
@@ -211,7 +211,7 @@ class PriceFetcher:
             return {
                 "price": current_price,
                 "change_24h_pct": change_pct,
-                "currency": "USD",
+                "currency": "EUR",
             }
 
         except Exception as yf_exc:
@@ -219,31 +219,116 @@ class PriceFetcher:
             return {"error": f"Failed to fetch Bitcoin price: {yf_exc}"}
 
     # ------------------------------------------------------------------
-    # Gold price (via GLD ETF)
+    # Gold price in EUR per kilogram
     # ------------------------------------------------------------------
     def get_gold_price(self) -> Dict[str, Any]:
-        """Get gold price via the GLD ETF.
+        """Get gold price in EUR per kilogram.
 
-        Returns the same shape as :meth:`get_quote` but with the name
-        set to ``"Gold (GLD)"``.
+        Tries CoinGecko first, then falls back to yfinance Gold Futures
+        (GC=F) converted from USD/oz to EUR/kg using the EUR/USD rate.
+
+        Returns: ``{"price": float, "change_pct": float,
+        "currency": "EUR", "unit": "kg"}``.
         """
-        quote = self.get_quote("GLD")
+        # 1 kg = 32.1507 troy ounces
+        OZ_PER_KG = 32.1507
+
+        # --- try CoinGecko first ---
+        try:
+            import httpx
+
+            url = (
+                "https://api.coingecko.com/api/v3/simple/price"
+                "?ids=gold&vs_currencies=eur&include_24hr_change=true"
+            )
+            logger.info("Fetching gold price from CoinGecko")
+            resp = httpx.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            gold = data["gold"]
+            # CoinGecko gold price is per troy ounce; convert to per kg
+            price_eur_per_oz = float(gold["eur"])
+            price_eur_per_kg = round(price_eur_per_oz * OZ_PER_KG, 2)
+            change_pct = round(float(gold.get("eur_24h_change", 0)), 2)
+
+            return {
+                "price": price_eur_per_kg,
+                "change_pct": change_pct,
+                "currency": "EUR",
+                "unit": "kg",
+            }
+
+        except Exception as cg_exc:
+            logger.warning(
+                "CoinGecko gold request failed (%s); falling back to yfinance",
+                cg_exc,
+            )
+
+        # --- yfinance fallback: GC=F (USD/oz) + EURUSD=X ---
+        try:
+            import yfinance as yf
+
+            logger.info("Fetching gold price from yfinance (GC=F + EURUSD=X)")
+
+            # Gold futures in USD per troy ounce
+            gold_ticker = yf.Ticker("GC=F")
+            gold_info = gold_ticker.fast_info
+            gold_price_usd = float(gold_info["lastPrice"])
+            gold_prev_close = float(gold_info["previousClose"])
+
+            # EUR/USD exchange rate
+            eur_ticker = yf.Ticker("EURUSD=X")
+            eur_info = eur_ticker.fast_info
+            eurusd_rate = float(eur_info["lastPrice"])
+
+            # Convert: USD per oz -> EUR per kg
+            price_eur_per_kg = round((gold_price_usd * OZ_PER_KG) / eurusd_rate, 2)
+
+            # Calculate change % from gold futures
+            change_pct = (
+                round(((gold_price_usd - gold_prev_close) / gold_prev_close) * 100, 2)
+                if gold_prev_close
+                else 0.0
+            )
+
+            return {
+                "price": price_eur_per_kg,
+                "change_pct": change_pct,
+                "currency": "EUR",
+                "unit": "kg",
+            }
+
+        except Exception as yf_exc:
+            logger.error("Gold price fetch failed entirely: %s", yf_exc)
+            return {"error": f"Failed to fetch gold price: {yf_exc}"}
+
+    # ------------------------------------------------------------------
+    # Oil price (WTI Crude Futures)
+    # ------------------------------------------------------------------
+    def get_oil_price(self) -> Dict[str, Any]:
+        """Get WTI Crude Oil price via yfinance (CL=F).
+
+        Returns the same shape as :meth:`get_quote`.
+        """
+        quote = self.get_quote("CL=F")
         if "error" in quote:
             return quote
-        quote["name"] = "Gold (GLD)"
+        quote["name"] = "Oil (WTI)"
         return quote
 
     # ------------------------------------------------------------------
-    # Combined market indicators (BTC + Gold + VIX)
+    # Combined market indicators (BTC + Gold + Oil + VIX)
     # ------------------------------------------------------------------
     def get_market_indicators(self) -> Dict[str, Any]:
-        """Fetch BTC, Gold, and VIX in one call.
+        """Fetch BTC, Gold, Oil, and VIX in one call.
 
         Returns::
 
             {
-                "bitcoin": {"price": ..., "change_pct": ..., "currency": ...},
-                "gold":    {"price": ..., "change_pct": ..., "currency": ...},
+                "bitcoin": {"price": ..., "change_pct": ..., "currency": "EUR"},
+                "gold":    {"price": ..., "change_pct": ..., "currency": "EUR", "unit": "kg"},
+                "oil":     {"price": ..., "change_pct": ..., "currency": "USD"},
                 "vix":     {"price": ..., "change_pct": ..., "currency": ...},
                 "fetched_at": "2024-06-15T12:34:56+00:00",
             }
@@ -263,7 +348,7 @@ class PriceFetcher:
         # -- Bitcoin --
         btc_raw = self.get_bitcoin_price()
         if "error" in btc_raw:
-            bitcoin = {"price": None, "change_pct": None, "currency": "USD"}
+            bitcoin = {"price": None, "change_pct": None, "currency": "EUR"}
         else:
             bitcoin = {
                 "price": btc_raw["price"],
@@ -271,15 +356,27 @@ class PriceFetcher:
                 "currency": btc_raw["currency"],
             }
 
-        # -- Gold (GLD) --
-        gold_raw = self.get_quote("GLD")
+        # -- Gold (EUR/kg) --
+        gold_raw = self.get_gold_price()
         if "error" in gold_raw:
-            gold = {"price": None, "change_pct": None, "currency": "USD"}
+            gold = {"price": None, "change_pct": None, "currency": "EUR", "unit": "kg"}
         else:
             gold = {
                 "price": gold_raw["price"],
                 "change_pct": gold_raw.get("change_pct", 0.0),
-                "currency": gold_raw.get("currency", "USD"),
+                "currency": gold_raw.get("currency", "EUR"),
+                "unit": gold_raw.get("unit", "kg"),
+            }
+
+        # -- Oil (WTI Crude) --
+        oil_raw = self.get_oil_price()
+        if "error" in oil_raw:
+            oil = {"price": None, "change_pct": None, "currency": "USD"}
+        else:
+            oil = {
+                "price": oil_raw["price"],
+                "change_pct": oil_raw.get("change_pct", 0.0),
+                "currency": oil_raw.get("currency", "USD"),
             }
 
         # -- VIX --
@@ -296,6 +393,7 @@ class PriceFetcher:
         result: Dict[str, Any] = {
             "bitcoin": bitcoin,
             "gold": gold,
+            "oil": oil,
             "vix": vix,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
