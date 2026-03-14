@@ -968,12 +968,140 @@ body {
 }
 
 /* ══════════════════════════════════════════════════════════════
+   Flow Cards (Miro-style Game Theory entry cards)
+   ══════════════════════════════════════════════════════════════ */
+
+.flow-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 16px;
+  margin-bottom: 32px;
+}
+
+.flow-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  cursor: pointer;
+  transition: border-color 0.2s, transform 0.15s, box-shadow 0.2s;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.flow-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.flow-card--active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 4px 16px rgba(91, 141, 239, 0.15);
+}
+
+.flow-card__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.flow-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.flow-status--live {
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--green);
+}
+
+.flow-status--live::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  margin-right: 6px;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.flow-status--archived {
+  background: rgba(136, 136, 136, 0.15);
+  color: var(--text-dim);
+}
+
+.flow-card__nodes {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  font-family: var(--mono);
+}
+
+.flow-card__name {
+  font-size: 1.15rem;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--text);
+}
+
+.flow-card__question {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.flow-card__footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  margin-top: auto;
+}
+
+.flow-card__prob {
+  font-size: 0.82rem;
+  font-weight: 600;
+  font-family: var(--mono);
+  color: var(--accent);
+}
+
+.flow-card__articles {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.flow-card__arrow {
+  margin-left: auto;
+  font-size: 1.2rem;
+  color: var(--text-dim);
+  transition: transform 0.15s, color 0.15s;
+}
+
+.flow-card:hover .flow-card__arrow {
+  transform: translateX(4px);
+  color: var(--accent);
+}
+
+/* ══════════════════════════════════════════════════════════════
    Animations
    ══════════════════════════════════════════════════════════════ */
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+  50% { opacity: 0.4; }
 }
 
 .runup-card--active .runup-card__name::before {
@@ -1004,6 +1132,9 @@ body {
   .runup-grid {
     grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   }
+  .flow-grid {
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  }
 }
 
 @media (max-width: 768px) {
@@ -1023,7 +1154,7 @@ body {
     grid-template-columns: repeat(2, 1fr);
   }
 
-  .runup-grid {
+  .runup-grid, .flow-grid {
     grid-template-columns: 1fr;
   }
 
@@ -2441,21 +2572,32 @@ body {
 .tree-canvas-header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 12px 0;
+  gap: 16px;
+  padding: 14px 0;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
 
-.tree-canvas-header h2 {
+.tree-canvas-title {
   flex: 1;
-  font-size: 1.1rem;
-  font-weight: 600;
+  min-width: 0;
+}
+
+.tree-canvas-header h2 {
+  font-size: 1.15rem;
+  font-weight: 700;
   margin: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--text);
+  line-height: 1.3;
+}
+
+.tree-canvas-subtitle {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  font-family: var(--mono);
 }
 
 .tree-canvas-controls {
@@ -2480,13 +2622,16 @@ body {
   border-color: var(--accent);
 }
 
-/* Cytoscape container */
+/* Cytoscape container — Miro-style canvas with subtle dot grid */
 .tree-canvas-container {
   flex: 1;
   min-height: 500px;
-  background: var(--bg);
+  background:
+    radial-gradient(circle, rgba(255,255,255,0.03) 1px, transparent 1px),
+    var(--bg);
+  background-size: 24px 24px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 10px;
   margin-top: 12px;
   position: relative;
 }

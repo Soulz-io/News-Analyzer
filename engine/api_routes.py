@@ -14,7 +14,7 @@ from typing import List, Optional, Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, desc
+from sqlalchemy import func, desc, case
 from sqlalchemy.orm import Session
 
 from .config import config
@@ -877,13 +877,23 @@ def dashboard_overview(db: Session = Depends(_get_db)):
     total_articles = db.query(func.count(Article.id)).scalar() or 0
     total_briefs = db.query(func.count(ArticleBrief.id)).scalar() or 0
 
-    # Active run-ups — exclude merged ones (only show consolidated topics)
+    # All run-ups with decision trees — active first, then expired
+    # Exclude merged ones (only show consolidated topics)
     active_runup_rows = (
         db.query(RunUp)
-        .filter(RunUp.status == "active", RunUp.merged_into_id.is_(None))
-        .order_by(desc(RunUp.current_score))
+        .filter(RunUp.merged_into_id.is_(None))
+        .order_by(
+            # Active first, then expired
+            case((RunUp.status == "active", 0), else_=1),
+            desc(RunUp.current_score),
+        )
         .all()
     )
+    # Only include run-ups that actually have decision nodes
+    active_runup_rows = [
+        ru for ru in active_runup_rows
+        if db.query(DecisionNode).filter(DecisionNode.run_up_id == ru.id).count() > 0
+    ]
 
     # Enrich run-ups with root decision node info
     runups_out = []
@@ -911,6 +921,10 @@ def dashboard_overview(db: Session = Depends(_get_db)):
         rd["score"] = ru.current_score
         rd["article_count"] = ru.article_count_total
         rd["active"] = ru.status == "active"
+        rd["status"] = ru.status
+        rd["node_count"] = db.query(DecisionNode).filter(
+            DecisionNode.run_up_id == ru.id
+        ).count()
         runups_out.append(rd)
 
     # Prediction scoreboard stats

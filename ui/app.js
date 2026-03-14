@@ -1152,60 +1152,39 @@ function renderBriefingPanel() {
 
 function renderRunUpSection() {
   if (state.runups.length === 0) {
-    return `<div class="section-title">Active Run-ups</div>
+    return `<div class="section-title">Game Theory Flows</div>
     <div class="empty">
-      <div class="empty__icon">&#x1F4F0;</div>
-      <div class="empty__text">No active run-ups</div>
-      <div class="empty__hint">Run-ups will appear here when the news analyzer detects developing narratives.</div>
+      <div class="empty__icon">&#x1F3AF;</div>
+      <div class="empty__text">No decision trees yet</div>
+      <div class="empty__hint">Decision trees will appear when narratives are detected and analyzed.</div>
     </div>`;
   }
 
-  let html = `<div class="section-title">Active Run-ups</div><div class="runup-grid">`;
+  let html = `<div class="section-title">Game Theory Flows</div><div class="flow-grid">`;
 
   for (const r of state.runups) {
-    const arrow = trendArrow(r.trend);
-    const score = r.score || r.runup_score || 0;
-    const gaugeCls = gaugeColorClass(score);
     const isActive = r.active !== false;
     const prob = r.root_probability || r.probability || 0;
-    const probChange = r.probability_change || 0;
-    const probChangeCls = probChange > 0 ? "prob-change--up" : (probChange < 0 ? "prob-change--down" : "prob-change--stable");
-    const probChangeSign = probChange > 0 ? "+" : "";
-    const probChangeArrow = probChange > 0 ? "&#8593;" : (probChange < 0 ? "&#8595;" : "&#8594;");
+    const nodeCount = r.node_count || 0;
+    const statusBadge = isActive
+      ? `<span class="flow-status flow-status--live">LIVE</span>`
+      : `<span class="flow-status flow-status--archived">ARCHIVED</span>`;
 
-    html += `<div class="runup-card ${isActive ? "runup-card--active" : ""}" data-runup-id="${esc(r.id || r.runup_id || "")}">
-      <div class="runup-card__header">
-        <div class="runup-card__name">${esc(r.narrative || r.name || "Unnamed")}</div>
-        <div class="runup-card__meta">
-          <span class="region-badge ${regionClass(r.region)}">${esc(r.region || "Global")}</span>
-          <span class="trend-arrow ${arrow.cls}" title="${esc(r.trend || "stable")}">${arrow.symbol}</span>
-        </div>
+    // Clean narrative name: replace dashes with spaces, title case
+    const rawName = r.narrative || r.name || "Unnamed";
+    const cleanName = rawName.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+
+    html += `<div class="flow-card ${isActive ? "flow-card--active" : ""}" data-runup-id="${esc(r.id || r.runup_id || "")}">
+      <div class="flow-card__top">
+        ${statusBadge}
+        <span class="flow-card__nodes">${nodeCount} node${nodeCount !== 1 ? "s" : ""}</span>
       </div>
-
-      <div class="score-gauge">
-        <div class="score-gauge__header">
-          <span class="score-gauge__label">Run-up Score</span>
-          <span class="score-gauge__value">${pct(score)}</span>
-        </div>
-        <div class="score-gauge__bar">
-          <div class="score-gauge__fill ${gaugeCls}" style="width:${pct(score)}%"></div>
-        </div>
-      </div>
-
-      <div class="runup-card__details">
-        <span>${r.days_active || 0} days active</span>
-        <span>${r.article_count || 0} articles</span>
-      </div>
-
-      <div class="runup-card__decision">
-        <div class="decision-question">${esc(r.root_question || r.decision || "")}</div>
-        <div class="prob-bar">
-          <div class="prob-bar__track">
-            <div class="prob-bar__fill" style="width:${pct(prob)}%"></div>
-          </div>
-          <div class="prob-bar__label">${pct(prob)}%</div>
-        </div>
-        ${probChange !== 0 ? `<div class="prob-change ${probChangeCls}">${probChangeArrow} ${probChangeSign}${pct(probChange)}% deze week</div>` : ""}
+      <div class="flow-card__name">${esc(cleanName)}</div>
+      <div class="flow-card__question">${esc(r.root_question || "")}</div>
+      <div class="flow-card__footer">
+        <span class="flow-card__prob">${pct(prob)}% likely</span>
+        <span class="flow-card__articles">${r.article_count || 0} articles</span>
+        <span class="flow-card__arrow">&rarr;</span>
       </div>
     </div>`;
   }
@@ -1240,14 +1219,20 @@ function renderTreeView() {
   }
 
   const root = tree.root || {};
-  const narrativeName = esc(runup ? (runup.narrative || runup.name) : (root.narrative || "Decision Tree"));
+  const rawName = runup ? (runup.narrative || runup.name) : (root.narrative || "Decision Tree");
+  const cleanName = rawName.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+  const narrativeName = esc(cleanName);
+  const nodeCount = (tree.tree || []).length;
 
   return `<div class="tree-canvas-view">
     <div class="tree-canvas-header">
-      <button class="back-btn" data-back>&#8592; Back</button>
-      <h2>${narrativeName} &mdash; Game Theory Tree</h2>
+      <button class="back-btn" data-back>&#8592; All Flows</button>
+      <div class="tree-canvas-title">
+        <h2>${narrativeName}</h2>
+        <span class="tree-canvas-subtitle">${nodeCount} decision node${nodeCount !== 1 ? "s" : ""}</span>
+      </div>
       <div class="tree-canvas-controls">
-        <button data-tree-fit title="Fit to view">Fit</button>
+        <button data-tree-fit title="Fit to view">&#8596; Fit</button>
         <button data-tree-zoom-in title="Zoom in">+</button>
         <button data-tree-zoom-out title="Zoom out">&minus;</button>
       </div>
@@ -1546,174 +1531,220 @@ function buildTreeElements(tree) {
 
 function getCytoscapeStylesheet() {
   return [
-    // Decision nodes (default/open)
+    // ── Decision nodes (Miro-style clean cards) ──
     {
       selector: "node[type='decision']",
       style: {
         "shape": "round-rectangle",
-        "width": 260,
-        "height": 90,
-        "background-color": "#1a1d25",
+        "width": 280,
+        "height": 80,
+        "background-color": "#1e2230",
         "border-color": "#5b8def",
         "border-width": 2,
+        "border-opacity": 0.9,
         "label": "data(label)",
         "text-wrap": "wrap",
-        "text-max-width": 230,
-        "color": "#e0e0e6",
-        "font-size": 11,
+        "text-max-width": 250,
+        "color": "#f0f0f4",
+        "font-size": 12,
+        "font-weight": "500",
         "text-valign": "center",
         "text-halign": "center",
-        "padding": "10px",
+        "padding": "12px",
+        "shadow-blur": 12,
+        "shadow-color": "rgba(0,0,0,0.3)",
+        "shadow-offset-x": 0,
+        "shadow-offset-y": 2,
+        "shadow-opacity": 0.5,
       },
     },
-    // Confirmed YES decision
+    // Confirmed YES — green glow
     {
       selector: "node[type='decision'][status='confirmed_yes']",
       style: {
-        "background-color": "#059669",
+        "background-color": "#0d3d2e",
         "border-color": "#34d399",
-        "color": "#ffffff",
+        "border-width": 3,
+        "color": "#34d399",
+        "shadow-color": "rgba(52,211,153,0.3)",
       },
     },
-    // Confirmed NO decision
+    // Confirmed NO — red glow
     {
       selector: "node[type='decision'][status='confirmed_no']",
       style: {
-        "background-color": "#dc2626",
+        "background-color": "#3d1515",
         "border-color": "#f87171",
-        "color": "#ffffff",
+        "border-width": 3,
+        "color": "#f87171",
+        "shadow-color": "rgba(248,113,113,0.3)",
       },
     },
-    // Consequence nodes (default)
+    // ── Consequence nodes ──
     {
       selector: "node[type='consequence']",
       style: {
         "shape": "round-rectangle",
-        "width": 220,
-        "height": 65,
-        "background-color": "#22262f",
-        "border-width": 1,
+        "width": 240,
+        "height": 60,
+        "background-color": "#1a1d26",
+        "border-width": 1.5,
+        "border-opacity": 0.7,
         "label": "data(label)",
         "text-wrap": "wrap",
-        "text-max-width": 195,
-        "color": "#e0e0e6",
-        "font-size": 10,
+        "text-max-width": 215,
+        "color": "#c8c8d0",
+        "font-size": 10.5,
         "text-valign": "center",
         "text-halign": "center",
         "padding": "8px",
+        "shadow-blur": 8,
+        "shadow-color": "rgba(0,0,0,0.2)",
+        "shadow-offset-x": 0,
+        "shadow-offset-y": 1,
+        "shadow-opacity": 0.4,
       },
     },
-    // YES consequence border
+    // YES consequence — green left border feel
     {
       selector: "node[type='consequence'][branch='yes']",
       style: {
-        "border-color": "rgba(52,211,153,0.5)",
+        "border-color": "#34d399",
+        "background-color": "#141e1a",
       },
     },
-    // NO consequence border
+    // NO consequence — red left border feel
     {
       selector: "node[type='consequence'][branch='no']",
       style: {
-        "border-color": "rgba(248,113,113,0.5)",
+        "border-color": "#f87171",
+        "background-color": "#1e1414",
       },
     },
-    // Stock nodes (default)
+    // ── Stock pill nodes ──
     {
       selector: "node[type='stock']",
       style: {
         "shape": "round-rectangle",
-        "width": 80,
-        "height": 30,
+        "width": 72,
+        "height": 28,
         "label": "data(label)",
-        "font-size": 11,
+        "font-size": 10,
         "font-weight": "bold",
         "text-valign": "center",
         "text-halign": "center",
         "color": "#ffffff",
+        "border-width": 0,
+        "shadow-blur": 6,
+        "shadow-color": "rgba(0,0,0,0.25)",
+        "shadow-offset-y": 1,
+        "shadow-opacity": 0.4,
       },
     },
-    // Bullish stock
     {
       selector: "node[type='stock'][direction='bullish']",
-      style: {
-        "background-color": "#059669",
-      },
+      style: { "background-color": "#059669" },
     },
-    // Bearish stock
     {
       selector: "node[type='stock'][direction='bearish']",
-      style: {
-        "background-color": "#dc2626",
-      },
+      style: { "background-color": "#dc2626" },
     },
-    // Default edges
+    // ── Edges — smooth Miro-style curves ──
     {
       selector: "edge",
       style: {
         "width": 2,
         "curve-style": "bezier",
         "target-arrow-shape": "triangle",
-        "arrow-scale": 0.8,
-        "line-color": "#444",
-        "target-arrow-color": "#444",
+        "arrow-scale": 0.7,
+        "line-color": "#333640",
+        "target-arrow-color": "#333640",
+        "opacity": 0.85,
       },
     },
-    // YES branch edges
+    // YES branch — green
     {
       selector: "edge[branch='yes']",
       style: {
         "line-color": "#34d399",
         "target-arrow-color": "#34d399",
+        "width": 2.5,
         "label": "YES",
         "font-size": 9,
         "font-weight": "bold",
         "color": "#34d399",
         "text-background-color": "#12141a",
-        "text-background-opacity": 0.8,
-        "text-background-padding": "3px",
+        "text-background-opacity": 0.9,
+        "text-background-padding": "4px",
+        "text-background-shape": "roundrectangle",
       },
     },
-    // NO branch edges
+    // NO branch — red
     {
       selector: "edge[branch='no']",
       style: {
         "line-color": "#f87171",
         "target-arrow-color": "#f87171",
+        "width": 2.5,
         "label": "NO",
         "font-size": 9,
         "font-weight": "bold",
         "color": "#f87171",
         "text-background-color": "#12141a",
-        "text-background-opacity": 0.8,
-        "text-background-padding": "3px",
+        "text-background-opacity": 0.9,
+        "text-background-padding": "4px",
+        "text-background-shape": "roundrectangle",
       },
     },
-    // Stock edges
+    // Stock edges — thin dashed
     {
       selector: "edge[type='stock']",
       style: {
         "width": 1,
-        "line-color": "#444",
-        "target-arrow-color": "#444",
+        "line-color": "#2a2e38",
+        "target-arrow-color": "#2a2e38",
         "line-style": "dashed",
+        "opacity": 0.6,
       },
     },
-    // Cascade edges (parent -> child decision nodes)
+    // Cascade edges — amber dashed
     {
       selector: "edge[type='cascade']",
       style: {
-        "width": 2,
+        "width": 2.5,
         "line-style": "dashed",
         "line-color": "#f59e0b",
         "target-arrow-color": "#f59e0b",
+        "label": "CASCADE",
+        "font-size": 8,
+        "color": "#f59e0b",
+        "text-background-color": "#12141a",
+        "text-background-opacity": 0.9,
+        "text-background-padding": "3px",
       },
     },
-    // Hover highlight
+    // ── Hover / active states ──
     {
       selector: "node:active",
       style: {
-        "overlay-opacity": 0.1,
+        "overlay-opacity": 0.08,
         "overlay-color": "#5b8def",
+      },
+    },
+    // Highlight classes for hover
+    {
+      selector: ".edge-highlight",
+      style: {
+        "width": 3.5,
+        "opacity": 1,
+      },
+    },
+    {
+      selector: ".node-highlight",
+      style: {
+        "border-width": 3,
+        "shadow-blur": 20,
+        "shadow-opacity": 0.7,
       },
     },
   ];
