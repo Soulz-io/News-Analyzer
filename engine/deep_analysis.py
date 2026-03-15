@@ -16,6 +16,8 @@ from datetime import datetime, date, timedelta
 from statistics import mean
 from typing import Dict, List, Any, Optional
 
+from sqlalchemy import or_
+
 from .db import (
     get_session,
     Article,
@@ -38,31 +40,38 @@ logger = logging.getLogger(__name__)
 
 SOURCE_CREDIBILITY: Dict[str, float] = {
     # Major wire services
-    "Reuters": 0.95,
+    "Reuters": 0.95, "Reuters Energy": 0.95, "Reuters Business": 0.95,
+    "Reuters Politics": 0.95,
     "AP News": 0.95,
     "AFP": 0.90,
-    # Western broadsheets
-    "BBC": 0.90,
-    "The Guardian": 0.88,
-    "NPR": 0.88,
+    # Western broadsheets / BBC variants (RSS feeds use regional suffixes)
+    "BBC": 0.90, "BBC World": 0.90, "BBC Middle East": 0.90,
+    "BBC South Asia": 0.90, "BBC Asia": 0.90, "BBC Europe": 0.90,
+    "BBC Africa": 0.90, "BBC Latin America": 0.90,
+    "The Guardian": 0.88, "Guardian World": 0.88, "Guardian Americas": 0.88,
+    "Guardian Africa": 0.88,
+    "NPR": 0.88, "NPR World": 0.88, "NPR News": 0.88,
     "PBS NewsHour": 0.88,
     "Financial Times": 0.90,
     "The Economist": 0.88,
-    "New York Times": 0.88,
+    "New York Times": 0.88, "NYT World": 0.88,
     "Washington Post": 0.85,
-    "Wall Street Journal": 0.88,
-    "Bloomberg": 0.88,
+    "Wall Street Journal": 0.88, "WSJ Markets": 0.88,
+    "Bloomberg": 0.88, "Bloomberg Markets": 0.88,
     # TV / cable news
     "CNN": 0.78,
-    "CNBC": 0.80,
+    "CNBC": 0.80, "CNBC Top News": 0.80, "CNBC World": 0.80,
     "Fox News": 0.60,
     # Regional quality outlets
-    "Al Jazeera English": 0.82,
-    "Al Jazeera": 0.82,
-    "South China Morning Post": 0.78,
-    "The Japan Times": 0.80,
-    "DW (Deutsche Welle)": 0.85,
-    "France24": 0.83,
+    "Al Jazeera English": 0.82, "Al Jazeera": 0.82,
+    "South China Morning Post": 0.78, "SCMP": 0.78,
+    "The Japan Times": 0.80, "Nikkei Asia": 0.82,
+    "DW (Deutsche Welle)": 0.85, "DW": 0.85,
+    "France24": 0.83, "France 24": 0.83, "France 24 Europe": 0.83,
+    "Haaretz": 0.80, "Kyiv Independent": 0.78, "Moscow Times": 0.75,
+    "Politico": 0.80, "Foreign Policy": 0.85, "Foreign Affairs": 0.88,
+    "Spiegel International": 0.85, "EUobserver": 0.80,
+    "MarketWatch": 0.75, "Yahoo Finance": 0.72,
     # Defense / specialist
     "Defense One": 0.82,
     "The War Zone": 0.80,
@@ -71,19 +80,22 @@ SOURCE_CREDIBILITY: Dict[str, float] = {
     "SIPRI": 0.90,
     "OilPrice.com": 0.72,
     "Rigzone": 0.72,
+    "IISS Analysis": 0.85, "Military Times": 0.78, "Naval News": 0.78,
     # Government
-    "White House": 0.70,
-    "US State Department": 0.70,
-    "NATO": 0.72,
-    "European Council": 0.72,
+    "White House": 0.70, "White House Briefing": 0.70,
+    "US State Department": 0.70, "US DoD News": 0.72,
+    "NATO": 0.72, "NATO News": 0.72,
+    "European Council": 0.72, "EU External Action": 0.72,
+    "UN News": 0.78,
     # State-affiliated media (lower credibility)
     "RT (Russia Today)": 0.30,
     "TASS": 0.35,
-    "Xinhua": 0.40,
+    "Xinhua": 0.40, "China Daily": 0.40,
     "CGTN": 0.38,
-    "PressTV Iran": 0.35,
+    "PressTV Iran": 0.35, "IRNA Iran News": 0.40,
     "IRNA": 0.40,
     "Press TV": 0.35,
+    "Kremlin Press (ENG)": 0.30,
     # Think tanks
     "CSIS": 0.85,
     "Brookings": 0.85,
@@ -739,6 +751,7 @@ def _generate_strategic_narrative(
         response = client.messages.create(
             model=config.tree_generator_model,
             max_tokens=2000,
+            temperature=0.3,
             system=STRATEGIC_SYSTEM,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -758,6 +771,9 @@ def _generate_strategic_narrative(
             text = text.split("\n", 1)[1] if "\n" in text else text[3:]
             if text.endswith("```"):
                 text = text[:-3].strip()
+        # Strip language tag (e.g., "json\n{...}")
+        if text.startswith("json"):
+            text = text[4:].strip()
 
         result = json.loads(text)
         logger.info(
@@ -809,7 +825,10 @@ def run_deep_analysis(period_days: int = 7) -> Optional[AnalysisReport]:
             session.query(TradingSignal)
             .filter(
                 TradingSignal.superseded_by_id.is_(None),
-                TradingSignal.expires_at >= datetime.utcnow(),
+                or_(
+                    TradingSignal.expires_at.is_(None),
+                    TradingSignal.expires_at >= datetime.utcnow(),
+                ),
             )
             .order_by(TradingSignal.confidence.desc())
             .limit(10)

@@ -249,11 +249,16 @@ def update_narratives(briefs: List[ArticleBrief]) -> List[NarrativeTimeline]:
             )
 
             if existing:
-                existing.article_count += article_count
+                # Weighted average: combine old and new by article count
+                old_n = existing.article_count
+                new_n = article_count
+                total_n = old_n + new_n
+                if total_n > 0:
+                    existing.avg_sentiment = (existing.avg_sentiment * old_n + avg_sentiment * new_n) / total_n
+                    existing.intensity_score = (existing.intensity_score * old_n + avg_intensity * new_n) / total_n
+                existing.article_count = total_n
                 existing.sources_count = max(existing.sources_count, len(sources))
                 existing.unique_regions = max(existing.unique_regions, len(regions))
-                existing.avg_sentiment = (existing.avg_sentiment + avg_sentiment) / 2
-                existing.intensity_score = (existing.intensity_score + avg_intensity) / 2
                 existing.topic_cluster_id = cluster_id
                 row = existing
             else:
@@ -639,18 +644,37 @@ def consolidate_runups() -> List[RunUp]:
             .all()
         )
 
-        if len(active) <= 1:
+        # Focus Mode: also include expired (non-merged) run-ups so they can
+        # be consolidated into a focused primary narrative.
+        from .focus_manager import get_focused_runup_ids
+        focused_ids = set(get_focused_runup_ids())
+
+        expired_candidates: list = []
+        if focused_ids:
+            expired_candidates = (
+                session.query(RunUp)
+                .filter(
+                    RunUp.status == "expired",
+                    RunUp.merged_into_id.is_(None),
+                )
+                .order_by(RunUp.current_score.desc())
+                .all()
+            )
+
+        all_candidates = active + expired_candidates
+
+        if len(all_candidates) <= 1:
             return active
 
         # Gather keywords per run-up
         ru_keywords: Dict[int, set] = {}
         ru_regions: Dict[int, str] = {}
-        for ru in active:
+        for ru in all_candidates:
             ru_keywords[ru.id] = _runup_keywords(ru.narrative_name, session)
             ru_regions[ru.id] = _extract_region(ru.narrative_name)
 
         # Build merge groups using union-find
-        parent: Dict[int, int] = {ru.id: ru.id for ru in active}
+        parent: Dict[int, int] = {ru.id: ru.id for ru in all_candidates}
 
         def find(x: int) -> int:
             while parent[x] != x:
@@ -663,38 +687,60 @@ def consolidate_runups() -> List[RunUp]:
             if ra != rb:
                 parent[rb] = ra
 
-        # Compare all pairs — same region + keyword overlap ≥ 40%
         OVERLAP_THRESHOLD = 0.40
-        for i, ru_a in enumerate(active):
-            for ru_b in active[i + 1:]:
-                if ru_regions[ru_a.id] != ru_regions[ru_b.id]:
-                    continue
+        FOCUS_OVERLAP_THRESHOLD = 0.25  # lower bar for focused narratives
+
+        for i, ru_a in enumerate(all_candidates):
+            for ru_b in all_candidates[i + 1:]:
+                either_focused = ru_a.id in focused_ids or ru_b.id in focused_ids
+
+                if not either_focused:
+                    # Standard merge: require same region, active only
+                    if ru_a.status != "active" or ru_b.status != "active":
+                        continue
+                    if ru_regions[ru_a.id] != ru_regions[ru_b.id]:
+                        continue
+                    threshold = OVERLAP_THRESHOLD
+                else:
+                    # Focus merge: cross-region, include expired, lower threshold
+                    threshold = FOCUS_OVERLAP_THRESHOLD
+
                 overlap = _keyword_overlap(
                     ru_keywords[ru_a.id], ru_keywords[ru_b.id]
                 )
-                if overlap >= OVERLAP_THRESHOLD:
+                if overlap >= threshold:
                     union(ru_a.id, ru_b.id)
 
-        # Group by root
+        # Group by root — include all candidates (active + expired in focus)
         groups: Dict[int, List[RunUp]] = defaultdict(list)
-        for ru in active:
+        for ru in all_candidates:
             groups[find(ru.id)].append(ru)
 
         primaries: List[RunUp] = []
         merged_count = 0
 
         for root_id, members in groups.items():
-            # Sort by score desc — first is primary
-            members.sort(key=lambda r: r.current_score, reverse=True)
+            # If any member is focused, it becomes primary (regardless of score)
+            focused_members = [m for m in members if m.id in focused_ids]
+            if focused_members:
+                members.sort(key=lambda r: (r.id not in focused_ids, -r.current_score))
+            else:
+                members.sort(key=lambda r: r.current_score, reverse=True)
             primary = members[0]
 
             # Aggregate article counts from merged members
-            total_articles = sum(m.article_count_total for m in members)
+            total_articles = sum(
+                getattr(m, "article_count_total", 0) or 0 for m in members
+            )
             primary.article_count_total = total_articles
 
             # Take the best score
             best_score = max(m.current_score for m in members)
             primary.current_score = best_score
+
+            # Ensure primary is active (reactivate if it was expired)
+            if primary.status == "expired" and primary.id in focused_ids:
+                primary.status = "active"
 
             primaries.append(primary)
 
@@ -706,8 +752,10 @@ def consolidate_runups() -> List[RunUp]:
 
         session.commit()
         logger.info(
-            "Consolidation: %d active run-ups → %d topics (%d merged).",
+            "Consolidation: %d candidates (%d active + %d expired) → %d topics (%d merged).",
+            len(all_candidates),
             len(active),
+            len(expired_candidates),
             len(primaries),
             merged_count,
         )

@@ -543,3 +543,143 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
                 )
 
     return confirmed_count
+
+
+# ---------------------------------------------------------------------------
+# Manual Polymarket linking (Focus Mode)
+# ---------------------------------------------------------------------------
+
+def create_manual_polymarket_match(
+    run_up_id: int,
+    polymarket_url: str,
+    db: Optional[Session] = None,
+) -> Optional[Dict]:
+    """Create a PolymarketMatch from a user-provided Polymarket URL.
+
+    Fetches the event/market data from the Polymarket Gamma API using the
+    URL slug, then creates a PolymarketMatch with match_method='manual'
+    and match_score=100.
+
+    Returns a summary dict on success, None on failure.
+    """
+    close_session = False
+    if db is None:
+        db = get_session()
+        close_session = True
+
+    try:
+        # Extract slug from URL: https://polymarket.com/event/<slug>
+        slug = polymarket_url.rstrip("/").split("/")[-1]
+        if not slug:
+            logger.warning("Manual PM link: no slug extracted from %s", polymarket_url)
+            return None
+
+        # Fetch market data
+        resp = httpx.get(
+            POLYMARKET_EVENTS_API,
+            params={"slug": slug},
+            timeout=FETCH_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            logger.warning(
+                "Manual PM link: API returned %d for slug %s", resp.status_code, slug
+            )
+            return None
+
+        events = resp.json()
+        if not events:
+            logger.warning("Manual PM link: no events found for slug %s", slug)
+            return None
+
+        event = events[0]
+        markets = event.get("markets", [])
+        if not markets:
+            logger.warning("Manual PM link: no markets in event %s", slug)
+            return None
+
+        market = markets[0]
+        polymarket_id = str(market.get("id", slug))
+        question = market.get("question", event.get("title", ""))
+        yes_price = None
+        volume = None
+
+        try:
+            yes_price = float(market.get("outcomePrices", "[0.5]").strip("[]").split(",")[0])
+        except (ValueError, IndexError):
+            yes_price = 0.5
+
+        try:
+            volume = float(market.get("volume", 0))
+        except (ValueError, TypeError):
+            volume = 0
+
+        # Find root decision node for this run-up
+        root_node = (
+            db.query(DecisionNode)
+            .filter(DecisionNode.run_up_id == run_up_id, DecisionNode.depth == 0)
+            .first()
+        )
+
+        # Create or update PolymarketMatch
+        existing = (
+            db.query(PolymarketMatch)
+            .filter(
+                PolymarketMatch.run_up_id == run_up_id,
+                PolymarketMatch.polymarket_id == polymarket_id,
+            )
+            .first()
+        )
+
+        if existing:
+            existing.outcome_yes_price = yes_price
+            existing.volume = volume
+            existing.match_score = 100.0
+            existing.match_method = "manual"
+            existing.polymarket_question = question
+            existing.polymarket_url = polymarket_url
+            existing.updated_at = datetime.utcnow()
+            match = existing
+        else:
+            match = PolymarketMatch(
+                run_up_id=run_up_id,
+                decision_node_id=root_node.id if root_node else None,
+                polymarket_id=polymarket_id,
+                polymarket_question=question,
+                polymarket_url=polymarket_url,
+                outcome_yes_price=yes_price,
+                volume=volume,
+                match_score=100.0,
+                match_method="manual",
+            )
+            db.add(match)
+
+        # Record price history
+        history = PolymarketPriceHistory(
+            polymarket_id=polymarket_id,
+            question=question,
+            yes_price=yes_price,
+            volume=volume,
+            recorded_at=datetime.utcnow(),
+        )
+        db.add(history)
+        db.commit()
+
+        logger.info(
+            "Manual PM link: linked run-up %d to %s (YES=%.2f, vol=%.0f)",
+            run_up_id, question[:50], yes_price or 0, volume or 0,
+        )
+        return {
+            "status": "linked",
+            "polymarket_id": polymarket_id,
+            "question": question,
+            "yes_price": yes_price,
+            "volume": volume,
+        }
+
+    except Exception:
+        db.rollback()
+        logger.exception("Manual Polymarket link failed for run-up %d", run_up_id)
+        return None
+    finally:
+        if close_session:
+            db.close()

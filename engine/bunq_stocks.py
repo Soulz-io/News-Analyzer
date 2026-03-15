@@ -1,23 +1,61 @@
 """BUNQ Stocks whitelist — curated list of stocks/ETFs available on bunq.
 
 bunq Stocks uses Ginmon (broker) + Upvest (principal broker & custodian)
-executing on Börse Stuttgart and other EU exchanges.
+executing on Tradegate, Xetra, Quotrix, Gettex, and Lang & Schwarz.
 
-bunq offers ~200+ curated popular US & EU large-caps and ETFs.
-This list is compiled from bunq's public communications and the typical
-Upvest/Ginmon universe. Update this list periodically as bunq adds more.
+Because all execution happens on German/EU exchanges, only instruments with
+a European listing are available.  Pure US-listed commodity ETFs (USO, GLD,
+SLV) and the VIX index are NOT available to European retail investors
+(MiFID II / PRIIPs KID requirement).
+
+bunq offers ~400+ curated popular US & EU large-caps and ETFs.
+This list is compiled from bunq's public communications, user-confirmed
+holdings, and the typical Upvest/Ginmon universe.
 
 Source: https://press.bunq.com/241839-bunq-lanceert-beleggingsproduct/
 Partner info: https://upvest.co/blog/bunq-ginmon-and-upvest-join-forces-to-launch-investment-products
+Upvest docs: https://docs.upvest.co/products/tol/guides/instruments/concept
 """
 
-# Confirmed available (mentioned in bunq press releases / reviews)
+# ── Confirmed by user (actually in their bunq portfolio) ─────────────
 CONFIRMED = {
     "AAPL", "TSLA", "NVDA", "META", "MSFT", "HPQ", "V",
+    # User-confirmed holdings (March 2026):
+    "XOM", "IS0D.DE", "WMIN.DE", "IS0E.DE", "ISPA.DE",
 }
 
-# Highly likely available — standard large-cap US & EU stocks
-# offered by Upvest to all partners (Revolut, N26, bunq)
+# ── NOT available on bunq (verified) ─────────────────────────────────
+# These are US-only instruments that lack EU cross-listings required
+# by Upvest's execution venues.
+NOT_AVAILABLE = {
+    "USO",   # United States Oil Fund — US-only commodity ETF
+    "GLD",   # SPDR Gold Shares — US-only (use IGLN.L / EWG2.DE instead)
+    "SLV",   # iShares Silver Trust — US-only (use ISLN.L instead)
+    "VIX",   # CBOE Volatility Index — not a tradeable security
+    "GDX",   # VanEck Gold Miners — US-only (use IS0E.DE instead)
+    "XOP",   # SPDR Oil & Gas E&P — US-only
+    "HDV",   # iShares Core High Dividend — US-only (use VHYL.AS)
+    "SCHD",  # Schwab US Dividend — US-only
+    # US-domiciled ETFs — no UCITS KID, blocked for EU retail under MiFID II/PRIIPs
+    "XLE",   # Energy Select SPDR — use IS0D.DE instead
+    "XLF",   # Financial Select SPDR
+    "XLV",   # Health Care Select SPDR
+    "XLK",   # Technology Select SPDR
+    "XLI",   # Industrial Select SPDR
+    "ITA",   # iShares US Aerospace & Defense
+    "VNQ",   # Vanguard Real Estate ETF
+    "EEM",   # iShares MSCI EM — use IEMA.AS instead
+    "EFA",   # iShares MSCI EAFE
+    "FXI",   # iShares China Large-Cap
+    "TLT",   # iShares 20+ Year Treasury
+    "HYG",   # iShares High Yield Corporate Bond
+    "SPY",   # SPDR S&P 500 — use CSPX.AS instead
+    "QQQ",   # Invesco QQQ — use EQQQ.DE instead
+    "VTI",   # Vanguard Total Stock Market — use IWDA.AS instead
+    "VGK",   # Vanguard FTSE Europe — use VEUR.AS instead
+}
+
+# ── Full whitelist ───────────────────────────────────────────────────
 BUNQ_STOCKS: dict[str, str] = {
     # ═══ US MEGA-CAPS (confirmed + very likely) ═══
     "AAPL":  "Apple",
@@ -129,7 +167,7 @@ BUNQ_STOCKS: dict[str, str] = {
     "AD.AS":  "Ahold Delhaize",
     "HEIA.AS": "Heineken",
     "WKL.AS": "Wolters Kluwer",
-    "REN.AS": "RELX",
+    "RELX.AS": "RELX",
     "PRX.AS": "Prosus",
     "NESN.SW": "Nestlé",
     "ROG.SW": "Roche",
@@ -139,7 +177,7 @@ BUNQ_STOCKS: dict[str, str] = {
     "HSBA.L": "HSBC Holdings",
     "BP.L":   "BP",
 
-    # ═══ ETFs (known bunq/Ginmon offerings) ═══
+    # ═══ ETFs — EU-listed (UCITS compliant, on Xetra/Tradegate) ═══
     "IWDA.AS": "iShares Core MSCI World",
     "VWRL.AS": "Vanguard FTSE All-World",
     "CSPX.AS": "iShares Core S&P 500",
@@ -147,33 +185,29 @@ BUNQ_STOCKS: dict[str, str] = {
     "VUSA.AS": "Vanguard S&P 500",
     "IEMA.AS": "iShares MSCI EM",
     "ISAC.AS": "iShares MSCI ACWI",
-
-    # ═══ COMMODITY ETFs ═══
-    "GLD":   "SPDR Gold Shares",
-    "USO":   "United States Oil Fund",
-    "SLV":   "iShares Silver Trust",
-
-    # ═══ SECTOR ETFs ═══
-    "XLE":   "Energy Select Sector SPDR",
-    "XLF":   "Financial Select Sector SPDR",
-    "XLV":   "Health Care Select Sector SPDR",
-    "XLK":   "Technology Select Sector SPDR",
-    "XLI":   "Industrial Select Sector SPDR",
-    "ITA":   "iShares US Aerospace & Defense",
-    "VNQ":   "Vanguard Real Estate ETF",
-    "EEM":   "iShares MSCI Emerging Markets",
-    "EFA":   "iShares MSCI EAFE",
-    "FXI":   "iShares China Large-Cap",
-    "TLT":   "iShares 20+ Year Treasury Bond",
-    "HYG":   "iShares High Yield Corporate Bond",
-    "SPY":   "SPDR S&P 500 ETF Trust",
-    "QQQ":   "Invesco QQQ Trust",
-    "VTI":   "Vanguard Total Stock Market",
-    "VGK":   "Vanguard FTSE Europe",
+    "VHYL.AS": "Vanguard FTSE All-World High Dividend Yield",
     "IQQH.DE": "iShares Global Clean Energy",
 
-    # ═══ VOLATILITY ═══
-    "VIX":   "CBOE Volatility Index",
+    # ═══ COMMODITY / MINING / GOLD (EU-listed UCITS, user-confirmed) ═══
+    "IS0D.DE": "iShares Oil & Gas Exploration & Production UCITS ETF",
+    "WMIN.DE": "VanEck S&P Global Mining UCITS ETF",
+    "IS0E.DE": "iShares Gold Producers UCITS ETF",
+    "ISPA.DE": "iShares STOXX Global Select Dividend 100 UCITS ETF (DE)",
+
+    # ═══ COPPER / CRITICAL MINERALS (mid-term structural plays) ═══
+    "FCX":     "Freeport-McMoRan (copper/gold mining)",
+    "SCCO":    "Southern Copper Corp",
+    "GLEN.L":  "Glencore (copper/commodities)",
+    "ANTO.L":  "Antofagasta (copper mining)",
+    "TECK":    "Teck Resources (copper/zinc)",
+    "ALB":     "Albemarle (lithium)",
+    "RIO":     "Rio Tinto (copper/iron/aluminium)",
+    "BHP":     "BHP Group (copper/iron/commodities)",
+
+    # ═══ INFRASTRUCTURE / INDUSTRIALS ═══
+    # Note: CAT already listed under US MEGA-CAPS
+    "DE":      "Deere & Co",
+
 }
 
 # Simple lookup: normalize ticker to just uppercase base
@@ -184,6 +218,9 @@ _TICKER_SET.update(t.upper() for t in BUNQ_STOCKS)
 def is_available_on_bunq(ticker: str) -> bool:
     """Check if a ticker is likely available on bunq Stocks."""
     t = ticker.strip().upper()
+    # Explicitly blocked tickers
+    if t in NOT_AVAILABLE:
+        return False
     if t in BUNQ_STOCKS:
         return True
     # Check base ticker without exchange suffix
@@ -198,13 +235,10 @@ def get_bunq_ticker_list() -> list[str]:
 
 def get_bunq_stocks_prompt_snippet() -> str:
     """Return a compact string listing available tickers for Claude prompts."""
-    # Group by category for readability
-    us_tickers = [t for t in BUNQ_STOCKS if "." not in t and t not in ("GLD", "USO", "SLV", "XLE", "XLF", "XLV", "XLK", "XLI", "ITA", "VNQ", "EEM", "EFA", "FXI", "TLT", "HYG", "SPY", "QQQ", "VTI", "VGK", "VIX")]
+    us_tickers = [t for t in BUNQ_STOCKS if "." not in t]
     eu_tickers = [t for t in BUNQ_STOCKS if "." in t]
-    etf_tickers = [t for t in BUNQ_STOCKS if t in ("GLD", "USO", "SLV", "XLE", "XLF", "XLV", "XLK", "XLI", "ITA", "VNQ", "EEM", "EFA", "FXI", "TLT", "HYG", "SPY", "QQQ", "VTI", "VGK", "VIX")]
 
     return (
         f"US stocks: {', '.join(sorted(us_tickers))}\n"
-        f"EU stocks: {', '.join(sorted(eu_tickers))}\n"
-        f"ETFs: {', '.join(sorted(etf_tickers))}"
+        f"EU stocks/ETFs: {', '.join(sorted(eu_tickers))}"
     )

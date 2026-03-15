@@ -181,7 +181,11 @@ def score_evidence(brief: ArticleBrief, yes_keywords: List[str], no_keywords: Li
 # ---------------------------------------------------------------------------
 
 def _bayesian_update(prior: float, evidence_score: float, max_shift: float) -> float:
-    """Perform a dampened Bayesian-style update.
+    """Perform a log-odds Bayesian update with dampening.
+
+    Uses proper Bayesian reasoning via log-odds space, which correctly
+    handles cumulative evidence and converges naturally.  The max_shift
+    parameter caps the per-cycle change to prevent wild swings.
 
     Parameters
     ----------
@@ -197,11 +201,29 @@ def _bayesian_update(prior: float, evidence_score: float, max_shift: float) -> f
     float
         Updated probability clamped to [0.01, 0.99].
     """
-    # Convert evidence to a likelihood ratio approximation
-    # Positive evidence_score -> shift prior upward
-    shift = evidence_score * max_shift
+    import math
 
-    posterior = prior + shift
+    # Clamp prior to prevent log(0)
+    prior = max(0.01, min(0.99, prior))
+
+    # Convert to log-odds space: log(p / (1-p))
+    log_odds = math.log(prior / (1.0 - prior))
+
+    # Evidence as log-likelihood ratio (scaled for reasonable sensitivity)
+    # evidence_score ∈ [-1, 1] roughly → LLR ∈ [-2, 2]
+    llr = evidence_score * 2.0
+
+    # Update in log-odds space (proper Bayesian update)
+    log_odds += llr
+
+    # Convert back to probability
+    posterior = 1.0 / (1.0 + math.exp(-log_odds))
+
+    # Cap the maximum per-cycle shift to prevent wild swings
+    shift = posterior - prior
+    if abs(shift) > max_shift:
+        posterior = prior + max_shift * (1.0 if shift > 0 else -1.0)
+
     return round(max(min(posterior, 0.99), 0.01), 4)
 
 

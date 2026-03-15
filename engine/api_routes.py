@@ -12,7 +12,7 @@ import logging
 from datetime import datetime, date, timedelta
 from typing import List, Optional, Any, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, desc, case
 from sqlalchemy.orm import Session
@@ -35,10 +35,15 @@ from .db import (
     EngineSettings,
     AnalysisReport,
     TradingSignal,
+    SwarmVerdict,
 )
 from .narrative_tracker import update_narratives, detect_runups, consolidate_runups
 from .probability_engine import get_significant_shifts
 from .tree_generator import generate_tree, generate_trees_for_new_runups
+from .focus_manager import (
+    get_focused_runup_ids, set_focus, clear_focus, is_focused,
+    get_focus_polymarket_links, add_polymarket_link,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +134,99 @@ class UserFeedCreate(BaseModel):
     url: str
     region: str = "global"
     lang: str = "en"
+
+
+class FocusUpdate(BaseModel):
+    runup_ids: List[int] = Field(default_factory=list)
+
+
+class PolymarketLinkCreate(BaseModel):
+    run_up_id: int
+    polymarket_url: str
+
+
+# ===========================================================================
+# FOCUS MODE ENDPOINTS
+# ===========================================================================
+
+@router.get("/focus")
+def get_focus(db: Session = Depends(_get_db)):
+    """Return current focus state."""
+    ids = get_focused_runup_ids()
+    links = get_focus_polymarket_links()
+
+    focused_runups = []
+    if ids:
+        runups = db.query(RunUp).filter(RunUp.id.in_(ids)).all()
+        for ru in runups:
+            root_node = (
+                db.query(DecisionNode)
+                .filter(DecisionNode.run_up_id == ru.id, DecisionNode.depth == 0)
+                .first()
+            )
+            focused_runups.append({
+                "id": ru.id,
+                "narrative_name": ru.narrative_name,
+                "score": ru.current_score,
+                "article_count": ru.article_count_total,
+                "status": ru.status,
+                "has_tree": root_node is not None,
+                "root_question": root_node.question if root_node else None,
+                "root_probability": round((root_node.yes_probability or 0.5) * 100, 1) if root_node else None,
+            })
+
+    return {
+        "focused_runup_ids": ids,
+        "focused_runups": focused_runups,
+        "polymarket_links": links,
+    }
+
+
+@router.put("/focus")
+def update_focus(payload: FocusUpdate, db: Session = Depends(_get_db)):
+    """Set focused run-ups (max 3). Triggers consolidation."""
+    ids = set_focus(payload.runup_ids)
+    if ids:
+        consolidate_runups()
+    return {"status": "ok", "focused_runup_ids": ids}
+
+
+@router.delete("/focus")
+def delete_focus():
+    """Clear all focus selections."""
+    clear_focus()
+    return {"status": "ok", "focused_runup_ids": []}
+
+
+@router.post("/focus/polymarket-link")
+def focus_polymarket_link(payload: PolymarketLinkCreate, db: Session = Depends(_get_db)):
+    """Manually link a Polymarket URL to a run-up."""
+    from .polymarket import create_manual_polymarket_match
+
+    result = create_manual_polymarket_match(
+        run_up_id=payload.run_up_id,
+        polymarket_url=payload.polymarket_url,
+        db=db,
+    )
+    if result is None:
+        from fastapi import HTTPException as HE
+        raise HE(status_code=400, detail="Failed to link Polymarket URL")
+    return result
+
+
+@router.post("/focus/regenerate-tree/{run_up_id}")
+def focus_regenerate_tree(run_up_id: int):
+    """Force regenerate a decision tree for a focused run-up."""
+    if not is_focused(run_up_id):
+        from fastapi import HTTPException as HE
+        raise HE(status_code=403, detail="Run-up is not in focus mode")
+
+    from .tree_generator import regenerate_tree
+    result = regenerate_tree(run_up_id)
+    if result is None:
+        from fastapi import HTTPException as HE
+        raise HE(status_code=500, detail="Tree regeneration failed")
+    return result
 
 
 # ===========================================================================
@@ -510,6 +608,142 @@ def budget_history(days: int = Query(7, ge=1, le=90), db: Session = Depends(_get
     ]
 
 
+@router.get("/usage/breakdown")
+def usage_breakdown(
+    days: int = Query(7, ge=1, le=90),
+    db: Session = Depends(_get_db),
+):
+    """Comprehensive token usage breakdown by platform, purpose, and model."""
+    from .tree_generator import get_daily_budget_eur, get_today_spending_eur
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    budget = get_daily_budget_eur()
+    spent_today = get_today_spending_eur()
+
+    # ---------- helpers to classify provider ----------
+    def _provider(model: str) -> str:
+        m = (model or "").lower()
+        if m.startswith("openrouter/"):
+            return "OpenRouter"
+        if m.startswith("groq/"):
+            return "Groq"
+        if "llama" in m or "qwen" in m or "scout" in m or "nemotron" in m or "hermes" in m or "gpt-oss" in m or "step-" in m:
+            # Legacy rows logged without Groq/OR prefix
+            return "Groq"
+        return "Claude"
+
+    # ---------- raw rows for the requested window ----------
+    rows = (
+        db.query(TokenUsage)
+        .filter(TokenUsage.timestamp >= cutoff)
+        .order_by(TokenUsage.timestamp.desc())
+        .all()
+    )
+
+    # ---------- per-platform totals ----------
+    platform_totals: Dict[str, Any] = {}
+    purpose_totals: Dict[str, Any] = {}
+    model_totals: Dict[str, Any] = {}
+    daily_by_platform: Dict[str, Dict[str, float]] = {}  # date -> {platform -> cost}
+    daily_totals: Dict[str, Dict[str, Any]] = {}  # date -> aggregated
+
+    for r in rows:
+        prov = _provider(r.model or "")
+        purp = r.purpose or "unknown"
+        model = r.model or "unknown"
+        day = r.timestamp.strftime("%Y-%m-%d") if r.timestamp else "unknown"
+        cost = float(r.cost_eur or 0)
+        inp = int(r.input_tokens or 0)
+        out = int(r.output_tokens or 0)
+
+        # Platform
+        if prov not in platform_totals:
+            platform_totals[prov] = {"cost_eur": 0.0, "input_tokens": 0, "output_tokens": 0, "calls": 0}
+        platform_totals[prov]["cost_eur"] += cost
+        platform_totals[prov]["input_tokens"] += inp
+        platform_totals[prov]["output_tokens"] += out
+        platform_totals[prov]["calls"] += 1
+
+        # Purpose
+        if purp not in purpose_totals:
+            purpose_totals[purp] = {"cost_eur": 0.0, "input_tokens": 0, "output_tokens": 0, "calls": 0}
+        purpose_totals[purp]["cost_eur"] += cost
+        purpose_totals[purp]["input_tokens"] += inp
+        purpose_totals[purp]["output_tokens"] += out
+        purpose_totals[purp]["calls"] += 1
+
+        # Model
+        if model not in model_totals:
+            model_totals[model] = {"cost_eur": 0.0, "input_tokens": 0, "output_tokens": 0, "calls": 0, "provider": prov}
+        model_totals[model]["cost_eur"] += cost
+        model_totals[model]["input_tokens"] += inp
+        model_totals[model]["output_tokens"] += out
+        model_totals[model]["calls"] += 1
+
+        # Daily by platform
+        if day not in daily_by_platform:
+            daily_by_platform[day] = {}
+        daily_by_platform[day][prov] = daily_by_platform[day].get(prov, 0.0) + cost
+
+        # Daily totals
+        if day not in daily_totals:
+            daily_totals[day] = {"cost_eur": 0.0, "input_tokens": 0, "output_tokens": 0, "calls": 0}
+        daily_totals[day]["cost_eur"] += cost
+        daily_totals[day]["input_tokens"] += inp
+        daily_totals[day]["output_tokens"] += out
+        daily_totals[day]["calls"] += 1
+
+    # Round costs
+    for v in platform_totals.values():
+        v["cost_eur"] = round(v["cost_eur"], 4)
+    for v in purpose_totals.values():
+        v["cost_eur"] = round(v["cost_eur"], 4)
+    for v in model_totals.values():
+        v["cost_eur"] = round(v["cost_eur"], 4)
+
+    # Build daily history sorted desc
+    daily_history = []
+    for day in sorted(daily_totals.keys(), reverse=True):
+        dt = daily_totals[day]
+        entry = {
+            "date": day,
+            "cost_eur": round(dt["cost_eur"], 4),
+            "input_tokens": dt["input_tokens"],
+            "output_tokens": dt["output_tokens"],
+            "calls": dt["calls"],
+            "by_platform": {k: round(v, 4) for k, v in daily_by_platform.get(day, {}).items()},
+        }
+        daily_history.append(entry)
+
+    # Grand total
+    total_cost = sum(v["cost_eur"] for v in platform_totals.values())
+    total_calls = sum(v["calls"] for v in platform_totals.values())
+    total_input = sum(v["input_tokens"] for v in platform_totals.values())
+    total_output = sum(v["output_tokens"] for v in platform_totals.values())
+
+    return {
+        "budget": {
+            "daily_budget_eur": budget,
+            "spent_today_eur": round(spent_today, 4),
+            "remaining_today_eur": round(max(0, budget - spent_today), 4),
+            "pct_used_today": round((spent_today / budget * 100) if budget > 0 else 0, 1),
+        },
+        "period_days": days,
+        "totals": {
+            "cost_eur": round(total_cost, 4),
+            "calls": total_calls,
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+        },
+        "by_platform": platform_totals,
+        "by_purpose": purpose_totals,
+        "by_model": {
+            k: v for k, v in sorted(model_totals.items(), key=lambda x: -x[1]["cost_eur"])
+        },
+        "daily_history": daily_history,
+    }
+
+
 # ---- Decision trees -------------------------------------------------------
 
 @router.post("/decision-tree")
@@ -680,7 +914,7 @@ def confirm_decision_node(
     if payload.branch not in ("yes", "no"):
         raise HTTPException(400, detail="branch must be 'yes' or 'no'.")
 
-    node.status = f"{payload.branch}_confirmed"
+    node.status = f"confirmed_{payload.branch}"
     node.confirmed_at = datetime.utcnow()
     node.evidence = payload.evidence
     node.updated_at = datetime.utcnow()
@@ -894,6 +1128,11 @@ def dashboard_overview(db: Session = Depends(_get_db)):
         ru for ru in active_runup_rows
         if db.query(DecisionNode).filter(DecisionNode.run_up_id == ru.id).count() > 0
     ]
+    # Filter out expired run-ups with very few articles (noise)
+    active_runup_rows = [
+        ru for ru in active_runup_rows
+        if not (ru.status == "expired" and (ru.article_count_total or 0) < 10)
+    ]
 
     # Enrich run-ups with root decision node info
     runups_out = []
@@ -925,6 +1164,15 @@ def dashboard_overview(db: Session = Depends(_get_db)):
         rd["node_count"] = db.query(DecisionNode).filter(
             DecisionNode.run_up_id == ru.id
         ).count()
+        # Latest swarm verdict for this run-up
+        sv = (
+            db.query(SwarmVerdict)
+            .filter(SwarmVerdict.run_up_id == ru.id, SwarmVerdict.superseded_at.is_(None))
+            .order_by(SwarmVerdict.created_at.desc())
+            .first()
+        )
+        rd["swarm_verdict"] = sv.verdict if sv else None
+        rd["swarm_confidence"] = round(sv.confidence * 100) if sv else None
         runups_out.append(rd)
 
     # Prediction scoreboard stats
@@ -948,8 +1196,36 @@ def dashboard_overview(db: Session = Depends(_get_db)):
         if b.intensity in intensity_dist:
             intensity_dist[b.intensity] += 1
 
+    # Resolved predictions: confirmed decision nodes (our track record)
+    resolved_nodes = (
+        db.query(DecisionNode)
+        .filter(DecisionNode.status.in_(["confirmed_yes", "confirmed_no"]))
+        .order_by(DecisionNode.updated_at.desc())
+        .limit(20)
+        .all()
+    )
+    resolved_out = []
+    for node in resolved_nodes:
+        ru = db.query(RunUp).get(node.run_up_id) if node.run_up_id else None
+        resolved_out.append({
+            "node_id": node.id,
+            "question": node.question,
+            "predicted_probability": round((node.yes_probability or 0.5) * 100, 1),
+            "outcome": "YES" if node.status == "confirmed_yes" else "NO",
+            "correct": (
+                (node.status == "confirmed_yes" and (node.yes_probability or 0.5) >= 0.5) or
+                (node.status == "confirmed_no" and (node.yes_probability or 0.5) < 0.5)
+            ),
+            "narrative_name": ru.narrative_name if ru else "unknown",
+            "article_count": ru.article_count_total if ru else 0,
+            "days_active": (date.today() - ru.start_date).days if ru and ru.start_date else 0,
+            "resolved_at": node.updated_at.isoformat() if node.updated_at else None,
+            "depth": node.depth,
+        })
+
     return {
         "runups": runups_out,
+        "resolved_predictions": resolved_out,
         "stats": {
             "predictions": total_preds,
             "correct": correct,
@@ -1034,10 +1310,38 @@ def dashboard_tree(run_up_id: int, db: Session = Depends(_get_db)):
             cd["stock_impacts"] = [_stock_impact_to_dict(si) for si in impacts]
             cons_dicts.append(cd)
 
+        # Swarm verdict for this node (latest non-superseded)
+        sv = (
+            db.query(SwarmVerdict)
+            .filter(
+                SwarmVerdict.decision_node_id == n.id,
+                SwarmVerdict.superseded_at.is_(None),
+            )
+            .order_by(SwarmVerdict.created_at.desc())
+            .first()
+        )
+        swarm_data = None
+        if sv:
+            swarm_data = {
+                "verdict": sv.verdict,
+                "confidence": round(sv.confidence * 100),
+                "yes_probability": round(sv.yes_probability * 100),
+                "primary_ticker": sv.primary_ticker,
+                "ticker_direction": sv.ticker_direction,
+                "entry_reasoning": sv.entry_reasoning,
+                "exit_trigger": sv.exit_trigger,
+                "risk_note": sv.risk_note,
+                "dissent_note": sv.dissent_note,
+                "consensus_strength": round(sv.consensus_strength * 100),
+                "all_ticker_signals": json.loads(sv.all_ticker_signals_json or "[]"),
+                "created_at": sv.created_at.isoformat(),
+            }
+
         tree_nodes.append({
             **_node_to_dict(n),
             "consequences": cons_dicts,
             "children_ids": [ch.id for ch in n.children] if n.children else [],
+            "swarm_verdict": swarm_data,
         })
 
     # Polymarket matches for this run-up
@@ -1257,9 +1561,13 @@ def get_trading_signals(
     """Return active trading signals sorted by confidence."""
     q = db.query(TradingSignal)
     if active_only:
+        from sqlalchemy import or_
         q = q.filter(
             TradingSignal.superseded_by_id.is_(None),
-            TradingSignal.expires_at >= datetime.utcnow(),
+            or_(
+                TradingSignal.expires_at.is_(None),
+                TradingSignal.expires_at >= datetime.utcnow(),
+            ),
         )
     if level:
         q = q.filter(TradingSignal.signal_level == level.upper())
@@ -1335,6 +1643,119 @@ def trigger_confidence_scoring():
 
 
 # ===========================================================================
+# Swarm Consensus (Expert Panel — Groq/Llama)
+# ===========================================================================
+
+
+@router.get("/swarm/verdicts/{run_up_id}")
+def get_swarm_verdicts(run_up_id: int):
+    """Get all active swarm verdicts for a run-up."""
+    from .swarm_consensus import get_verdicts_for_runup
+
+    verdicts = get_verdicts_for_runup(run_up_id)
+    return {"run_up_id": run_up_id, "verdicts": verdicts, "count": len(verdicts)}
+
+
+@router.get("/swarm/verdict/{node_id}")
+def get_swarm_verdict(node_id: int):
+    """Get the latest swarm verdict for a specific decision node."""
+    from .swarm_consensus import get_latest_verdict
+
+    verdict = get_latest_verdict(node_id)
+    if not verdict:
+        return {"node_id": node_id, "verdict": None}
+    return {"node_id": node_id, "verdict": verdict}
+
+
+@router.post("/swarm/evaluate/{node_id}")
+async def trigger_swarm_evaluation(node_id: int):
+    """Manually trigger a swarm evaluation for a specific decision node."""
+    from .swarm_consensus import evaluate_node
+
+    result = await evaluate_node(node_id)
+    if result is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Swarm evaluation failed — check Groq API key or logs.",
+        )
+    return {
+        "node_id": node_id,
+        "verdict": result.get("verdict", "HOLD"),
+        "confidence": result.get("confidence", 0),
+        "primary_ticker": result.get("primary_ticker"),
+    }
+
+
+@router.post("/swarm/run-cycle")
+async def trigger_swarm_cycle():
+    """Manually trigger a full swarm consensus cycle."""
+    from .swarm_consensus import swarm_consensus_cycle
+
+    count = await swarm_consensus_cycle()
+    return {"status": "ok", "nodes_evaluated": count}
+
+
+@router.get("/swarm/status")
+def get_swarm_status():
+    """Get swarm consensus status (enabled, stats, etc)."""
+    from .db import SwarmVerdict
+
+    db = get_session()
+    try:
+        total = db.query(SwarmVerdict).count()
+        active = (
+            db.query(SwarmVerdict)
+            .filter(SwarmVerdict.superseded_at.is_(None))
+            .count()
+        )
+
+        # Count verdicts by type
+        verdicts_by_type = {}
+        if active > 0:
+            rows = (
+                db.query(SwarmVerdict.verdict, func.count())
+                .filter(SwarmVerdict.superseded_at.is_(None))
+                .group_by(SwarmVerdict.verdict)
+                .all()
+            )
+            verdicts_by_type = {v: c for v, c in rows}
+
+        return {
+            "enabled": config.swarm_enabled,
+            "groq_model": config.groq_model,
+            "groq_configured": bool(config.groq_api_key),
+            "openrouter_configured": bool(config.openrouter_api_key),
+            "interval_minutes": config.swarm_interval_minutes,
+            "total_verdicts": total,
+            "active_verdicts": active,
+            "verdicts_by_type": verdicts_by_type,
+        }
+    finally:
+        db.close()
+
+
+@router.put("/swarm/config")
+def update_swarm_config(
+    groq_api_key: Optional[str] = None,
+    openrouter_api_key: Optional[str] = None,
+    interval_minutes: Optional[int] = None,
+):
+    """Update Groq/OpenRouter API keys or swarm interval."""
+    if groq_api_key is not None:
+        config.groq_api_key = groq_api_key
+    if openrouter_api_key is not None:
+        config.openrouter_api_key = openrouter_api_key
+    if interval_minutes is not None and interval_minutes >= 10:
+        config.swarm_interval_minutes = interval_minutes
+    return {
+        "enabled": config.swarm_enabled,
+        "groq_configured": bool(config.groq_api_key),
+        "openrouter_configured": bool(config.openrouter_api_key),
+        "interval_minutes": config.swarm_interval_minutes,
+    }
+
+
+# ===========================================================================
 # Price Data & Market Indicators
 # ===========================================================================
 
@@ -1370,6 +1791,105 @@ def get_market_indicators():
 
     fetcher = get_price_fetcher()
     return fetcher.get_market_indicators()
+
+
+# ===========================================================================
+# Dashboard: Opportunities Board
+# ===========================================================================
+
+
+@router.get("/dashboard/opportunities")
+def dashboard_opportunities(
+    min_edge: float = Query(5.0, ge=0, le=100),
+    db: Session = Depends(_get_db),
+):
+    """Return opportunities where our probability diverges from Polymarket.
+
+    Computes edge = (our_prob - market_prob) for each run-up that has
+    a PolymarketMatch, filters by |edge| >= min_edge.
+    """
+    # All run-ups that have decision nodes (active first, then expired)
+    active_runups = (
+        db.query(RunUp)
+        .filter(RunUp.merged_into_id.is_(None))
+        .order_by(
+            case((RunUp.status == "active", 0), else_=1),
+            desc(RunUp.current_score),
+        )
+        .all()
+    )
+
+    opportunities = []
+    for ru in active_runups:
+        # Get root node
+        root_node = (
+            db.query(DecisionNode)
+            .filter(DecisionNode.run_up_id == ru.id, DecisionNode.depth == 0)
+            .first()
+        )
+        if not root_node:
+            continue
+
+        # Skip resolved nodes — the event already happened
+        if root_node.status in ("confirmed_yes", "confirmed_no"):
+            continue
+
+        our_prob = round((root_node.yes_probability or 0.5) * 100, 1)
+
+        # Best Polymarket match
+        best_pm = (
+            db.query(PolymarketMatch)
+            .filter(PolymarketMatch.run_up_id == ru.id)
+            .order_by(PolymarketMatch.match_score.desc())
+            .first()
+        )
+        if not best_pm or best_pm.outcome_yes_price is None:
+            continue
+
+        market_prob = round(best_pm.outcome_yes_price * 100, 1)
+        edge = round(our_prob - market_prob, 1)
+
+        if abs(edge) < min_edge:
+            continue
+
+        # Latest swarm verdict for root node (skip failed evaluations)
+        sv = (
+            db.query(SwarmVerdict)
+            .filter(
+                SwarmVerdict.decision_node_id == root_node.id,
+                SwarmVerdict.superseded_at.is_(None),
+                SwarmVerdict.confidence > 0,
+            )
+            .order_by(SwarmVerdict.created_at.desc())
+            .first()
+        )
+        # Also skip verdicts whose entry_reasoning indicates synthesis failure
+        if sv and sv.entry_reasoning and "Synthesis failed" in sv.entry_reasoning:
+            sv = None
+
+        opportunities.append({
+            "run_up_id": ru.id,
+            "question": root_node.question or ru.narrative_name,
+            "our_probability": our_prob,
+            "market_probability": market_prob,
+            "edge": edge,
+            "edge_direction": "long" if edge > 0 else "short",
+            "polymarket_question": best_pm.polymarket_question,
+            "polymarket_url": best_pm.polymarket_url,
+            "volume": best_pm.volume,
+            "match_score": best_pm.match_score,
+            "narrative_name": ru.narrative_name,
+            "article_count": ru.article_count_total,
+            "days_active": (date.today() - ru.start_date).days if ru.start_date else 0,
+            "swarm_verdict": sv.verdict if sv else None,
+            "swarm_confidence": round(sv.confidence * 100) if sv else None,
+            "swarm_ticker": sv.primary_ticker if sv else None,
+            "swarm_ticker_direction": sv.ticker_direction if sv else None,
+        })
+
+    # Sort by abs(edge) descending
+    opportunities.sort(key=lambda x: abs(x["edge"]), reverse=True)
+    return opportunities
 
 
 # ===========================================================================
@@ -1431,6 +1951,7 @@ def _runup_to_dict(r: RunUp) -> Dict:
         "acceleration_rate": r.acceleration_rate,
         "article_count_total": r.article_count_total,
         "status": r.status,
+        "is_focused": bool(getattr(r, "is_focused", False)),
     }
 
 
@@ -1549,3 +2070,574 @@ def _safe_json(raw: Optional[str]) -> Any:
         return json.loads(raw)
     except Exception:
         return raw
+
+
+# ---------------------------------------------------------------------------
+# Daily Investment Advisory
+# ---------------------------------------------------------------------------
+
+@router.get("/advisory/latest")
+def advisory_latest(db: Session = Depends(_get_db)):
+    """Return the most recent daily advisory with portfolio context."""
+    report = (
+        db.query(AnalysisReport)
+        .filter(AnalysisReport.report_type == "daily_advisory")
+        .order_by(AnalysisReport.created_at.desc())
+        .first()
+    )
+    if not report:
+        return {"advisory": None, "message": "No advisory generated yet."}
+
+    try:
+        data = json.loads(report.report_json)
+    except Exception:
+        data = {}
+
+    performance = None
+    if report.performance_json:
+        try:
+            performance = json.loads(report.performance_json)
+        except Exception:
+            pass
+
+    # Inject live portfolio holdings for UI
+    from .db import EngineSettings
+    holdings = []
+    s = db.query(EngineSettings).get("portfolio_holdings")
+    if s and s.value:
+        try:
+            holdings = json.loads(s.value)
+        except Exception:
+            pass
+
+    return {
+        "advisory": data,
+        "report_id": report.id,
+        "created_at": report.created_at.isoformat() if report.created_at else None,
+        "performance": performance,
+        "portfolio_holdings": holdings,
+    }
+
+
+@router.get("/advisory/history")
+def advisory_history(
+    limit: int = Query(30, ge=1, le=90),
+    db: Session = Depends(_get_db),
+):
+    """Return historical advisories with performance data."""
+    reports = (
+        db.query(AnalysisReport)
+        .filter(AnalysisReport.report_type == "daily_advisory")
+        .order_by(AnalysisReport.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    history = []
+    for r in reports:
+        try:
+            data = json.loads(r.report_json)
+        except Exception:
+            data = {}
+
+        performance = None
+        if r.performance_json:
+            try:
+                performance = json.loads(r.performance_json)
+            except Exception:
+                pass
+
+        # Summary stats from outcomes
+        outcomes = data.get("outcomes", {})
+        total_evals = 0
+        total_correct = 0
+        avg_return = 0.0
+        returns = []
+        for ticker, horizons in outcomes.items():
+            for h_key, result in horizons.items():
+                total_evals += 1
+                if result.get("correct"):
+                    total_correct += 1
+                ret = result.get("return_pct", 0)
+                returns.append(ret)
+
+        history.append({
+            "report_id": r.id,
+            "date": r.period_start.isoformat() if r.period_start else None,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "market_stance": data.get("market_stance"),
+            "buy_count": len(data.get("buy_recommendations", [])),
+            "sell_count": len(data.get("sell_recommendations", [])),
+            "buy_tickers": [
+                rec.get("ticker") for rec in data.get("buy_recommendations", [])
+            ],
+            "sell_tickers": [
+                rec.get("ticker") for rec in data.get("sell_recommendations", [])
+            ],
+            "outcomes_evaluated": total_evals,
+            "outcomes_correct": total_correct,
+            "accuracy": round(total_correct / total_evals, 4) if total_evals > 0 else None,
+            "avg_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
+            "performance": performance,
+        })
+
+    # Also fetch overall learning stats
+    from .db import EngineSettings
+    stats = {}
+    for key in ("advisory_accuracy", "advisory_total_checks", "advisory_total_hits",
+                "advisory_brier_scores", "advisory_weights", "advisory_component_emas"):
+        s = db.query(EngineSettings).get(key)
+        if s and s.value:
+            try:
+                stats[key] = json.loads(s.value)
+            except (json.JSONDecodeError, ValueError):
+                stats[key] = s.value
+
+    return {
+        "history": history,
+        "total_advisories": len(reports),
+        "learning_stats": stats,
+    }
+
+
+@router.post("/advisory/generate")
+def advisory_generate():
+    """Manually trigger daily advisory generation."""
+    try:
+        from .daily_advisory import generate_daily_advisory
+        report = generate_daily_advisory()
+        if not report:
+            return {"success": False, "message": "Advisory generation failed — check logs."}
+
+        data = json.loads(report.report_json) if report.report_json else {}
+        return {
+            "success": True,
+            "report_id": report.id,
+            "market_stance": data.get("market_stance"),
+            "buy_count": len(data.get("buy_recommendations", [])),
+            "sell_count": len(data.get("sell_recommendations", [])),
+            "advisory": data,
+        }
+    except Exception as e:
+        logger.exception("Manual advisory generation failed.")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Portfolio Holdings ──────────────────────────────────────────────────
+
+
+@router.get("/portfolio/holdings")
+def portfolio_holdings(db: Session = Depends(_get_db)):
+    """Return user's current portfolio holdings."""
+    from .db import EngineSettings
+    s = db.query(EngineSettings).get("portfolio_holdings")
+    if not s or not s.value:
+        return {"holdings": [], "total_value": 0}
+    try:
+        holdings = json.loads(s.value)
+    except (json.JSONDecodeError, ValueError):
+        holdings = []
+
+    total = sum(h.get("value_eur", 0) for h in holdings)
+    total_pnl = sum(h.get("pnl_eur", 0) for h in holdings)
+    return {"holdings": holdings, "total_value": round(total, 2), "total_pnl": round(total_pnl, 2)}
+
+
+@router.put("/portfolio/holdings")
+def portfolio_holdings_update(
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(_get_db),
+):
+    """Update user's current portfolio holdings.
+
+    Body: { "holdings": [ {"ticker": "XOM", "name": "Exxon Mobil", "value_eur": 10.89}, ... ] }
+    """
+    holdings = payload.get("holdings", [])
+
+    # Validate
+    cleaned = []
+    for h in holdings:
+        ticker = (h.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        cleaned.append({
+            "ticker": ticker,
+            "name": h.get("name", ticker),
+            "value_eur": round(float(h.get("value_eur", 0)), 2),
+            "pnl_eur": round(float(h.get("pnl_eur", 0)), 2),
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+
+    from .db import EngineSettings
+    s = db.query(EngineSettings).get("portfolio_holdings")
+    if s:
+        s.value = json.dumps(cleaned)
+    else:
+        s = EngineSettings(key="portfolio_holdings", value=json.dumps(cleaned))
+        db.add(s)
+    db.commit()
+
+    total = sum(c["value_eur"] for c in cleaned)
+    return {"success": True, "holdings": cleaned, "total_value": round(total, 2)}
+
+
+@router.get("/portfolio/alignment")
+def portfolio_alignment(db: Session = Depends(_get_db)):
+    """Compare current portfolio against latest advisory and return alignment analysis."""
+    from .db import EngineSettings
+
+    # 1. Get holdings
+    s = db.query(EngineSettings).get("portfolio_holdings")
+    holdings = []
+    if s and s.value:
+        try:
+            holdings = json.loads(s.value)
+        except Exception:
+            pass
+
+    if not holdings:
+        return {"alignment": [], "message": "No portfolio holdings configured."}
+
+    # 2. Get latest advisory
+    report = (
+        db.query(AnalysisReport)
+        .filter(AnalysisReport.report_type == "daily_advisory")
+        .order_by(AnalysisReport.created_at.desc())
+        .first()
+    )
+    if not report:
+        return {"alignment": [], "message": "No advisory generated yet."}
+
+    try:
+        advisory = json.loads(report.report_json)
+    except Exception:
+        return {"alignment": [], "message": "Failed to parse advisory."}
+
+    buy_map = {
+        r["ticker"]: r for r in advisory.get("buy_recommendations", [])
+    }
+    sell_map = {
+        r["ticker"]: r for r in advisory.get("sell_recommendations", [])
+    }
+
+    # 3. Analyse each holding
+    alignment = []
+    for h in holdings:
+        t = h["ticker"]
+        entry = {
+            "ticker": t,
+            "name": h.get("name", t),
+            "value_eur": h.get("value_eur", 0),
+            "pnl_eur": h.get("pnl_eur", 0),
+        }
+
+        if t in buy_map:
+            rec = buy_map[t]
+            entry["signal"] = "HOLD_ADD"
+            entry["label"] = "✅ Aanhouden + bijkopen"
+            entry["reasoning"] = rec.get("reasoning", "In BUY aanbevelingen")
+            entry["composite_score"] = rec.get("composite_score")
+            entry["rank"] = rec.get("rank")
+        elif t in sell_map:
+            rec = sell_map[t]
+            entry["signal"] = "REDUCE"
+            entry["label"] = "⚠️ Afbouwen / verkopen"
+            entry["reasoning"] = rec.get("reasoning", "In SELL aanbevelingen")
+            entry["composite_score"] = rec.get("composite_score")
+            entry["rank"] = rec.get("rank")
+        else:
+            # Check sector alignment
+            sector_outlook = advisory.get("sectors_outlook", [])
+            relevant_sectors = _match_holding_sectors(t, h.get("name", ""), sector_outlook)
+            if relevant_sectors:
+                best = relevant_sectors[0]
+                direction = best.get("direction", "neutral")
+                if direction == "bullish":
+                    entry["signal"] = "HOLD"
+                    entry["label"] = f"🟢 Aanhouden — {best['sector']} bullish"
+                elif direction == "bearish":
+                    entry["signal"] = "WATCH"
+                    entry["label"] = f"🟡 Monitoren — {best['sector']} bearish"
+                else:
+                    entry["signal"] = "NEUTRAL"
+                    entry["label"] = "⚪ Geen signaal"
+                entry["reasoning"] = best.get("reasoning", "")
+            else:
+                # Detect sector from ticker/name even without outlook match
+                _sector = _detect_sector(t, h.get("name", ""))
+                if _sector:
+                    entry["signal"] = "HOLD"
+                    entry["label"] = f"🟢 Aanhouden — {_sector}"
+                    entry["reasoning"] = "Geen actief signaal; positie behouden."
+                else:
+                    entry["signal"] = "NEUTRAL"
+                    entry["label"] = "⚪ Geen signaal"
+                    entry["reasoning"] = "Niet in huidige advisory — geen actie nodig"
+
+        alignment.append(entry)
+
+    # 4. Missed opportunities: BUY recs not in portfolio
+    held_tickers = {h["ticker"] for h in holdings}
+    missed = [
+        {
+            "ticker": r["ticker"],
+            "name": r["name"],
+            "action": "BUY",
+            "composite_score": r["composite_score"],
+            "reasoning": r.get("reasoning", ""),
+            "current_price": r.get("current_price"),
+        }
+        for r in advisory.get("buy_recommendations", [])
+        if r["ticker"] not in held_tickers
+    ]
+
+    return {
+        "alignment": alignment,
+        "missed_opportunities": missed,
+        "market_stance": advisory.get("market_stance"),
+        "advisory_date": advisory.get("generated_at"),
+    }
+
+
+def _match_holding_sectors(
+    ticker: str, name: str, sectors: list
+) -> list:
+    """Match a holding to relevant sector outlooks."""
+    lower_name = name.lower()
+    matches = []
+
+    SECTOR_KEYWORDS = {
+        "Energy": ["oil", "gas", "energy", "petroleum", "crude", "fuel",
+                    "xle", "uso", "xop", "is0d", "exploration", "exxon", "xom"],
+        "Precious Metals": ["gold", "silver", "precious", "mining", "metal", "copper",
+                            "gld", "slv", "gdx", "ring", "pick", "is0e",
+                            "wmin", "vaneck", "producer", "miner"],
+        "Defense & Aerospace": ["defense", "defence", "aerospace", "military",
+                                "lmt", "rtx", "noc", "ita"],
+        "Emerging Markets": ["emerging", "eem", "iema", "developing"],
+        "Credit": ["bond", "yield", "credit", "hyg", "tlt", "high yield",
+                    "dividend", "ispa", "select dividend", "stoxx"],
+        "Technology": ["tech", "software", "semiconductor", "xlk", "qqq"],
+    }
+
+    ticker_lower = ticker.lower()
+    for sector_info in sectors:
+        sector_name = sector_info.get("sector", "")
+        # Match flexibly — Claude may return "Energy (XOM, XLE)" not just "Energy"
+        keywords = []
+        for key, kwlist in SECTOR_KEYWORDS.items():
+            if sector_name.lower().startswith(key.lower()):
+                keywords = kwlist
+                break
+        if any(kw in lower_name or kw in ticker_lower for kw in keywords):
+            matches.append(sector_info)
+
+    return matches
+
+
+def _detect_sector(ticker: str, name: str):
+    """Detect sector label from ticker/name, independent of sectors_outlook."""
+    lower = (name + " " + ticker).lower()
+    SECTOR_MAP = [
+        ("Energy / Oil & Gas", ["oil", "gas", "energy", "petroleum", "crude",
+                                 "is0d", "xle", "exxon", "xom"]),
+        ("Mining & Grondstoffen", ["mining", "miner", "mineral", "copper",
+                                    "wmin", "vaneck", "glen", "bhp", "rio",
+                                    "teck", "fcx", "scco"]),
+        ("Goud & Edelmetalen", ["gold", "silver", "precious", "producer",
+                                 "is0e", "gdx"]),
+        ("Dividend", ["dividend", "select dividend", "stoxx", "ispa", "vhyl",
+                       "yield", "income"]),
+        ("Defensie", ["defense", "defence", "aerospace", "military"]),
+        ("Technologie", ["tech", "software", "semiconductor"]),
+    ]
+    for sector_label, keywords in SECTOR_MAP:
+        if any(kw in lower for kw in keywords):
+            return sector_label
+    return None
+
+
+# ── Telegram Notifications ────────────────────────────────────────────
+
+
+@router.get("/telegram/status")
+def telegram_status(db: Session = Depends(_get_db)):
+    """Check if Telegram notifications are configured."""
+    from .telegram_notifier import is_telegram_configured
+    from .db import EngineSettings
+
+    configured = is_telegram_configured()
+
+    # Get stored values (masked)
+    token_set = False
+    chat_id_set = False
+    s = db.query(EngineSettings).get("telegram_bot_token")
+    if s and s.value:
+        token_set = True
+    s = db.query(EngineSettings).get("telegram_chat_id")
+    if s and s.value:
+        chat_id_set = True
+
+    return {
+        "configured": configured,
+        "token_set": token_set,
+        "chat_id_set": chat_id_set,
+    }
+
+
+@router.put("/telegram/configure")
+def telegram_configure(
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(_get_db),
+):
+    """Configure Telegram bot token and chat ID.
+
+    Body: { "bot_token": "...", "chat_id": "..." }
+    """
+    from .db import EngineSettings
+
+    token = (payload.get("bot_token") or "").strip()
+    chat_id = (payload.get("chat_id") or "").strip()
+
+    if not token or not chat_id:
+        raise HTTPException(status_code=400, detail="Both bot_token and chat_id are required.")
+
+    for key, val in [("telegram_bot_token", token), ("telegram_chat_id", chat_id)]:
+        s = db.query(EngineSettings).get(key)
+        if s:
+            s.value = val
+        else:
+            db.add(EngineSettings(key=key, value=val))
+    db.commit()
+
+    return {"success": True, "message": "Telegram configured. Use /api/telegram/test to verify."}
+
+
+@router.post("/telegram/test")
+def telegram_test():
+    """Send a test message via Telegram to verify configuration."""
+    from .telegram_notifier import send_test_message, is_telegram_configured
+    if not is_telegram_configured():
+        return {"success": False, "message": "Telegram not configured. Set bot_token and chat_id first."}
+
+    sent = send_test_message()
+    return {
+        "success": sent,
+        "message": "Test message sent!" if sent else "Failed to send — check token and chat_id.",
+    }
+
+
+@router.post("/telegram/send-advisory")
+def telegram_send_advisory(db: Session = Depends(_get_db)):
+    """Manually send the latest advisory via Telegram."""
+    from .telegram_notifier import send_advisory_notification, is_telegram_configured
+
+    if not is_telegram_configured():
+        return {"success": False, "message": "Telegram not configured."}
+
+    report = (
+        db.query(AnalysisReport)
+        .filter(AnalysisReport.report_type == "daily_advisory")
+        .order_by(AnalysisReport.created_at.desc())
+        .first()
+    )
+    if not report:
+        return {"success": False, "message": "No advisory available to send."}
+
+    try:
+        data = json.loads(report.report_json)
+    except Exception:
+        return {"success": False, "message": "Failed to parse advisory data."}
+
+    sent = send_advisory_notification(data)
+    return {
+        "success": sent,
+        "message": "Advisory sent via Telegram!" if sent else "Failed to send.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# ML endpoints (V2.0)
+# ---------------------------------------------------------------------------
+
+@router.get("/ml/status")
+def ml_status():
+    """Get ML model status, metrics, and feature importance."""
+    try:
+        from .ml.inference import get_model_status
+        return get_model_status()
+    except ImportError:
+        return {"status": "not_installed", "message": "ML module not available."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/ml/predictions")
+def ml_predictions():
+    """Get ML predictions for all active run-ups."""
+    try:
+        from .ml.inference import predict_signal
+        session = get_session()
+        try:
+            from .db import RunUp
+            active = session.query(RunUp).filter(
+                RunUp.status == "active",
+                RunUp.merged_into_id.is_(None),
+            ).all()
+
+            predictions = []
+            for ru in active:
+                score = predict_signal(ru.id)
+                predictions.append({
+                    "run_up_id": ru.id,
+                    "narrative_name": ru.narrative_name,
+                    "ml_score": round(score, 4),
+                    "signal": "bullish" if score > 0.6 else "bearish" if score < 0.4 else "neutral",
+                })
+            return {"predictions": predictions, "count": len(predictions)}
+        finally:
+            session.close()
+    except ImportError:
+        return {"predictions": [], "count": 0, "message": "ML module not available."}
+
+
+@router.post("/ml/retrain")
+def ml_retrain():
+    """Force ML model retrain on current data."""
+    try:
+        from .ml.prepare import extract_all
+        from .ml.train import train
+
+        features, labels = extract_all()
+        if features.empty:
+            return {"success": False, "message": "No features available."}
+
+        metadata = train(force=True)
+        if metadata:
+            return {
+                "success": True,
+                "metrics": metadata.get("metrics", {}),
+                "n_samples": metadata.get("n_samples", 0),
+                "training_seconds": metadata.get("training_seconds", 0),
+            }
+        return {"success": False, "message": "Training produced no model."}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@router.get("/ml/experiments")
+def ml_experiments():
+    """Get experiment history from results.tsv."""
+    import csv
+    from pathlib import Path
+    results_path = Path(__file__).parent / "ml" / "results.tsv"
+    if not results_path.exists():
+        return {"experiments": [], "count": 0}
+
+    experiments = []
+    with open(results_path) as f:
+        reader = csv.DictReader(f, delimiter="\t",
+                                fieldnames=["commit", "sharpe", "hit_rate", "brier", "status", "description"])
+        for row in reader:
+            experiments.append(row)
+    return {"experiments": experiments, "count": len(experiments)}

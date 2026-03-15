@@ -73,14 +73,30 @@ class EngineConfig:
             os.getenv("MAX_TREES_PER_CYCLE", "5")
         )
 
+        # Groq API (for swarm consensus — free tier)
+        self._groq_api_key: str = os.getenv("GROQ_API_KEY", "")
+        self.groq_model: str = os.getenv(
+            "GROQ_MODEL", "llama-3.3-70b-versatile"
+        )
+        # OpenRouter API (for diverse free models — Google Gemini, DeepSeek, etc.)
+        self._openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
+        self.swarm_interval_minutes: int = int(
+            os.getenv("SWARM_INTERVAL_MINUTES", "60")
+        )
+        # FRED API (optional — free registration at fred.stlouisfed.org)
+        self._fred_api_key: str = os.getenv("FRED_API_KEY", "")
+
+        # Telegram Bot API (for push notifications)
+        self._telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        self._telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
         # Twitter / X API
-        self.twitter_bearer_token: str = os.getenv(
+        self._twitter_bearer_token: str = os.getenv(
             "X_BEARER_TOKEN", os.getenv("TWITTER_BEARER_TOKEN", "")
         )
         self.twitter_fetch_interval_minutes: int = int(
             os.getenv("TWITTER_FETCH_INTERVAL_MINUTES", "120")
         )
-        self.twitter_enabled: bool = bool(self.twitter_bearer_token)
 
         # Logging
         self.log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -205,6 +221,190 @@ class EngineConfig:
                     setting.value = value
                 else:
                     setting = EngineSettings(key="anthropic_api_key", value=value)
+                    session.add(setting)
+                session.commit()
+            finally:
+                session.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Swarm enabled (dynamic — checks if any API key is available)
+    # ------------------------------------------------------------------
+    @property
+    def swarm_enabled(self) -> bool:
+        """True if at least one swarm LLM provider (Groq or OpenRouter) is configured."""
+        return bool(self.groq_api_key) or bool(self.openrouter_api_key)
+
+    @swarm_enabled.setter
+    def swarm_enabled(self, value: bool) -> None:
+        """No-op setter to avoid AttributeError from old code."""
+        pass  # Property is dynamically computed
+
+    # ------------------------------------------------------------------
+    # Groq API key (from env or DB settings)
+    # ------------------------------------------------------------------
+    @property
+    def groq_api_key(self) -> str:
+        """Return Groq API key from env → DB settings → empty."""
+        if self._groq_api_key:
+            return self._groq_api_key
+        try:
+            from .db import get_session, EngineSettings
+            session = get_session()
+            try:
+                setting = session.query(EngineSettings).get("groq_api_key")
+                if setting and setting.value:
+                    return setting.value
+            finally:
+                session.close()
+        except Exception:
+            pass
+        return ""
+
+    @groq_api_key.setter
+    def groq_api_key(self, value: str) -> None:
+        """Store Groq API key in DB settings for persistence."""
+        self._groq_api_key = value
+        self.swarm_enabled = bool(value)
+        try:
+            from .db import get_session, EngineSettings
+            session = get_session()
+            try:
+                setting = session.query(EngineSettings).get("groq_api_key")
+                if setting:
+                    setting.value = value
+                else:
+                    setting = EngineSettings(key="groq_api_key", value=value)
+                    session.add(setting)
+                session.commit()
+            finally:
+                session.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # OpenRouter API key (from env or DB settings)
+    # ------------------------------------------------------------------
+    @property
+    def openrouter_api_key(self) -> str:
+        """Return OpenRouter API key from env → DB settings → empty."""
+        if self._openrouter_api_key:
+            return self._openrouter_api_key
+        try:
+            from .db import get_session, EngineSettings
+            session = get_session()
+            try:
+                setting = session.query(EngineSettings).get("openrouter_api_key")
+                if setting and setting.value:
+                    return setting.value
+            finally:
+                session.close()
+        except Exception:
+            pass
+        return ""
+
+    @openrouter_api_key.setter
+    def openrouter_api_key(self, value: str) -> None:
+        """Store OpenRouter API key in DB settings."""
+        self._openrouter_api_key = value
+        self.swarm_enabled = bool(self._groq_api_key) or bool(value)
+        try:
+            from .db import get_session, EngineSettings
+            session = get_session()
+            try:
+                setting = session.query(EngineSettings).get("openrouter_api_key")
+                if setting:
+                    setting.value = value
+                else:
+                    setting = EngineSettings(key="openrouter_api_key", value=value)
+                    session.add(setting)
+                session.commit()
+            finally:
+                session.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Twitter / X bearer token (from env or DB settings)
+    # ------------------------------------------------------------------
+    @property
+    def twitter_bearer_token(self) -> str:
+        """Return X/Twitter bearer token from env → DB settings → empty."""
+        if self._twitter_bearer_token:
+            return self._twitter_bearer_token
+        try:
+            from .db import get_session, EngineSettings
+            session = get_session()
+            try:
+                setting = session.query(EngineSettings).get("twitter_bearer_token")
+                if setting and setting.value:
+                    return setting.value
+            finally:
+                session.close()
+        except Exception:
+            pass
+        return ""
+
+    @twitter_bearer_token.setter
+    def twitter_bearer_token(self, value: str) -> None:
+        """Store X/Twitter bearer token in DB settings for persistence."""
+        self._twitter_bearer_token = value
+        try:
+            from .db import get_session, EngineSettings
+            session = get_session()
+            try:
+                setting = session.query(EngineSettings).get("twitter_bearer_token")
+                if setting:
+                    setting.value = value
+                else:
+                    setting = EngineSettings(key="twitter_bearer_token", value=value)
+                    session.add(setting)
+                session.commit()
+            finally:
+                session.close()
+        except Exception:
+            pass
+
+    @property
+    def twitter_enabled(self) -> bool:
+        """True if X/Twitter bearer token is configured."""
+        return bool(self.twitter_bearer_token)
+
+    # ------------------------------------------------------------------
+    # FRED API key (optional — from env or DB settings)
+    # ------------------------------------------------------------------
+    @property
+    def fred_api_key(self) -> str:
+        """Return FRED API key from env → DB settings → empty."""
+        if self._fred_api_key:
+            return self._fred_api_key
+        try:
+            from .db import get_session, EngineSettings
+            session = get_session()
+            try:
+                setting = session.query(EngineSettings).get("fred_api_key")
+                if setting and setting.value:
+                    return setting.value
+            finally:
+                session.close()
+        except Exception:
+            pass
+        return ""
+
+    @fred_api_key.setter
+    def fred_api_key(self, value: str) -> None:
+        """Store FRED API key in DB settings."""
+        self._fred_api_key = value
+        try:
+            from .db import get_session, EngineSettings
+            session = get_session()
+            try:
+                setting = session.query(EngineSettings).get("fred_api_key")
+                if setting:
+                    setting.value = value
+                else:
+                    setting = EngineSettings(key="fred_api_key", value=value)
                     session.add(setting)
                 session.commit()
             finally:

@@ -26,6 +26,10 @@ const PREFIX = "/plugins/openclaw-news-analyzer";
  *   - ?_api=feeds&id=N → proxy DELETE /api/feeds/{N}
  *   - ?_api=budget     → proxy GET/PUT /api/budget
  *   - ?_api=apikey     → proxy GET/PUT /api/settings/api-key
+ *   - ?_api=swarm-status    → proxy GET /api/swarm/status
+ *   - ?_api=swarm-verdict&nodeId=N → proxy GET /api/swarm/verdict/{N}
+ *   - ?_api=swarm-verdicts&runUpId=N → proxy GET /api/swarm/verdicts/{N}
+ *   - ?_api=swarm-cycle     → proxy POST /api/swarm/run-cycle
  */
 export function createHttpHandler(params: HttpHandlerParams) {
   const { logger, uiRoot, enginePort } = params;
@@ -55,9 +59,6 @@ export function createHttpHandler(params: HttpHandlerParams) {
   <title>News Analyzer</title>
   <style>${css}</style>
   <script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
-  <script src="https://unpkg.com/dagre@0.8/dist/dagre.min.js"></script>
-  <script src="https://unpkg.com/cytoscape@3/dist/cytoscape.min.js"></script>
-  <script src="https://unpkg.com/cytoscape-dagre@2/cytoscape-dagre.js"></script>
 </head>
 <body>
   <div id="app"></div>
@@ -175,6 +176,79 @@ export function createHttpHandler(params: HttpHandlerParams) {
     }
     if (apiAction === "indicators" && req.method === "GET") {
       return proxyToEngine("/api/indicators", req, res);
+    }
+    if (apiAction === "swarm-status" && req.method === "GET") {
+      return proxyToEngine("/api/swarm/status", req, res);
+    }
+    if (apiAction === "swarm-verdict" && req.method === "GET") {
+      const nodeId = url.searchParams.get("nodeId") || "";
+      return proxyToEngine(`/api/swarm/verdict/${encodeURIComponent(nodeId)}`, req, res);
+    }
+    if (apiAction === "swarm-verdicts" && req.method === "GET") {
+      const runUpId = url.searchParams.get("runUpId") || "";
+      return proxyToEngine(`/api/swarm/verdicts/${encodeURIComponent(runUpId)}`, req, res);
+    }
+    if (apiAction === "swarm-cycle" && req.method === "POST") {
+      return proxyToEngine("/api/swarm/run-cycle", req, res);
+    }
+    if (apiAction === "opportunities" && req.method === "GET") {
+      const minEdge = url.searchParams.get("minEdge") || "5";
+      return proxyToEngine(`/api/dashboard/opportunities?min_edge=${encodeURIComponent(minEdge)}`, req, res);
+    }
+
+    // ── Daily Advisory (Portfolio) ────────────────────────────
+    if (apiAction === "advisory" && req.method === "GET") {
+      return proxyToEngine("/api/advisory/latest", req, res);
+    }
+    if (apiAction === "advisory-history" && req.method === "GET") {
+      const limit = url.searchParams.get("limit") || "30";
+      return proxyToEngine(`/api/advisory/history?limit=${encodeURIComponent(limit)}`, req, res);
+    }
+    if (apiAction === "advisory-generate" && req.method === "POST") {
+      return proxyToEngine("/api/advisory/generate", req, res);
+    }
+
+    // ── Telegram Notifications ─────────────────────────────────
+    if (apiAction === "telegram-status" && req.method === "GET") {
+      return proxyToEngine("/api/telegram/status", req, res);
+    }
+    if (apiAction === "telegram-configure" && req.method === "PUT") {
+      return proxyToEngine("/api/telegram/configure", req, res);
+    }
+    if (apiAction === "telegram-test" && req.method === "POST") {
+      return proxyToEngine("/api/telegram/test", req, res);
+    }
+    if (apiAction === "telegram-send-advisory" && req.method === "POST") {
+      return proxyToEngine("/api/telegram/send-advisory", req, res);
+    }
+
+    // ── Usage / Token Tracking ────────────────────────────────
+    if (apiAction === "usage-breakdown" && req.method === "GET") {
+      const days = url.searchParams.get("days") || "7";
+      return proxyToEngine(`/api/usage/breakdown?days=${encodeURIComponent(days)}`, req, res);
+    }
+
+    // ── Portfolio Holdings ─────────────────────────────────────
+    if (apiAction === "portfolio-holdings" && req.method === "GET") {
+      return proxyToEngine("/api/portfolio/holdings", req, res);
+    }
+    if (apiAction === "portfolio-holdings" && req.method === "PUT") {
+      return proxyToEngine("/api/portfolio/holdings", req, res);
+    }
+    if (apiAction === "portfolio-alignment" && req.method === "GET") {
+      return proxyToEngine("/api/portfolio/alignment", req, res);
+    }
+
+    // ── Focus mode ────────────────────────────────────────────
+    if (apiAction === "focus") {
+      return proxyToEngine("/api/focus", req, res);
+    }
+    if (apiAction === "focus-polymarket-link" && req.method === "POST") {
+      return proxyToEngine("/api/focus/polymarket-link", req, res);
+    }
+    if (apiAction === "focus-regenerate-tree" && req.method === "POST") {
+      const id = url.searchParams.get("id") || "";
+      return proxyToEngine(`/api/focus/regenerate-tree/${encodeURIComponent(id)}`, req, res);
     }
 
     // ── HTML bundle ──────────────────────────────────────────

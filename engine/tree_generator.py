@@ -25,6 +25,7 @@ from .db import (
     DecisionNode,
     Consequence,
     StockImpact,
+    SwarmVerdict,
     NarrativeTimeline,
     ArticleBrief,
     Article,
@@ -342,6 +343,44 @@ def _log_usage(
 # Claude API call
 # ---------------------------------------------------------------------------
 
+# Sonnet model for high-signal narratives (better quality, ~4x cost)
+SONNET_MODEL = "claude-sonnet-4-20250514"
+# Thresholds for Sonnet upgrade: narratives with high score or many articles
+SONNET_SCORE_THRESHOLD = 60   # Run-up score >= 60 → use Sonnet
+SONNET_ARTICLE_THRESHOLD = 15  # Article count >= 15 → use Sonnet
+
+
+def _select_model_for_tree(prompt_context: Dict[str, Any]) -> str:
+    """Select Claude model based on narrative importance.
+
+    High-signal narratives (score >= 60 OR article_count >= 15) get Sonnet
+    for deeper analysis. Regular narratives use Haiku (default).
+    Cost impact: Sonnet ~€0.03/call vs Haiku ~€0.008/call.
+    With ~5 trees/day, maybe 1-2 use Sonnet = ~€0.06 extra/day max.
+    """
+    score = prompt_context.get("score", 0) or 0
+    article_count = prompt_context.get("article_count", 0) or 0
+
+    if score >= SONNET_SCORE_THRESHOLD or article_count >= SONNET_ARTICLE_THRESHOLD:
+        # Check we have enough budget remaining for the more expensive model
+        budget = get_daily_budget_eur()
+        spent = get_today_spending_eur()
+        remaining = budget - spent
+        # Only use Sonnet if we have at least 40% budget remaining
+        if remaining > budget * 0.4:
+            logger.info(
+                "Upgrading to Sonnet for high-signal narrative (score=%d, articles=%d, budget remaining=€%.3f)",
+                score, article_count, remaining,
+            )
+            return SONNET_MODEL
+        else:
+            logger.info(
+                "Would upgrade to Sonnet (score=%d, articles=%d) but budget tight (€%.3f remaining)",
+                score, article_count, remaining,
+            )
+    return config.tree_generator_model
+
+
 def _call_claude(
     prompt_context: Dict[str, Any],
     run_up_id: Optional[int] = None,
@@ -349,6 +388,7 @@ def _call_claude(
     """Call Claude API and return the parsed JSON decision tree.
 
     Checks the daily EUR budget before calling. Logs token usage after.
+    Uses Sonnet for high-signal narratives, Haiku otherwise.
     """
     if not config.anthropic_api_key:
         logger.error("ANTHROPIC_API_KEY not set -- cannot generate decision trees.")
@@ -365,12 +405,14 @@ def _call_claude(
         return None
 
     user_prompt = USER_PROMPT_TEMPLATE.format(**prompt_context)
+    model = _select_model_for_tree(prompt_context)
 
     try:
         client = anthropic.Anthropic(api_key=config.anthropic_api_key)
         response = client.messages.create(
-            model=config.tree_generator_model,
+            model=model,
             max_tokens=6000,
+            temperature=0.3,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -378,7 +420,7 @@ def _call_claude(
         # Log token usage
         usage = response.usage
         _log_usage(
-            model=config.tree_generator_model,
+            model=model,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             purpose="tree_generation",
@@ -393,10 +435,14 @@ def _call_claude(
             text = text.split("\n", 1)[1] if "\n" in text else text[3:]
             if text.endswith("```"):
                 text = text[:-3].strip()
+        # Strip residual language tag (e.g., "json\n{...}")
+        if text.startswith("json"):
+            text = text[4:].strip()
 
         tree_data = json.loads(text)
         logger.info(
-            "Claude generated tree: question=%r, yes_prob=%.2f",
+            "Claude (%s) generated tree: question=%r, yes_prob=%.2f",
+            model.split("-")[1] if "-" in model else model,
             tree_data.get("question", "?")[:80],
             tree_data.get("yes_probability", 0.5),
         )
@@ -488,8 +534,12 @@ def _store_tree(run_up_id: int, tree_data: Dict, session: Session) -> DecisionNo
 # Public API
 # ---------------------------------------------------------------------------
 
-def generate_tree(run_up_id: int) -> Optional[Dict]:
+def generate_tree(run_up_id: int, max_briefs: int = 30) -> Optional[Dict]:
     """Generate a decision tree for a single run-up.
+
+    Args:
+        run_up_id: The run-up to generate a tree for.
+        max_briefs: Max article briefs to include in context (60 for focused).
 
     Returns a dict with tree info on success, None on failure.
     """
@@ -515,7 +565,7 @@ def generate_tree(run_up_id: int) -> Optional[Dict]:
             return {"status": "exists", "root_node_id": existing.id}
 
         # Collect briefs
-        briefs = _collect_briefs_for_runup(run_up, session)
+        briefs = _collect_briefs_for_runup(run_up, session, max_briefs=max_briefs)
         summaries = _briefs_to_summary(briefs)
 
         # Derive region from narrative name
@@ -658,28 +708,39 @@ Respond with this exact JSON structure:
 }}"""
 
 
-def generate_child_tree(parent_node_id: int) -> Optional[Dict]:
-    """Generate child decision tree after a node is auto-confirmed.
+def generate_child_tree(
+    parent_node_id: int,
+    force_branch: Optional[str] = None,
+) -> Optional[Dict]:
+    """Generate child decision tree after a node is confirmed or has a strong signal.
 
     When a decision node is confirmed (via Polymarket or manual), this creates
     the next level of the game theory tree — asking "what happens next?"
+
+    Args:
+        parent_node_id: The parent decision node ID.
+        force_branch: If set ("yes" or "no"), skip confirmed status check and
+                      use this branch for consequence context. Used for proactive
+                      branching on strong-signal nodes.
 
     Returns a dict with tree info on success, None on failure.
     """
     session = get_session()
     try:
-        # 1. Load the confirmed parent node
+        # 1. Load the parent node
         parent = session.query(DecisionNode).get(parent_node_id)
         if parent is None:
             logger.error("Parent node %d not found.", parent_node_id)
             return None
 
-        if parent.status not in ("confirmed_yes", "confirmed_no"):
-            logger.warning(
-                "Node %d is not confirmed (status=%s). Skipping child tree.",
-                parent_node_id, parent.status,
-            )
-            return None
+        if force_branch is None:
+            # Standard path: require confirmed status
+            if parent.status not in ("confirmed_yes", "confirmed_no"):
+                logger.warning(
+                    "Node %d is not confirmed (status=%s). Skipping child tree.",
+                    parent_node_id, parent.status,
+                )
+                return None
 
         # Prevent exponential growth
         MAX_TREE_DEPTH = 4
@@ -709,9 +770,13 @@ def generate_child_tree(parent_node_id: int) -> Optional[Dict]:
             logger.error("RunUp %d not found for node %d.", parent.run_up_id, parent_node_id)
             return None
 
-        # 3. Determine the confirmed branch and pick the highest-impact consequence
-        confirmed_branch = "yes" if parent.status == "confirmed_yes" else "no"
-        confirmed_outcome = "YES" if confirmed_branch == "yes" else "NO"
+        # 3. Determine the branch and pick the highest-impact consequence
+        if force_branch:
+            confirmed_branch = force_branch
+            confirmed_outcome = force_branch.upper()
+        else:
+            confirmed_branch = "yes" if parent.status == "confirmed_yes" else "no"
+            confirmed_outcome = "YES" if confirmed_branch == "yes" else "NO"
 
         consequences = (
             session.query(Consequence)
@@ -748,7 +813,10 @@ def generate_child_tree(parent_node_id: int) -> Optional[Dict]:
         prompt_context = {
             "confirmed_question": parent.question,
             "confirmed_outcome": confirmed_outcome,
-            "evidence": parent.evidence or "Auto-confirmed via Polymarket",
+            "evidence": parent.evidence or (
+                "Auto-confirmed via Polymarket" if not force_branch
+                else f"Proactive branching — probability strongly favors {confirmed_outcome}"
+            ),
             "consequence_text": consequence_text,
             "narrative_name": run_up.narrative_name,
             "score": run_up.current_score,
@@ -839,6 +907,7 @@ def _call_claude_child(
         response = client.messages.create(
             model=config.tree_generator_model,
             max_tokens=12000,
+            temperature=0.3,
             system=CHILD_TREE_SYSTEM,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -859,6 +928,9 @@ def _call_claude_child(
             text = text.split("\n", 1)[1] if "\n" in text else text[3:]
             if text.endswith("```"):
                 text = text[:-3].strip()
+        # Strip residual language tag (e.g., "json\n{...}")
+        if text.startswith("json"):
+            text = text[4:].strip()
 
         tree_data = json.loads(text)
         logger.info(
@@ -962,10 +1034,14 @@ def _store_child_tree(
 def generate_trees_for_new_runups() -> List[Dict]:
     """Generate decision trees for active, non-merged run-ups that don't have one yet.
 
+    Focused run-ups get priority and richer context (60 briefs vs 30).
     Respects ``config.max_trees_per_cycle`` to limit API costs.
 
     Returns a list of result dicts from ``generate_tree()``.
     """
+    from .focus_manager import get_focused_runup_ids
+    focused_ids = set(get_focused_runup_ids())
+
     session = get_session()
     try:
         # Find active, non-merged run-ups without decision trees
@@ -984,11 +1060,32 @@ def generate_trees_for_new_runups() -> List[Dict]:
                 ~RunUp.id.in_(session.query(has_tree.c.run_up_id)),
             )
             .order_by(RunUp.current_score.desc())
-            .limit(config.max_trees_per_cycle)
             .all()
         )
 
-        run_up_ids = [ru.id for ru in candidates]
+        # Filter out catch-all "general" narratives (noise, not actionable)
+        candidates = [c for c in candidates if not c.narrative_name.endswith("-general")]
+
+        # Quality gate: minimum score and article count (focused bypass)
+        MIN_SCORE_FOR_TREE = 55.0
+        MIN_ARTICLES_FOR_TREE = 8
+        candidates = [
+            c for c in candidates
+            if (c.current_score >= MIN_SCORE_FOR_TREE
+                and (c.article_count_total or 0) >= MIN_ARTICLES_FOR_TREE)
+            or c.id in focused_ids
+        ]
+
+        # Prioritize: focused run-ups first, then by score
+        candidates.sort(key=lambda r: (r.id not in focused_ids, -r.current_score))
+
+        # Focused always get through; cap non-focused to remaining slots
+        focused_candidates = [c for c in candidates if c.id in focused_ids]
+        other_candidates = [c for c in candidates if c.id not in focused_ids]
+        remaining_slots = max(0, config.max_trees_per_cycle - len(focused_candidates))
+        final = focused_candidates + other_candidates[:remaining_slots]
+
+        run_up_ids = [(ru.id, ru.id in focused_ids) for ru in final]
     finally:
         session.close()
 
@@ -997,16 +1094,170 @@ def generate_trees_for_new_runups() -> List[Dict]:
         return []
 
     logger.info(
-        "Generating decision trees for %d run-ups (max %d per cycle).",
+        "Generating decision trees for %d run-ups (%d focused, max %d per cycle).",
         len(run_up_ids),
+        sum(1 for _, f in run_up_ids if f),
         config.max_trees_per_cycle,
     )
 
     results = []
-    for ru_id in run_up_ids:
-        result = generate_tree(ru_id)
+    for ru_id, is_focus in run_up_ids:
+        # Focused run-ups get richer context (60 briefs vs 30)
+        briefs_count = 60 if is_focus else 30
+        result = generate_tree(ru_id, max_briefs=briefs_count)
         if result:
             results.append(result)
 
     logger.info("Generated %d decision trees.", len(results))
     return results
+
+
+def generate_proactive_children() -> List[Dict]:
+    """Generate depth-1 child trees for root nodes with strong probability signal.
+
+    Instead of waiting for Polymarket to confirm a node (price >=75%), this
+    proactively generates scenario branches when probability is strongly
+    skewed:
+      - yes_probability >= 0.65 → generate YES-branch children
+      - yes_probability <= 0.35 → generate NO-branch children
+
+    Only for active, non-merged, non-general run-ups.
+    Max 3 per cycle to limit API cost (~€0.003/tree with haiku).
+
+    Returns list of result dicts from generate_child_tree().
+    """
+    from .focus_manager import get_focused_runup_ids
+    focused_ids = set(get_focused_runup_ids())
+
+    MAX_PROACTIVE_PER_CYCLE = 3
+    STRONG_YES_THRESHOLD = 0.65
+    STRONG_NO_THRESHOLD = 0.35
+
+    session = get_session()
+    try:
+        # Find root nodes (depth=0) that are open and have no children yet
+        root_nodes = (
+            session.query(DecisionNode)
+            .join(RunUp, DecisionNode.run_up_id == RunUp.id)
+            .filter(
+                DecisionNode.depth == 0,
+                DecisionNode.status == "open",
+                RunUp.status == "active",
+                RunUp.merged_into_id.is_(None),
+            )
+            .all()
+        )
+
+        candidates = []
+        for node in root_nodes:
+            # Skip general narratives
+            run_up = session.query(RunUp).get(node.run_up_id)
+            if not run_up or run_up.narrative_name.endswith("-general"):
+                continue
+
+            # Skip if already has children
+            has_children = (
+                session.query(DecisionNode)
+                .filter(DecisionNode.parent_node_id == node.id)
+                .first()
+            )
+            if has_children:
+                continue
+
+            # Determine branch direction based on probability
+            prob = node.yes_probability or 0.5
+            if prob >= STRONG_YES_THRESHOLD:
+                branch = "yes"
+                strength = prob
+            elif prob <= STRONG_NO_THRESHOLD:
+                branch = "no"
+                strength = 1.0 - prob
+            else:
+                continue  # not strong enough
+
+            candidates.append((node.id, branch, strength, node.run_up_id in focused_ids))
+
+        # Prioritize: focused first, then by strength
+        candidates.sort(key=lambda x: (not x[3], -x[2]))
+        candidates = candidates[:MAX_PROACTIVE_PER_CYCLE]
+
+    finally:
+        session.close()
+
+    if not candidates:
+        logger.info("Proactive children: no strong-signal root nodes found.")
+        return []
+
+    logger.info(
+        "Proactive children: generating for %d strong-signal nodes.",
+        len(candidates),
+    )
+
+    results = []
+    for node_id, branch, strength, is_focused in candidates:
+        logger.info(
+            "Proactive child: node %d, branch=%s, strength=%.2f, focused=%s",
+            node_id, branch, strength, is_focused,
+        )
+        result = generate_child_tree(node_id, force_branch=branch)
+        if result:
+            results.append(result)
+
+    logger.info("Proactive children: %d child trees generated.", len(results))
+    return results
+
+
+def regenerate_tree(run_up_id: int) -> Optional[Dict]:
+    """Delete existing tree for a run-up and regenerate with fresh data.
+
+    Used by Focus Mode to refresh stale trees.
+    Always uses 60 briefs for richer context.
+    """
+    session = get_session()
+    try:
+        # Delete old decision nodes, consequences, stock impacts, and verdicts
+        old_nodes = (
+            session.query(DecisionNode)
+            .filter(DecisionNode.run_up_id == run_up_id)
+            .all()
+        )
+        if old_nodes:
+            node_ids = [n.id for n in old_nodes]
+            logger.info(
+                "Regenerating tree for run-up %d — deleting %d old nodes.",
+                run_up_id, len(old_nodes),
+            )
+            # Delete verdicts
+            session.query(SwarmVerdict).filter(
+                SwarmVerdict.decision_node_id.in_(node_ids)
+            ).delete(synchronize_session="fetch")
+            # Delete stock impacts via consequences
+            cons_ids = [
+                c.id for c in session.query(Consequence)
+                .filter(Consequence.decision_node_id.in_(node_ids))
+                .all()
+            ]
+            if cons_ids:
+                session.query(StockImpact).filter(
+                    StockImpact.consequence_id.in_(cons_ids)
+                ).delete(synchronize_session="fetch")
+            # Delete consequences
+            session.query(Consequence).filter(
+                Consequence.decision_node_id.in_(node_ids)
+            ).delete(synchronize_session="fetch")
+            # Delete nodes
+            session.query(DecisionNode).filter(
+                DecisionNode.run_up_id == run_up_id
+            ).delete(synchronize_session="fetch")
+            session.commit()
+        else:
+            logger.info("Regenerating tree for run-up %d — no existing tree.", run_up_id)
+    except Exception:
+        session.rollback()
+        logger.exception("Failed to delete old tree for run-up %d.", run_up_id)
+        return None
+    finally:
+        session.close()
+
+    # Now generate fresh tree with 60 briefs
+    return generate_tree(run_up_id, max_briefs=60)

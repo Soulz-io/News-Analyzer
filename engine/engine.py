@@ -12,6 +12,7 @@ Responsibilities:
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import AsyncGenerator
 
 from fastapi import FastAPI
@@ -211,11 +212,125 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     else:
         logger.info("X/Twitter OSINT disabled — no bearer token configured.")
 
+    # Schedule swarm consensus (if Groq API key is configured)
+    if config.swarm_enabled:
+        scheduler.add_job(
+            swarm_consensus_job,
+            trigger=IntervalTrigger(minutes=config.swarm_interval_minutes),
+            id="swarm_consensus",
+            name="Swarm consensus expert panel",
+            replace_existing=True,
+            max_instances=1,
+        )
+        logger.info(
+            "Swarm consensus enabled — running every %d min (Groq/Llama).",
+            config.swarm_interval_minutes,
+        )
+    else:
+        logger.info("Swarm consensus disabled — no Groq API key configured.")
+
+    # Schedule price snapshot storage (every 4 hours — for news→price correlation)
+    scheduler.add_job(
+        store_price_snapshots,
+        trigger=IntervalTrigger(hours=4),
+        id="price_snapshots",
+        name="Price snapshot storage for news-price correlation",
+        replace_existing=True,
+        max_instances=1,
+    )
+    logger.info("Price snapshot job scheduled — every 4 hours.")
+
+    # Focused narratives get hourly price snapshots
+    scheduler.add_job(
+        store_focused_price_snapshots,
+        trigger=IntervalTrigger(hours=1),
+        id="focused_price_snapshots",
+        name="Hourly price snapshots for focused narratives",
+        replace_existing=True,
+        max_instances=1,
+    )
+    logger.info("Focused price snapshot job scheduled — every 1 hour.")
+
+    # Schedule automatic tree generation (every 2 hours)
+    scheduler.add_job(
+        tree_generation_job,
+        trigger=IntervalTrigger(hours=2),
+        id="tree_generation",
+        name="Generate decision trees for active narratives",
+        replace_existing=True,
+        max_instances=1,
+    )
+    logger.info("Tree generation job scheduled — every 2 hours.")
+
+    # Schedule daily advisory evaluation (07:25 UTC — before new advisory)
+    scheduler.add_job(
+        advisory_evaluation_job,
+        trigger=CronTrigger(hour=7, minute=25),
+        id="advisory_evaluation",
+        name="Multi-horizon advisory evaluation",
+        replace_existing=True,
+        max_instances=1,
+    )
+    logger.info("Advisory evaluation job scheduled — daily 07:25 UTC.")
+
+    # Schedule daily advisory generation (07:30 UTC — before EU market open)
+    scheduler.add_job(
+        daily_advisory_job,
+        trigger=CronTrigger(hour=7, minute=30),
+        id="daily_advisory",
+        name="Daily investment advisory",
+        replace_existing=True,
+        max_instances=1,
+    )
+    logger.info("Daily advisory job scheduled — daily 07:30 UTC.")
+
+    # Schedule weekly weight rebalancing (Sunday 07:35 UTC)
+    scheduler.add_job(
+        advisory_rebalance_job,
+        trigger=CronTrigger(day_of_week="sun", hour=7, minute=35),
+        id="advisory_rebalance",
+        name="Weekly advisory weight rebalancing",
+        replace_existing=True,
+        max_instances=1,
+    )
+    logger.info("Advisory weight rebalance job scheduled — Sunday 07:35 UTC.")
+
+    # Schedule proactive child tree branching (every 4 hours)
+    scheduler.add_job(
+        proactive_children_job,
+        trigger=IntervalTrigger(hours=4),
+        id="proactive_children",
+        name="Proactive scenario branches for strong-signal narratives",
+        replace_existing=True,
+        max_instances=1,
+    )
+    logger.info("Proactive children job scheduled — every 4 hours.")
+
+    # Schedule ML model retrain (daily at 03:00 UTC — before 07:30 advisory)
+    import os
+    if os.environ.get("ML_ENABLED", "").lower() in ("1", "true", "yes"):
+        scheduler.add_job(
+            ml_retrain_job,
+            trigger=CronTrigger(hour=3, minute=0),
+            id="ml_retrain",
+            name="ML model retrain (autoresearch)",
+            replace_existing=True,
+            max_instances=1,
+        )
+        logger.info("ML retrain job scheduled — daily 03:00 UTC.")
+    else:
+        logger.info("ML disabled — set ML_ENABLED=true to activate.")
+
     scheduler.start()
     logger.info(
-        "Scheduler started -- fetch %dmin, polymarket 1h, scoring 2h, confidence 30min, GDELT 30min, analysis 08:00+20:00 UTC.",
+        "Scheduler started -- fetch %dmin, polymarket 1h, scoring 2h, confidence 30min, GDELT 30min, swarm %s, analysis 08:00+20:00 UTC, trees 2h, ML %s.",
         config.fetch_interval_minutes,
+        f"{config.swarm_interval_minutes}min" if config.swarm_enabled else "disabled",
+        "enabled" if os.environ.get("ML_ENABLED", "").lower() in ("1", "true", "yes") else "disabled",
     )
+
+    # Generate child trees for any already-confirmed nodes missing children
+    asyncio.create_task(_generate_pending_child_trees_async())
 
     # Run one immediate cycle in the background so the engine is pre-warmed
     asyncio.create_task(_initial_fetch())
@@ -328,57 +443,203 @@ async def proximity_update() -> None:
         from .price_fetcher import get_price_fetcher
 
         session = get_session()
-        fetcher = get_price_fetcher()
+        try:
+            fetcher = get_price_fetcher()
 
-        # Find consequences with price thresholds
-        consequences = (
-            session.query(Consequence)
-            .filter(Consequence.price_thresholds_json.isnot(None))
-            .filter(Consequence.status == "predicted")
-            .all()
-        )
+            # Find consequences with price thresholds
+            consequences = (
+                session.query(Consequence)
+                .filter(Consequence.price_thresholds_json.isnot(None))
+                .filter(Consequence.status == "predicted")
+                .all()
+            )
 
-        updated = 0
-        for cons in consequences:
-            try:
-                thresholds = _json.loads(cons.price_thresholds_json or "[]")
-                if not thresholds:
+            updated = 0
+            for cons in consequences:
+                try:
+                    thresholds = _json.loads(cons.price_thresholds_json or "[]")
+                    if not thresholds:
+                        continue
+
+                    for th in thresholds:
+                        asset = th.get("asset", "")
+                        direction = th.get("direction", "above")
+                        target = float(th.get("value", 0))
+                        if not asset or target <= 0:
+                            continue
+
+                        # Fetch current price
+                        quote = await asyncio.to_thread(fetcher.get_quote, asset)
+                        if "error" in quote:
+                            continue
+
+                        current = quote["price"]
+                        if direction == "above":
+                            pct = min(100.0, max(0, (current / target) * 100))
+                        else:  # "below"
+                            pct = min(100.0, max(0, (target / current) * 100)) if current > 0 else 0
+
+                        cons.proximity_pct = round(pct, 1)
+                        updated += 1
+                        break  # Use first threshold
+
+                except Exception:
                     continue
 
-                for th in thresholds:
-                    asset = th.get("asset", "")
-                    direction = th.get("direction", "above")
-                    target = float(th.get("value", 0))
-                    if not asset or target <= 0:
-                        continue
-
-                    # Fetch current price
-                    quote = await asyncio.to_thread(fetcher.get_quote, asset)
-                    if "error" in quote:
-                        continue
-
-                    current = quote["price"]
-                    if direction == "above":
-                        pct = min(100.0, (current / target) * 100)
-                    else:  # "below"
-                        pct = min(100.0, (target / current) * 100) if current > 0 else 0
-
-                    cons.proximity_pct = round(pct, 1)
-                    updated += 1
-                    break  # Use first threshold
-
-            except Exception:
-                continue
-
-        if updated:
-            session.commit()
-            logger.info("Proximity: updated %d consequences.", updated)
-        session.close()
+            if updated:
+                session.commit()
+                logger.info("Proximity: updated %d consequences.", updated)
+        finally:
+            session.close()
 
     except Exception:
         logger.exception("proximity_update cycle FAILED.")
     finally:
         logger.info("=== proximity_update cycle END ===")
+
+
+async def store_price_snapshots() -> None:
+    """Recurring job: snapshot prices for tickers in active StockImpacts + key macro assets.
+
+    Runs every 4 hours. Enables news→price correlation by storing historical data.
+    Cleans up snapshots older than 30 days.
+    """
+    logger.info("=== store_price_snapshots cycle START ===")
+    try:
+        from .db import (
+            get_session, RunUp, DecisionNode, Consequence, StockImpact,
+            PriceSnapshot, cleanup_old_price_snapshots,
+        )
+        from .price_fetcher import get_price_fetcher
+
+        session = get_session()
+        try:
+            fetcher = get_price_fetcher()
+
+            # Collect unique tickers from active StockImpacts
+            active_tickers: set = set()
+            active_runups = (
+                session.query(RunUp)
+                .filter(RunUp.status == "active", RunUp.merged_into_id.is_(None))
+                .all()
+            )
+            for ru in active_runups:
+                for node in ru.decision_nodes:
+                    if node.status != "open":
+                        continue
+                    for cons in node.consequences:
+                        for si in cons.stock_impacts:
+                            active_tickers.add(si.ticker.upper())
+
+            # Always track key macro tickers
+            always_track = {"GC=F", "SI=F", "HG=F", "CL=F", "^VIX", "ITA", "XLE", "SPY"}
+            active_tickers.update(always_track)
+
+            logger.info("Price snapshots: tracking %d tickers", len(active_tickers))
+
+            stored = 0
+            for ticker in active_tickers:
+                try:
+                    quote = await asyncio.to_thread(fetcher.get_quote, ticker)
+                    if "error" in quote:
+                        continue
+
+                    snapshot = PriceSnapshot(
+                        ticker=ticker,
+                        price=quote["price"],
+                        recorded_at=datetime.utcnow(),
+                    )
+                    session.add(snapshot)
+                    stored += 1
+                except Exception:
+                    continue
+
+            if stored:
+                session.commit()
+                logger.info("Price snapshots: stored %d snapshots.", stored)
+
+            # Cleanup old snapshots (>30 days)
+            cleaned = cleanup_old_price_snapshots(max_age_days=30)
+            if cleaned:
+                logger.info("Price snapshots: cleaned %d old records.", cleaned)
+        finally:
+            session.close()
+
+    except Exception:
+        logger.exception("store_price_snapshots cycle FAILED.")
+    finally:
+        logger.info("=== store_price_snapshots cycle END ===")
+
+
+async def store_focused_price_snapshots() -> None:
+    """Recurring job: hourly price snapshots for tickers in focused narratives only.
+
+    Focused narratives get 4x more frequent price data (hourly vs 4-hourly)
+    for better news-price correlation analysis.
+    """
+    from .focus_manager import get_focused_runup_ids
+
+    focused_ids = get_focused_runup_ids()
+    if not focused_ids:
+        return  # No focused narratives — skip silently
+
+    logger.info("=== store_focused_price_snapshots cycle START ===")
+    try:
+        from .db import (
+            get_session, RunUp, DecisionNode, Consequence, StockImpact,
+            PriceSnapshot,
+        )
+        from .price_fetcher import get_price_fetcher
+
+        session = get_session()
+        try:
+            fetcher = get_price_fetcher()
+
+            # Collect tickers from focused run-ups' StockImpacts
+            focus_tickers: set = set()
+            for ru_id in focused_ids:
+                ru = session.query(RunUp).get(ru_id)
+                if not ru:
+                    continue
+                for node in ru.decision_nodes:
+                    if node.status != "open":
+                        continue
+                    for cons in node.consequences:
+                        for si in cons.stock_impacts:
+                            focus_tickers.add(si.ticker.upper())
+
+            if not focus_tickers:
+                logger.info("Focused price snapshots: no tickers to track.")
+                return
+
+            logger.info("Focused price snapshots: tracking %d tickers", len(focus_tickers))
+
+            stored = 0
+            for ticker in focus_tickers:
+                try:
+                    quote = await asyncio.to_thread(fetcher.get_quote, ticker)
+                    if "error" in quote:
+                        continue
+                    snapshot = PriceSnapshot(
+                        ticker=ticker,
+                        price=quote["price"],
+                        recorded_at=datetime.utcnow(),
+                    )
+                    session.add(snapshot)
+                    stored += 1
+                except Exception:
+                    continue
+
+            if stored:
+                session.commit()
+                logger.info("Focused price snapshots: stored %d snapshots.", stored)
+        finally:
+            session.close()
+
+    except Exception:
+        logger.exception("store_focused_price_snapshots cycle FAILED.")
+    finally:
+        logger.info("=== store_focused_price_snapshots cycle END ===")
 
 
 async def confidence_scoring() -> None:
@@ -396,6 +657,196 @@ async def confidence_scoring() -> None:
         logger.exception("confidence_scoring cycle FAILED.")
     finally:
         logger.info("=== confidence_scoring cycle END ===")
+
+
+async def ml_retrain_job() -> None:
+    """Recurring job: retrain ML signal predictor on latest data."""
+    logger.info("=== ml_retrain cycle START ===")
+    try:
+        from .ml.prepare import extract_all
+        from .ml.train import train
+
+        # Extract fresh features from DB
+        features, labels = extract_all()
+        if features.empty:
+            logger.warning("ML retrain skipped — no features available.")
+            return
+
+        # Train model
+        metadata = train()
+        if metadata:
+            metrics = metadata.get("metrics", {})
+            logger.info(
+                "ML retrain complete: sharpe=%.4f, hit_rate=%.4f, n_samples=%d",
+                metrics.get("sharpe_ratio", 0),
+                metrics.get("hit_rate", 0),
+                metadata.get("n_samples", 0),
+            )
+        else:
+            logger.warning("ML retrain produced no model (insufficient data?).")
+    except Exception:
+        logger.exception("ml_retrain cycle FAILED.")
+    finally:
+        logger.info("=== ml_retrain cycle END ===")
+
+
+async def swarm_consensus_job() -> None:
+    """Recurring job: run expert swarm debate on decision nodes (Groq/Llama)."""
+    logger.info("=== swarm_consensus cycle START ===")
+    try:
+        from .swarm_consensus import swarm_consensus_cycle
+
+        count = await swarm_consensus_cycle()
+        logger.info("Swarm consensus: %d nodes evaluated.", count)
+    except Exception:
+        logger.exception("swarm_consensus cycle FAILED.")
+    finally:
+        logger.info("=== swarm_consensus cycle END ===")
+
+
+async def tree_generation_job() -> None:
+    """Recurring job: generate decision trees for active run-ups missing trees."""
+    logger.info("=== tree_generation cycle START ===")
+    try:
+        from .tree_generator import generate_trees_for_new_runups
+
+        results = await asyncio.to_thread(generate_trees_for_new_runups)
+        created = sum(1 for r in results if r.get("status") == "created")
+        logger.info("Tree generation: %d trees created out of %d candidates.", created, len(results))
+    except Exception:
+        logger.exception("tree_generation cycle FAILED.")
+    finally:
+        logger.info("=== tree_generation cycle END ===")
+
+
+async def proactive_children_job() -> None:
+    """Recurring job: generate depth-1 child trees for strong-signal root nodes."""
+    logger.info("=== proactive_children cycle START ===")
+    try:
+        from .tree_generator import generate_proactive_children
+
+        results = await asyncio.to_thread(generate_proactive_children)
+        logger.info("Proactive children: %d child trees generated.", len(results))
+    except Exception:
+        logger.exception("proactive_children cycle FAILED.")
+    finally:
+        logger.info("=== proactive_children cycle END ===")
+
+
+async def daily_advisory_job() -> None:
+    """Recurring job: generate daily investment advisory (07:30 UTC)."""
+    logger.info("=== daily_advisory cycle START ===")
+    try:
+        from .daily_advisory import generate_daily_advisory
+        report = await asyncio.to_thread(generate_daily_advisory)
+        if report:
+            logger.info("Daily advisory generated: report %d", report.id)
+            # Send Telegram notification
+            try:
+                import json
+                from .telegram_notifier import send_advisory_notification
+                data = json.loads(report.report_json) if report.report_json else {}
+                sent = await asyncio.to_thread(send_advisory_notification, data)
+                if sent:
+                    logger.info("Telegram advisory notification sent.")
+            except Exception:
+                logger.debug("Telegram notification skipped (not configured or failed).")
+        else:
+            logger.warning("Daily advisory returned None — check logs.")
+    except Exception:
+        logger.exception("daily_advisory cycle FAILED.")
+    finally:
+        logger.info("=== daily_advisory cycle END ===")
+
+
+async def advisory_evaluation_job() -> None:
+    """Recurring job: evaluate past advisories at all horizons (07:25 UTC)."""
+    logger.info("=== advisory_evaluation cycle START ===")
+    try:
+        from .daily_advisory import evaluate_open_advisories, calculate_brier_scores
+        result = await asyncio.to_thread(evaluate_open_advisories)
+        logger.info(
+            "Advisory evaluation: %d checks, %.1f%% accuracy",
+            result.get("total_checks", 0),
+            result.get("accuracy", 0),
+        )
+        # Also update Brier scores
+        await asyncio.to_thread(calculate_brier_scores)
+    except Exception:
+        logger.exception("advisory_evaluation cycle FAILED.")
+    finally:
+        logger.info("=== advisory_evaluation cycle END ===")
+
+
+async def advisory_rebalance_job() -> None:
+    """Recurring job: weekly weight rebalancing (Sunday 07:35 UTC)."""
+    logger.info("=== advisory_rebalance cycle START ===")
+    try:
+        from .daily_advisory import rebalance_weights
+        new_weights = await asyncio.to_thread(rebalance_weights)
+        logger.info("Advisory weights rebalanced: %s", new_weights)
+    except Exception:
+        logger.exception("advisory_rebalance cycle FAILED.")
+    finally:
+        logger.info("=== advisory_rebalance cycle END ===")
+
+
+async def _generate_pending_child_trees_async() -> None:
+    """One-time startup task: generate child trees for confirmed nodes missing children."""
+    await asyncio.sleep(15)  # let other startup tasks settle
+    logger.info("=== pending_child_trees check START ===")
+    try:
+        from .db import DecisionNode
+
+        session = get_session()
+        try:
+            confirmed = (
+                session.query(DecisionNode)
+                .filter(
+                    DecisionNode.status.in_(["confirmed_yes", "confirmed_no"]),
+                    DecisionNode.depth < 4,
+                )
+                .all()
+            )
+
+            pending = []
+            for node in confirmed:
+                has_children = (
+                    session.query(DecisionNode)
+                    .filter(DecisionNode.parent_node_id == node.id)
+                    .first()
+                )
+                if not has_children:
+                    pending.append(node.id)
+        finally:
+            session.close()
+
+        if not pending:
+            logger.info("No confirmed nodes missing child trees.")
+            return
+
+        logger.info(
+            "Found %d confirmed nodes without child trees — generating...",
+            len(pending),
+        )
+
+        from .tree_generator import generate_child_tree
+
+        for node_id in pending:
+            try:
+                result = await asyncio.to_thread(generate_child_tree, node_id)
+                if result:
+                    logger.info(
+                        "Generated child tree for node %d: %s",
+                        node_id, result.get("status", "?"),
+                    )
+            except Exception:
+                logger.exception("Failed to generate child tree for node %d.", node_id)
+
+    except Exception:
+        logger.exception("pending_child_trees check FAILED.")
+    finally:
+        logger.info("=== pending_child_trees check END ===")
 
 
 async def _initial_fetch() -> None:

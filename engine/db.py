@@ -208,6 +208,8 @@ class RunUp(Base):
     merged_into_id: Optional[int] = Column(
         Integer, ForeignKey("run_ups.id"), nullable=True
     )
+    # Focus Mode: concentrated analysis on this narrative
+    is_focused: bool = Column(Boolean, nullable=False, default=False)
 
     # Relationships
     decision_nodes = relationship("DecisionNode", back_populates="run_up")
@@ -527,6 +529,7 @@ class TradingSignal(Base):
     polymarket_drift_component: float = Column(Float, nullable=False, default=0.0)
     news_acceleration_component: float = Column(Float, nullable=False, default=0.0)
     source_convergence_component: float = Column(Float, nullable=False, default=0.0)
+    ml_prediction_component: float = Column(Float, nullable=False, default=0.0)
 
     # Context
     x_signal_count: int = Column(Integer, nullable=False, default=0)
@@ -572,6 +575,40 @@ class PolymarketPriceHistory(Base):
         )
 
 
+class PriceSnapshot(Base):
+    """Periodic price snapshots for tracked tickers — enables news→price correlation.
+
+    Stored every 4 hours for tickers in active StockImpacts + key macro assets.
+    Retention: 30 days (cleaned by snapshot job).
+    """
+
+    __tablename__ = "price_snapshots"
+    __table_args__ = (
+        Index("idx_ps_ticker_time", "ticker", "recorded_at"),
+    )
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    ticker: str = Column(String(16), nullable=False)
+    price: float = Column(Float, nullable=False)
+    recorded_at: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<PriceSnapshot {self.ticker} price={self.price:.2f} at={self.recorded_at}>"
+
+
+def cleanup_old_price_snapshots(max_age_days: int = 30) -> int:
+    """Delete PriceSnapshot records older than max_age_days. Returns count deleted."""
+    session = get_session()
+    try:
+        from datetime import timedelta as _td
+        cutoff = datetime.utcnow() - _td(days=max_age_days)
+        count = session.query(PriceSnapshot).filter(PriceSnapshot.recorded_at < cutoff).delete()
+        session.commit()
+        return count
+    finally:
+        session.close()
+
+
 class EngineSettings(Base):
     """Key-value settings store (e.g. daily budget)."""
 
@@ -598,12 +635,73 @@ class AnalysisReport(Base):
     period_start: date = Column(Date, nullable=False)
     period_end: date = Column(Date, nullable=False)
     report_json: str = Column(Text, nullable=False)
+    performance_json: str = Column(Text, nullable=True)
     created_at: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     def __repr__(self) -> str:
         return (
             f"<AnalysisReport type={self.report_type!r} "
             f"period={self.period_start}..{self.period_end}>"
+        )
+
+
+class SwarmVerdict(Base):
+    """A swarm consensus verdict for a decision node.
+
+    Produced by the expert panel (7 agents × 3 debate rounds).
+    New verdicts supersede old ones for the same node.
+    """
+
+    __tablename__ = "swarm_verdicts"
+    __table_args__ = (
+        Index("idx_sv_node", "decision_node_id"),
+        Index("idx_sv_runup", "run_up_id"),
+        Index("idx_sv_created", "created_at"),
+    )
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    decision_node_id: int = Column(
+        Integer, ForeignKey("decision_nodes.id"), nullable=False
+    )
+    run_up_id: int = Column(Integer, ForeignKey("run_ups.id"), nullable=False)
+
+    # Verdict
+    verdict: str = Column(String(16), nullable=False)  # STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL
+    confidence: float = Column(Float, nullable=False, default=0.0)  # 0.0-1.0
+    yes_probability: float = Column(Float, nullable=False, default=0.5)  # 0.0-1.0
+    consensus_strength: float = Column(Float, nullable=False, default=0.0)  # 0.0-1.0
+
+    # Primary trading signal
+    primary_ticker: Optional[str] = Column(String(16), nullable=True)
+    ticker_direction: Optional[str] = Column(String(8), nullable=True)  # long/short
+
+    # Reasoning
+    entry_reasoning: str = Column(Text, nullable=False, default="")
+    exit_trigger: str = Column(Text, nullable=False, default="")
+    risk_note: str = Column(Text, nullable=False, default="")
+    dissent_note: str = Column(Text, nullable=False, default="")
+
+    # Full ticker signals JSON: [{"ticker":"XOM","direction":"long","votes":5}]
+    all_ticker_signals_json: Optional[str] = Column(Text, nullable=True)
+
+    # Debate transcript (for detail panel)
+    round1_json: Optional[str] = Column(Text, nullable=True)
+    round2_json: Optional[str] = Column(Text, nullable=True)
+
+    # Meta
+    model_used: str = Column(String(64), nullable=False, default="llama-3.3-70b-versatile")
+    context_hash: Optional[str] = Column(String(64), nullable=True)  # SHA-256 of input context
+    created_at: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+    superseded_at: Optional[datetime] = Column(DateTime, nullable=True)
+
+    # Relationships
+    decision_node = relationship("DecisionNode", backref="swarm_verdicts")
+    run_up = relationship("RunUp", backref="swarm_verdicts")
+
+    def __repr__(self) -> str:
+        return (
+            f"<SwarmVerdict id={self.id} node={self.decision_node_id} "
+            f"verdict={self.verdict!r} conf={self.confidence:.0%}>"
         )
 
 
@@ -713,6 +811,33 @@ def _migrate_columns(engine) -> None:
                     f"ALTER TABLE consequences ADD COLUMN {col_name} {col_type}"
                 )
                 logger.info("Migration: added column consequences.%s", col_name)
+
+        # Check run_ups for focus column
+        cursor.execute("PRAGMA table_info(run_ups)")
+        runup_cols = {row[1] for row in cursor.fetchall()}
+        if "is_focused" not in runup_cols:
+            cursor.execute(
+                "ALTER TABLE run_ups ADD COLUMN is_focused BOOLEAN DEFAULT 0"
+            )
+            logger.info("Migration: added column run_ups.is_focused")
+
+        # Check analysis_reports for performance_json column
+        cursor.execute("PRAGMA table_info(analysis_reports)")
+        report_cols = {row[1] for row in cursor.fetchall()}
+        if "performance_json" not in report_cols:
+            cursor.execute(
+                "ALTER TABLE analysis_reports ADD COLUMN performance_json TEXT DEFAULT NULL"
+            )
+            logger.info("Migration: added column analysis_reports.performance_json")
+
+        # Check swarm_verdicts for context_hash column
+        cursor.execute("PRAGMA table_info(swarm_verdicts)")
+        sv_cols = {row[1] for row in cursor.fetchall()}
+        if "context_hash" not in sv_cols:
+            cursor.execute(
+                "ALTER TABLE swarm_verdicts ADD COLUMN context_hash VARCHAR(64) DEFAULT NULL"
+            )
+            logger.info("Migration: added column swarm_verdicts.context_hash")
 
         conn.commit()
         conn.close()

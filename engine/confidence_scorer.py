@@ -1,21 +1,22 @@
 """Confidence scorer -- composite multi-source signal generator.
 
-Combines five independent signal sources into a single confidence score
+Combines six independent signal sources into a single confidence score
 per active run-up, then generates TradingSignal records when the composite
 crosses pre-defined thresholds.
 
-Signal sources and weights:
-  1. Run-up momentum score (W_RUNUP = 0.25)
-  2. X/Twitter OSINT density (W_X_SIGNAL = 0.20)
-  3. Polymarket price drift   (W_POLYMARKET = 0.25)
-  4. News article acceleration (W_NEWS_ACCEL = 0.15)
-  5. Source convergence        (W_SOURCE_CONV = 0.15)
+Signal sources and weights (V2.0):
+  1. Run-up momentum score  (W_RUNUP = 0.15)
+  2. Swarm verdict strength (W_SWARM = 0.20)
+  3. Polymarket price drift (W_POLYMARKET = 0.15)
+  4. News article accel     (W_NEWS_ACCEL = 0.15)
+  5. Source convergence     (W_SOURCE_CONV = 0.15)
+  6. ML signal predictor    (W_ML_PRED = 0.20)
 
-Signal levels:
-  STRONG_BUY: >= 0.85
-  BUY:        >= 0.75
-  ALERT:      >= 0.60
-  WATCH:      >= 0.40
+Signal levels (mapped to SELL-side for bearish direction):
+  STRONG_BUY / STRONG_SELL: >= 0.80
+  BUY / SELL:               >= 0.70
+  ALERT:                    >= 0.55
+  WATCH:                    >= 0.35
 
 No Claude API calls -- pure Python computation.  Zero additional cost.
 """
@@ -41,6 +42,7 @@ from .db import (
     TradingSignal,
     PolymarketMatch,
     PolymarketPriceHistory,
+    SwarmVerdict,
 )
 from .bunq_stocks import is_available_on_bunq
 
@@ -51,18 +53,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SIGNAL_THRESHOLDS = [
-    (0.85, "STRONG_BUY"),
-    (0.75, "BUY"),
-    (0.60, "ALERT"),
-    (0.40, "WATCH"),
+    (0.80, "STRONG_BUY"),
+    (0.70, "BUY"),
+    (0.55, "ALERT"),
+    (0.35, "WATCH"),
 ]
 
 # Component weights (must sum to 1.0)
-W_RUNUP = 0.25
-W_X_SIGNAL = 0.20
-W_POLYMARKET = 0.25
-W_NEWS_ACCEL = 0.15
-W_SOURCE_CONV = 0.15
+# V2.0: added ML predictor, rebalanced existing weights
+W_RUNUP = 0.15
+W_SWARM = 0.20        # swarm verdict confidence
+W_POLYMARKET = 0.15   # keep but reduced (sparse matches)
+W_NEWS_ACCEL = 0.15   # reliable
+W_SOURCE_CONV = 0.15  # reliable
+W_ML_PRED = 0.20      # ML signal predictor (autoresearch-optimized XGBoost)
 
 
 def _classify_level(confidence: float) -> str:
@@ -392,18 +396,25 @@ def _calculate_news_acceleration(run_up: RunUp, session: Session) -> Dict[str, A
 # ---------------------------------------------------------------------------
 
 def _calculate_source_convergence(run_up: RunUp, session: Session) -> Dict[str, Any]:
-    """Score based on number of independent sources covering this narrative
+    """Score based on number and QUALITY of independent sources covering this narrative
     in the last 48 hours.
 
     Matching logic:
       - Region overlap with narrative name parts, OR
       - Keyword overlap via ArticleBrief
 
-    Score formula:
-      score = min(1.0, unique_sources / 8)   (8+ sources = max)
+    Score formula (credibility-weighted):
+      raw_score = min(1.0, unique_sources / 8)
+      credibility_bonus = (avg_credibility - 0.6) × 0.5   (max +0.2 for high-quality sources)
+      score = clamp(raw_score + credibility_bonus, 0, 1)
 
-    Returns dict with score, unique source count, and source list.
+    A narrative covered by Reuters + FT + BBC scores higher than one covered
+    by 3 obscure blogs, even with the same source count.
+
+    Returns dict with score, unique source count, source list, and avg credibility.
     """
+    from .deep_analysis import SOURCE_CREDIBILITY, DEFAULT_CREDIBILITY
+
     try:
         cutoff = datetime.utcnow() - timedelta(hours=48)
 
@@ -419,7 +430,8 @@ def _calculate_source_convergence(run_up: RunUp, session: Session) -> Dict[str, 
         )
 
         if not articles:
-            return {"score": 0.0, "unique_sources": 0, "sources": []}
+            return {"score": 0.0, "unique_sources": 0, "sources": [],
+                    "avg_credibility": 0.0}
 
         # Preload briefs
         article_ids = [a.id for a in articles]
@@ -457,12 +469,27 @@ def _calculate_source_convergence(run_up: RunUp, session: Session) -> Dict[str, 
                 matched_sources.add(art.source)
 
         unique_count = len(matched_sources)
-        score = min(1.0, unique_count / 8.0)
+        raw_score = min(1.0, unique_count / 8.0)
+
+        # Credibility-weighted bonus: high-quality sources boost the score
+        if matched_sources:
+            avg_cred = sum(
+                SOURCE_CREDIBILITY.get(s, DEFAULT_CREDIBILITY)
+                for s in matched_sources
+            ) / len(matched_sources)
+            # Bonus: if avg credibility > 0.6 baseline, boost score by up to 0.2
+            credibility_bonus = max(0.0, (avg_cred - DEFAULT_CREDIBILITY)) * 0.5
+        else:
+            avg_cred = 0.0
+            credibility_bonus = 0.0
+
+        score = min(1.0, max(0.0, raw_score + credibility_bonus))
 
         return {
             "score": round(score, 4),
             "unique_sources": unique_count,
             "sources": sorted(matched_sources),
+            "avg_credibility": round(avg_cred, 3),
         }
 
     except Exception:
@@ -470,7 +497,99 @@ def _calculate_source_convergence(run_up: RunUp, session: Session) -> Dict[str, 
             "Source convergence calculation failed for run-up %s",
             run_up.narrative_name,
         )
-        return {"score": 0.0, "unique_sources": 0, "sources": []}
+        return {"score": 0.0, "unique_sources": 0, "sources": [],
+                "avg_credibility": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# Component 5: Swarm Verdict Consensus
+# ---------------------------------------------------------------------------
+
+# Map swarm verdicts to a 0-1 scale (how far from neutral)
+_VERDICT_POSITION = {
+    "STRONG_BUY": 1.0,
+    "BUY": 0.75,
+    "HOLD": 0.5,
+    "SELL": 0.25,
+    "STRONG_SELL": 0.0,
+}
+
+
+def _calculate_swarm_component(run_up: RunUp, session: Session) -> Dict[str, Any]:
+    """Score based on swarm consensus verdict strength.
+
+    Uses the most recent (non-superseded) SwarmVerdict for any decision node
+    in this run-up. The signal strength is:
+
+        |deviation from neutral| × confidence
+
+    Examples:
+      STRONG_BUY with 80% confidence → |1.0-0.5|×2×0.8 = 0.80
+      BUY with 70% confidence → |0.75-0.5|×2×0.7 = 0.35
+      HOLD with 90% confidence → |0.5-0.5|×2×0.9 = 0.00
+
+    Returns dict with score, verdict, and confidence.
+    """
+    try:
+        # Get the most recent non-superseded verdict for this run-up
+        verdict = (
+            session.query(SwarmVerdict)
+            .filter(
+                SwarmVerdict.run_up_id == run_up.id,
+                SwarmVerdict.superseded_at.is_(None),
+            )
+            .order_by(SwarmVerdict.created_at.desc())
+            .first()
+        )
+
+        if not verdict:
+            return {"score": 0.0, "verdict": None, "confidence": 0.0}
+
+        position = _VERDICT_POSITION.get(verdict.verdict, 0.5)
+        deviation = abs(position - 0.5) * 2.0  # scale to 0-1
+        score = deviation * verdict.confidence
+
+        return {
+            "score": round(min(1.0, score), 4),
+            "verdict": verdict.verdict,
+            "confidence": round(verdict.confidence, 4),
+            "consensus_strength": round(verdict.consensus_strength or 0.0, 4),
+        }
+
+    except Exception:
+        logger.exception(
+            "Swarm component calculation failed for run-up %s",
+            run_up.narrative_name,
+        )
+        return {"score": 0.0, "verdict": None, "confidence": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# ML signal predictor component (V2.0)
+# ---------------------------------------------------------------------------
+
+def _calculate_ml_component(run_up: RunUp, session: Session) -> Dict[str, Any]:
+    """Calculate the ML signal predictor component.
+
+    Uses a trained XGBoost model to predict the probability that this run-up
+    leads to a profitable trade. Returns 0.5 (neutral) if model is not available.
+    """
+    try:
+        from .ml.inference import predict_signal, get_model_status
+
+        status = get_model_status()
+        score = predict_signal(run_up.id)
+
+        return {
+            "score": round(score, 4),
+            "model_status": status.get("status", "unknown"),
+            "model_trained_at": status.get("trained_at"),
+        }
+    except ImportError:
+        return {"score": 0.5, "model_status": "not_installed"}
+    except Exception:
+        logger.exception("ML prediction failed for %s", run_up.narrative_name)
+        return {"score": 0.5, "model_status": "error"}
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +599,8 @@ def _calculate_source_convergence(run_up: RunUp, session: Session) -> Dict[str, 
 def calculate_confidence(run_up: RunUp, session: Session) -> Dict[str, Any]:
     """Calculate the composite confidence score for a single run-up.
 
-    Calls all four component scorers plus normalizes the run-up's own
+    Calls all five component scorers plus ML predictor, and normalizes
+    the run-up's own
     current_score (0-100 scale) to 0-1.
 
     Returns a dict containing:
@@ -496,10 +616,10 @@ def calculate_confidence(run_up: RunUp, session: Session) -> Dict[str, Any]:
     # but we also guard here so a broken component returns 0 without
     # crashing the entire scorer.
     try:
-        x = _calculate_x_signal(run_up, session)
+        swarm = _calculate_swarm_component(run_up, session)
     except Exception:
-        logger.exception("X signal failed for %s, defaulting to 0", run_up.narrative_name)
-        x = {"score": 0.0, "count": 0, "accounts": []}
+        logger.exception("Swarm component failed for %s, defaulting to 0", run_up.narrative_name)
+        swarm = {"score": 0.0, "verdict": None, "confidence": 0.0}
 
     try:
         poly = _calculate_polymarket_drift(run_up, session)
@@ -519,12 +639,26 @@ def calculate_confidence(run_up: RunUp, session: Session) -> Dict[str, Any]:
         logger.exception("Source convergence failed for %s, defaulting to 0", run_up.narrative_name)
         src = {"score": 0.0, "unique_sources": 0, "sources": []}
 
+    # Also calculate X signal for display/reasoning (kept at 0 weight)
+    try:
+        x = _calculate_x_signal(run_up, session)
+    except Exception:
+        x = {"score": 0.0, "count": 0, "accounts": []}
+
+    # ML signal predictor (V2.0 — autoresearch-optimized XGBoost)
+    try:
+        ml = _calculate_ml_component(run_up, session)
+    except Exception:
+        logger.exception("ML component failed for %s, defaulting to neutral", run_up.narrative_name)
+        ml = {"score": 0.5, "model_status": "error"}
+
     confidence = (
         W_RUNUP * runup_norm
-        + W_X_SIGNAL * x["score"]
+        + W_SWARM * swarm["score"]
         + W_POLYMARKET * poly["score"]
         + W_NEWS_ACCEL * news["score"]
         + W_SOURCE_CONV * src["score"]
+        + W_ML_PRED * ml["score"]
     )
 
     signal_level = _classify_level(confidence)
@@ -534,10 +668,12 @@ def calculate_confidence(run_up: RunUp, session: Session) -> Dict[str, Any]:
         "signal_level": signal_level,
         "components": {
             "runup_score": round(runup_norm, 4),
+            "swarm_verdict": swarm,
             "x_signal": x,
             "polymarket_drift": poly,
             "news_acceleration": news,
             "source_convergence": src,
+            "ml_prediction": ml,
         },
     }
 
@@ -610,6 +746,7 @@ def _generate_reasoning(
     run_up: RunUp,
     result: Dict[str, Any],
     ticker: Optional[str],
+    signal_level: Optional[str] = None,
 ) -> str:
     """Generate a human-readable reasoning string from component scores.
 
@@ -617,14 +754,19 @@ def _generate_reasoning(
       [BUY] middle-east-iran-war: 8 OSINT tweets in 48h; Polymarket drift
       +12.5%; 45 articles accelerating; 11 sources; Primary: XOM
     """
-    level = result["signal_level"]
+    level = signal_level or result["signal_level"]
     comps = result["components"]
     parts: List[str] = []
 
-    # X/Twitter signal
-    x = comps["x_signal"]
-    if x["count"] > 0:
-        parts.append(f"{x['count']} OSINT tweets in 48h")
+    # Swarm verdict
+    swarm = comps.get("swarm_verdict", {})
+    if swarm.get("verdict"):
+        parts.append(f"Swarm: {swarm['verdict']} ({swarm['confidence']:.0%} conf)")
+
+    # X/Twitter signal (informational — 0 weight)
+    x = comps.get("x_signal", {})
+    if x.get("count", 0) > 0:
+        parts.append(f"{x['count']} OSINT tweets")
 
     # Polymarket drift
     poly = comps["polymarket_drift"]
@@ -688,6 +830,9 @@ def update_trading_signals() -> List[TradingSignal]:
             .all()
         )
 
+        # Filter out catch-all "general" narratives (noise, not actionable signals)
+        active_runups = [ru for ru in active_runups if not ru.narrative_name.endswith("-general")]
+
         if not active_runups:
             logger.info("Confidence scorer: no active run-ups to score.")
             return []
@@ -721,35 +866,50 @@ def update_trading_signals() -> List[TradingSignal]:
                 .first()
             )
 
+            # Find the primary ticker for this run-up
+            ticker, direction = _find_primary_ticker(ru, session)
+
+            # Map signal level to direction-aware label BEFORE dedup comparison
+            signal_level = result["signal_level"]
+            if direction == "bearish":
+                _SELL_MAP = {
+                    "STRONG_BUY": "STRONG_SELL",
+                    "BUY": "SELL",
+                    "ALERT": "ALERT",
+                    "WATCH": "WATCH",
+                }
+                signal_level = _SELL_MAP.get(signal_level, signal_level)
+
+            # Suppress noise: skip if level and confidence barely changed
             if last_signal:
-                level_same = last_signal.signal_level == result["signal_level"]
+                level_same = last_signal.signal_level == signal_level
                 conf_shift = abs(last_signal.confidence - result["confidence"])
                 if level_same and conf_shift < 0.05:
                     continue  # No meaningful change -- suppress noise
 
-            # Find the primary ticker for this run-up
-            ticker, direction = _find_primary_ticker(ru, session)
-
-            # Build human-readable reasoning
-            reasoning = _generate_reasoning(ru, result, ticker)
+            # Build human-readable reasoning (use mapped signal_level)
+            reasoning = _generate_reasoning(ru, result, ticker, signal_level=signal_level)
 
             # Create the new TradingSignal record
             comps = result["components"]
+            swarm_comp = comps.get("swarm_verdict", {})
             signal = TradingSignal(
                 run_up_id=ru.id,
                 narrative_name=ru.narrative_name,
                 ticker=ticker,
                 direction=direction,
                 confidence=result["confidence"],
-                signal_level=result["signal_level"],
+                signal_level=signal_level,
                 # Component scores for transparency
+                # NOTE: x_signal_component repurposed to store swarm score (was always 0)
                 runup_score_component=comps["runup_score"],
-                x_signal_component=comps["x_signal"]["score"],
+                x_signal_component=swarm_comp.get("score", 0.0),
                 polymarket_drift_component=comps["polymarket_drift"]["score"],
                 news_acceleration_component=comps["news_acceleration"]["score"],
                 source_convergence_component=comps["source_convergence"]["score"],
+                ml_prediction_component=comps.get("ml_prediction", {}).get("score", 0.0),
                 # Context
-                x_signal_count=comps["x_signal"]["count"],
+                x_signal_count=comps.get("x_signal", {}).get("count", 0),
                 news_count=comps["news_acceleration"]["count"],
                 polymarket_prob=comps["polymarket_drift"]["prob"],
                 reasoning=reasoning,

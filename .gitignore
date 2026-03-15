@@ -8,3 +8,8 @@ engine/**/__pycache__/
 .env
 *.pyc
 .setup-complete
+# ML artifacts (regenerated at runtime)
+engine/ml/data/
+engine/ml/models/*.json
+engine/ml/results.tsv
+engine/ml/run.log

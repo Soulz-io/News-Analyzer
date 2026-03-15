@@ -120,6 +120,65 @@ OSINT_ACCOUNTS: Dict[str, Dict[str, Any]] = {
         "credibility": 0.68,
     },
 
+    "NoLimitGains": {
+        "name": "NoLimit",
+        "region": "global",
+        "category": "macro_finance",
+        "priority": 2,
+        "credibility": 0.68,
+    },
+    "QuiverQuant": {
+        "name": "Quiver Quantitative",
+        "region": "north-america",
+        "category": "insider_trading",
+        "priority": 1,
+        "credibility": 0.82,
+    },
+    "unusual_whales": {
+        "name": "Unusual Whales",
+        "region": "north-america",
+        "category": "options_flow",
+        "priority": 1,
+        "credibility": 0.78,
+    },
+    "DeItaone": {
+        "name": "Walter Bloomberg",
+        "region": "global",
+        "category": "breaking_market",
+        "priority": 1,
+        "credibility": 0.85,
+    },
+    "BNONews": {
+        "name": "BNO News",
+        "region": "global",
+        "category": "breaking_news",
+        "priority": 1,
+        "credibility": 0.80,
+    },
+
+    # === Tier 2: Finance + Macro (every 2nd cycle) ==========================
+    "FirstSquawk": {
+        "name": "First Squawk",
+        "region": "global",
+        "category": "breaking_market",
+        "priority": 2,
+        "credibility": 0.76,
+    },
+    "Fxhedgers": {
+        "name": "Fxhedgers",
+        "region": "global",
+        "category": "macro_finance",
+        "priority": 2,
+        "credibility": 0.68,
+    },
+    "Insider_Trades": {
+        "name": "Insider Trade Alerts",
+        "region": "north-america",
+        "category": "insider_trading",
+        "priority": 2,
+        "credibility": 0.75,
+    },
+
     # === Tier 3: Geopolitical Journalists (every 3rd cycle) ================
     "ggreenwald": {
         "name": "Glenn Greenwald",
@@ -232,9 +291,12 @@ class TwitterFetcher:
     """
 
     def __init__(self):
+        # Try env vars first, then fall back to config (DB settings)
+        from .config import config as _cfg
         self.bearer_token: str = (
             os.getenv("X_BEARER_TOKEN")
             or os.getenv("TWITTER_BEARER_TOKEN")
+            or _cfg.twitter_bearer_token
             or ""
         )
         self._client = None
