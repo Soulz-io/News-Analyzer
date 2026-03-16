@@ -12,6 +12,8 @@ The output is stored as DecisionNode + Consequence records in the DB.
 
 import json
 import logging
+import re
+import time as _time
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
@@ -34,6 +36,18 @@ from .db import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_text_for_prompt(text: str, max_len: int = 200) -> str:
+    """Strip potential prompt injection patterns from user-controlled text."""
+    if not text:
+        return ""
+    # Remove markdown code fences and common injection patterns
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'(?i)(ignore|disregard|forget)\s+(all\s+)?(previous\s+)?instructions?', '[REDACTED]', text)
+    text = re.sub(r'(?i)system\s*:', '[SYS]', text)
+    return text[:max_len].strip()
+
 
 # ---------------------------------------------------------------------------
 # Pricing table (EUR per 1M tokens)  — updated March 2025
@@ -207,8 +221,8 @@ def _briefs_to_summary(briefs: List[ArticleBrief]) -> str:
     for i, b in enumerate(briefs, 1):
         title = ""
         if b.article:
-            title = (b.article.title or "")[:100]
-        summary = (b.summary or "")[:150]
+            title = _sanitize_text_for_prompt((b.article.title or ""), max_len=100)
+        summary = _sanitize_text_for_prompt((b.summary or ""), max_len=150)
         sentiment = b.sentiment or 0.0
         intensity = b.intensity or "unknown"
         try:
@@ -409,13 +423,26 @@ def _call_claude(
 
     try:
         client = anthropic.Anthropic(api_key=config.anthropic_api_key)
-        response = client.messages.create(
-            model=model,
-            max_tokens=6000,
-            temperature=0.3,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
+
+        # Retry loop for transient API failures
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=6000,
+                    temperature=0.3,
+                    system=SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+                break  # Success
+            except Exception as api_err:
+                if attempt < max_retries:
+                    wait_seconds = 2 ** (attempt + 1)
+                    logger.warning("Claude API attempt %d failed, retrying in %ds: %s", attempt + 1, wait_seconds, api_err)
+                    _time.sleep(wait_seconds)
+                else:
+                    raise
 
         # Log token usage
         usage = response.usage
@@ -430,14 +457,10 @@ def _call_claude(
         # Extract text from response
         text = response.content[0].text.strip()
 
-        # Handle potential markdown code fences
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            if text.endswith("```"):
-                text = text[:-3].strip()
-        # Strip residual language tag (e.g., "json\n{...}")
-        if text.startswith("json"):
-            text = text[4:].strip()
+        # Robust markdown fence extraction
+        fence_match = re.search(r'```(?:json|JSON)?\s*\n?(.*?)```', text, re.DOTALL)
+        if fence_match:
+            text = fence_match.group(1).strip()
 
         tree_data = json.loads(text)
         logger.info(
@@ -906,19 +929,35 @@ def _call_claude_child(
 
     user_prompt = CHILD_TREE_USER_TEMPLATE.format(**prompt_context)
 
+    # Use the same model selection logic as root trees
+    model = _select_model_for_tree(prompt_context={"score": prompt_context.get("score", 0), "article_count": prompt_context.get("article_count", 0)}) if prompt_context else config.tree_generator_model
+
     try:
         client = anthropic.Anthropic(api_key=config.anthropic_api_key)
-        response = client.messages.create(
-            model=config.tree_generator_model,
-            max_tokens=12000,
-            temperature=0.3,
-            system=CHILD_TREE_SYSTEM,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
+
+        # Retry loop for transient API failures
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=12000,
+                    temperature=0.3,
+                    system=CHILD_TREE_SYSTEM,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+                break  # Success
+            except Exception as api_err:
+                if attempt < max_retries:
+                    wait_seconds = 2 ** (attempt + 1)
+                    logger.warning("Claude API attempt %d failed, retrying in %ds: %s", attempt + 1, wait_seconds, api_err)
+                    _time.sleep(wait_seconds)
+                else:
+                    raise
 
         usage = response.usage
         _log_usage(
-            model=config.tree_generator_model,
+            model=model,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             purpose="child_tree_generation",
@@ -927,18 +966,15 @@ def _call_claude_child(
 
         text = response.content[0].text.strip()
 
-        # Handle potential markdown code fences
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            if text.endswith("```"):
-                text = text[:-3].strip()
-        # Strip residual language tag (e.g., "json\n{...}")
-        if text.startswith("json"):
-            text = text[4:].strip()
+        # Robust markdown fence extraction
+        fence_match = re.search(r'```(?:json|JSON)?\s*\n?(.*?)```', text, re.DOTALL)
+        if fence_match:
+            text = fence_match.group(1).strip()
 
         tree_data = json.loads(text)
         logger.info(
-            "Claude generated child tree: question=%r, yes_prob=%.2f",
+            "Claude (%s) generated child tree: question=%r, yes_prob=%.2f",
+            model.split("-")[1] if "-" in model else model,
             tree_data.get("question", "?")[:80],
             tree_data.get("yes_probability", 0.5),
         )

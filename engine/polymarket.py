@@ -21,6 +21,7 @@ from .db import (
     get_session,
     RunUp,
     DecisionNode,
+    Consequence,
     PolymarketMatch,
     PolymarketPriceHistory,
 )
@@ -454,6 +455,8 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
     # --- YES branch: market strongly says YES ---
     yes_matches = (
         session.query(PolymarketMatch)
+        .join(RunUp, PolymarketMatch.run_up_id == RunUp.id)
+        .filter(RunUp.status == "active")
         .filter(PolymarketMatch.outcome_yes_price >= 0.97)
         .filter(PolymarketMatch.decision_node_id.isnot(None))
         .all()
@@ -476,6 +479,16 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
         )
         confirmed_count += 1
         newly_confirmed_ids.append(node.id)
+        # Score consequences: winning branch → tracking, losing branch → denied
+        winning_branch = "yes" if node.status == "confirmed_yes" else "no"
+        for cons in node.consequences:
+            if cons.status not in ("predicted", "tracking"):
+                continue
+            if cons.branch == winning_branch:
+                cons.status = "tracking"
+            else:
+                cons.status = "denied"
+                cons.confirmed_at = datetime.utcnow()
         logger.info(
             "Auto-confirmed YES: node %d (question=%r) — Polymarket at %.0f%%",
             node.id, node.question[:80], match.outcome_yes_price * 100,
@@ -484,6 +497,8 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
     # --- NO branch: market strongly says NO ---
     no_matches = (
         session.query(PolymarketMatch)
+        .join(RunUp, PolymarketMatch.run_up_id == RunUp.id)
+        .filter(RunUp.status == "active")
         .filter(PolymarketMatch.outcome_yes_price <= 0.03)
         .filter(PolymarketMatch.decision_node_id.isnot(None))
         .all()
@@ -506,6 +521,16 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
         )
         confirmed_count += 1
         newly_confirmed_ids.append(node.id)
+        # Score consequences: winning branch → tracking, losing branch → denied
+        winning_branch = "yes" if node.status == "confirmed_yes" else "no"
+        for cons in node.consequences:
+            if cons.status not in ("predicted", "tracking"):
+                continue
+            if cons.branch == winning_branch:
+                cons.status = "tracking"
+            else:
+                cons.status = "denied"
+                cons.confirmed_at = datetime.utcnow()
         logger.info(
             "Auto-confirmed NO: node %d (question=%r) — Polymarket NO at %.0f%%",
             node.id, node.question[:80], match.outcome_no_price * 100,
@@ -605,10 +630,16 @@ def create_manual_polymarket_match(
         yes_price = None
         volume = None
 
+        outcome_prices = market.get("outcomePrices", [])
         try:
-            yes_price = float(market.get("outcomePrices", "[0.5]").strip("[]").split(",")[0])
-        except (ValueError, IndexError):
+            if isinstance(outcome_prices, str):
+                import json as _json
+                outcome_prices = _json.loads(outcome_prices)
+            yes_price = float(outcome_prices[0]) if outcome_prices else 0.5
+            no_price = round(1.0 - yes_price, 4)
+        except (ValueError, IndexError, TypeError):
             yes_price = 0.5
+            no_price = 0.5
 
         try:
             volume = float(market.get("volume", 0))
@@ -634,6 +665,7 @@ def create_manual_polymarket_match(
 
         if existing:
             existing.outcome_yes_price = yes_price
+            existing.outcome_no_price = no_price
             existing.volume = volume
             existing.match_score = 100.0
             existing.match_method = "manual"
@@ -649,6 +681,7 @@ def create_manual_polymarket_match(
                 polymarket_question=question,
                 polymarket_url=polymarket_url,
                 outcome_yes_price=yes_price,
+                outcome_no_price=no_price,
                 volume=volume,
                 match_score=100.0,
                 match_method="manual",

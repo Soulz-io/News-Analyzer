@@ -1386,6 +1386,11 @@ def dashboard_tree(run_up_id: int, db: Session = Depends(_get_db)):
         tree_verdicts = []
     tree_verdict_by_node = {sv.decision_node_id: sv for sv in tree_verdicts}
 
+    # Precompute children mapping from already-loaded nodes to avoid N+1 lazy-loads
+    children_by_parent = {}
+    for n in nodes:
+        children_by_parent.setdefault(n.parent_node_id, []).append(n.id)
+
     tree_nodes = []
     for n in nodes:
         consequences = tree_cons_by_node.get(n.id, [])
@@ -1433,7 +1438,7 @@ def dashboard_tree(run_up_id: int, db: Session = Depends(_get_db)):
         tree_nodes.append({
             **_node_to_dict(n),
             "consequences": cons_dicts,
-            "children_ids": [ch.id for ch in n.children] if n.children else [],
+            "children_ids": children_by_parent.get(n.id, []),
             "swarm_verdict": swarm_data,
         })
 
@@ -1547,7 +1552,7 @@ def get_status(db: Session = Depends(_get_db)):
         "status": "ok" if db_ok else "degraded",
         "engine": "running" if db_ok else "stopped",
         "engine_port": config.engine_port,
-        "database": config.database_uri,
+        "database": "connected",
         "feeds_configured": len(config.feeds),
         "feeds": len(config.feeds),
         "total_articles": article_count,
@@ -1624,7 +1629,7 @@ def trigger_analysis():
         return {"status": "ok", "report_id": report.id}
     except Exception as e:
         logger.exception("Manual analysis trigger failed.")
-        raise HTTPException(500, detail=str(e))
+        raise HTTPException(500, detail="Analysis failed. Check engine logs.")
 
 
 @router.post("/predictions/score")
@@ -1636,7 +1641,7 @@ def trigger_prediction_scoring():
         return {"status": "ok", "resolved": count}
     except Exception as e:
         logger.exception("Manual prediction scoring failed.")
-        raise HTTPException(500, detail=str(e))
+        raise HTTPException(500, detail="Prediction scoring failed. Check engine logs.")
 
 
 # ===========================================================================
@@ -1789,42 +1794,36 @@ async def trigger_swarm_cycle():
 
 
 @router.get("/swarm/status")
-def get_swarm_status():
+def get_swarm_status(db: Session = Depends(_get_db)):
     """Get swarm consensus status (enabled, stats, etc)."""
-    from .db import SwarmVerdict
+    total = db.query(SwarmVerdict).count()
+    active = (
+        db.query(SwarmVerdict)
+        .filter(SwarmVerdict.superseded_at.is_(None))
+        .count()
+    )
 
-    db = get_session()
-    try:
-        total = db.query(SwarmVerdict).count()
-        active = (
-            db.query(SwarmVerdict)
+    # Count verdicts by type
+    verdicts_by_type = {}
+    if active > 0:
+        rows = (
+            db.query(SwarmVerdict.verdict, func.count())
             .filter(SwarmVerdict.superseded_at.is_(None))
-            .count()
+            .group_by(SwarmVerdict.verdict)
+            .all()
         )
+        verdicts_by_type = {v: c for v, c in rows}
 
-        # Count verdicts by type
-        verdicts_by_type = {}
-        if active > 0:
-            rows = (
-                db.query(SwarmVerdict.verdict, func.count())
-                .filter(SwarmVerdict.superseded_at.is_(None))
-                .group_by(SwarmVerdict.verdict)
-                .all()
-            )
-            verdicts_by_type = {v: c for v, c in rows}
-
-        return {
-            "enabled": config.swarm_enabled,
-            "groq_model": config.groq_model,
-            "groq_configured": bool(config.groq_api_key),
-            "openrouter_configured": bool(config.openrouter_api_key),
-            "interval_minutes": config.swarm_interval_minutes,
-            "total_verdicts": total,
-            "active_verdicts": active,
-            "verdicts_by_type": verdicts_by_type,
-        }
-    finally:
-        db.close()
+    return {
+        "enabled": config.swarm_enabled,
+        "groq_model": config.groq_model,
+        "groq_configured": bool(config.groq_api_key),
+        "openrouter_configured": bool(config.openrouter_api_key),
+        "interval_minutes": config.swarm_interval_minutes,
+        "total_verdicts": total,
+        "active_verdicts": active,
+        "verdicts_by_type": verdicts_by_type,
+    }
 
 
 @router.put("/swarm/config")
@@ -1901,6 +1900,8 @@ def dashboard_opportunities(
     Computes edge = (our_prob - market_prob) for each run-up that has
     a PolymarketMatch, filters by |edge| >= min_edge.
     """
+    from sqlalchemy import and_
+
     # All run-ups that have decision nodes (active first, then expired)
     active_runups = (
         db.query(RunUp)
@@ -1912,14 +1913,70 @@ def dashboard_opportunities(
         .all()
     )
 
+    all_ru_ids = [ru.id for ru in active_runups]
+    if not all_ru_ids:
+        return []
+
+    # Batch: root decision nodes (depth==0)
+    root_nodes_rows = (
+        db.query(DecisionNode)
+        .filter(DecisionNode.run_up_id.in_(all_ru_ids), DecisionNode.depth == 0)
+        .all()
+    )
+    root_by_runup = {n.run_up_id: n for n in root_nodes_rows}
+
+    # Batch: best PolymarketMatch per run-up (highest match_score)
+    pm_subq = (
+        db.query(
+            PolymarketMatch.run_up_id,
+            func.max(PolymarketMatch.match_score).label("max_score"),
+        )
+        .filter(PolymarketMatch.run_up_id.in_(all_ru_ids))
+        .group_by(PolymarketMatch.run_up_id)
+        .subquery()
+    )
+    best_pm_rows = (
+        db.query(PolymarketMatch)
+        .join(
+            pm_subq,
+            and_(
+                PolymarketMatch.run_up_id == pm_subq.c.run_up_id,
+                PolymarketMatch.match_score == pm_subq.c.max_score,
+            ),
+        )
+        .all()
+    )
+    best_pm_by_runup = {pm.run_up_id: pm for pm in best_pm_rows}
+
+    # Batch: latest swarm verdicts per run-up (reuse dashboard_overview pattern)
+    sv_subq = (
+        db.query(
+            SwarmVerdict.run_up_id,
+            func.max(SwarmVerdict.created_at).label("max_created"),
+        )
+        .filter(
+            SwarmVerdict.run_up_id.in_(all_ru_ids),
+            SwarmVerdict.superseded_at.is_(None),
+        )
+        .group_by(SwarmVerdict.run_up_id)
+        .subquery()
+    )
+    latest_verdicts = (
+        db.query(SwarmVerdict)
+        .join(
+            sv_subq,
+            and_(
+                SwarmVerdict.run_up_id == sv_subq.c.run_up_id,
+                SwarmVerdict.created_at == sv_subq.c.max_created,
+            ),
+        )
+        .all()
+    )
+    verdict_by_runup = {sv.run_up_id: sv for sv in latest_verdicts}
+
     opportunities = []
     for ru in active_runups:
-        # Get root node
-        root_node = (
-            db.query(DecisionNode)
-            .filter(DecisionNode.run_up_id == ru.id, DecisionNode.depth == 0)
-            .first()
-        )
+        root_node = root_by_runup.get(ru.id)
         if not root_node:
             continue
 
@@ -1929,13 +1986,7 @@ def dashboard_opportunities(
 
         our_prob = round((root_node.yes_probability or 0.5) * 100, 1)
 
-        # Best Polymarket match
-        best_pm = (
-            db.query(PolymarketMatch)
-            .filter(PolymarketMatch.run_up_id == ru.id)
-            .order_by(PolymarketMatch.match_score.desc())
-            .first()
-        )
+        best_pm = best_pm_by_runup.get(ru.id)
         if not best_pm or best_pm.outcome_yes_price is None:
             continue
 
@@ -1945,18 +1996,10 @@ def dashboard_opportunities(
         if abs(edge) < min_edge:
             continue
 
-        # Latest swarm verdict for root node (skip failed evaluations)
-        sv = (
-            db.query(SwarmVerdict)
-            .filter(
-                SwarmVerdict.decision_node_id == root_node.id,
-                SwarmVerdict.superseded_at.is_(None),
-                SwarmVerdict.confidence > 0,
-            )
-            .order_by(SwarmVerdict.created_at.desc())
-            .first()
-        )
-        # Also skip verdicts whose entry_reasoning indicates synthesis failure
+        # Latest swarm verdict (skip failed evaluations)
+        sv = verdict_by_runup.get(ru.id)
+        if sv and sv.confidence <= 0:
+            sv = None
         if sv and sv.entry_reasoning and "Synthesis failed" in sv.entry_reasoning:
             sv = None
 
@@ -2313,7 +2356,7 @@ def advisory_generate():
         }
     except Exception as e:
         logger.exception("Manual advisory generation failed.")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Advisory generation failed. Check engine logs.")
 
 
 # ── Portfolio Holdings ──────────────────────────────────────────────────
@@ -2662,34 +2705,30 @@ def ml_status():
     except ImportError:
         return {"status": "not_installed", "message": "ML module not available."}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        logger.exception("ML status check failed.")
+        return {"status": "error", "message": "ML status check failed."}
 
 
 @router.get("/ml/predictions")
-def ml_predictions():
+def ml_predictions(db: Session = Depends(_get_db)):
     """Get ML predictions for all active run-ups."""
     try:
         from .ml.inference import predict_signal
-        session = get_session()
-        try:
-            from .db import RunUp
-            active = session.query(RunUp).filter(
-                RunUp.status == "active",
-                RunUp.merged_into_id.is_(None),
-            ).all()
+        active = db.query(RunUp).filter(
+            RunUp.status == "active",
+            RunUp.merged_into_id.is_(None),
+        ).all()
 
-            predictions = []
-            for ru in active:
-                score = predict_signal(ru.id)
-                predictions.append({
-                    "run_up_id": ru.id,
-                    "narrative_name": ru.narrative_name,
-                    "ml_score": round(score, 4),
-                    "signal": "bullish" if score > 0.6 else "bearish" if score < 0.4 else "neutral",
-                })
-            return {"predictions": predictions, "count": len(predictions)}
-        finally:
-            session.close()
+        predictions = []
+        for ru in active:
+            score = predict_signal(ru.id)
+            predictions.append({
+                "run_up_id": ru.id,
+                "narrative_name": ru.narrative_name,
+                "ml_score": round(score, 4),
+                "signal": "bullish" if score > 0.6 else "bearish" if score < 0.4 else "neutral",
+            })
+        return {"predictions": predictions, "count": len(predictions)}
     except ImportError:
         return {"predictions": [], "count": 0, "message": "ML module not available."}
 
@@ -2715,7 +2754,8 @@ def ml_retrain():
             }
         return {"success": False, "message": "Training produced no model."}
     except Exception as e:
-        return {"success": False, "message": str(e)}
+        logger.exception("ML retrain failed.")
+        return {"success": False, "message": "ML retrain failed. Check engine logs."}
 
 
 @router.get("/ml/experiments")

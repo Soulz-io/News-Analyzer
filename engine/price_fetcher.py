@@ -31,6 +31,8 @@ class PriceFetcher:
     OPTIONS_TTL = 900       # 15 minutes
     ECONOMIC_TTL = 3600     # 1 hour
 
+    MAX_CACHE_SIZE = 200  # Max entries per cache dict
+
     def __init__(self) -> None:
         import threading
         self._lock = threading.Lock()
@@ -40,6 +42,23 @@ class PriceFetcher:
         self._fg_cache: Optional[Tuple[float, Dict]] = None
         self._options_cache: Dict[str, Tuple[float, Dict]] = {}
         self._econ_cache: Optional[Tuple[float, Dict]] = None
+        self._commodity_ext_cache: Optional[Tuple[float, Dict]] = None
+        self._sector_cache_data: Optional[Tuple[float, Dict]] = None
+
+    # ------------------------------------------------------------------
+    # Cache eviction
+    # ------------------------------------------------------------------
+    def _evict_stale(self, cache: dict, ttl: float) -> None:
+        """Remove expired entries from a cache dict. Must be called with self._lock held."""
+        now = time.time()
+        expired = [k for k, (ts, _) in cache.items() if now - ts >= ttl]
+        for k in expired:
+            del cache[k]
+        # If still over limit, remove oldest entries
+        if len(cache) > self.MAX_CACHE_SIZE:
+            sorted_keys = sorted(cache.keys(), key=lambda k: cache[k][0])
+            for k in sorted_keys[:len(cache) - self.MAX_CACHE_SIZE]:
+                del cache[k]
 
     # ------------------------------------------------------------------
     # Quote (single ticker)
@@ -103,6 +122,7 @@ class PriceFetcher:
                 "name": name,
             }
             with self._lock:
+                self._evict_stale(self._quote_cache, self.QUOTE_TTL)
                 self._quote_cache[ticker] = (now, result)
             return result
 
@@ -128,13 +148,14 @@ class PriceFetcher:
         cache_key = f"{ticker}:{period}"
         now = time.time()
 
-        # --- cache check ---
-        if cache_key in self._chart_cache:
-            ts, data = self._chart_cache[cache_key]
-            if now - ts < self.CHART_TTL:
-                logger.debug("Chart cache HIT for %s", cache_key)
-                return data
-            logger.debug("Chart cache EXPIRED for %s", cache_key)
+        # --- cache check (thread-safe) ---
+        with self._lock:
+            if cache_key in self._chart_cache:
+                ts, data = self._chart_cache[cache_key]
+                if now - ts < self.CHART_TTL:
+                    logger.debug("Chart cache HIT for %s", cache_key)
+                    return data
+                logger.debug("Chart cache EXPIRED for %s", cache_key)
 
         logger.info("Fetching chart data for %s (period=%s)", ticker, period)
         try:
@@ -159,7 +180,9 @@ class PriceFetcher:
                     }
                 )
 
-            self._chart_cache[cache_key] = (now, candles)
+            with self._lock:
+                self._evict_stale(self._chart_cache, self.CHART_TTL)
+                self._chart_cache[cache_key] = (now, candles)
             return candles
 
         except Exception as exc:
@@ -346,13 +369,14 @@ class PriceFetcher:
         """
         now = time.time()
 
-        # --- cache check ---
-        if self._indicator_cache is not None:
-            ts, data = self._indicator_cache
-            if now - ts < self.INDICATOR_TTL:
-                logger.debug("Indicator cache HIT")
-                return data
-            logger.debug("Indicator cache EXPIRED")
+        # --- cache check (thread-safe) ---
+        with self._lock:
+            if self._indicator_cache is not None:
+                ts, data = self._indicator_cache
+                if now - ts < self.INDICATOR_TTL:
+                    logger.debug("Indicator cache HIT")
+                    return data
+                logger.debug("Indicator cache EXPIRED")
 
         logger.info("Fetching combined market indicators")
 
@@ -409,7 +433,8 @@ class PriceFetcher:
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        self._indicator_cache = (now, result)
+        with self._lock:
+            self._indicator_cache = (now, result)
         return result
 
     # ------------------------------------------------------------------
@@ -422,10 +447,11 @@ class PriceFetcher:
         On failure: {"error": "..."}
         """
         now = time.time()
-        if self._fg_cache is not None:
-            ts, data = self._fg_cache
-            if now - ts < self.FEAR_GREED_TTL:
-                return data
+        with self._lock:
+            if self._fg_cache is not None:
+                ts, data = self._fg_cache
+                if now - ts < self.FEAR_GREED_TTL:
+                    return data
 
         try:
             import httpx
@@ -457,7 +483,8 @@ class PriceFetcher:
                 "label": rating,
                 "previous_close": previous,
             }
-            self._fg_cache = (now, result)
+            with self._lock:
+                self._fg_cache = (now, result)
             return result
         except Exception as exc:
             logger.debug("Fear & Greed fetch failed: %s", exc)
@@ -476,10 +503,11 @@ class PriceFetcher:
         cache_key = f"opts:{ticker}"
         now = time.time()
 
-        if cache_key in self._options_cache:
-            ts, data = self._options_cache[cache_key]
-            if now - ts < self.OPTIONS_TTL:
-                return data
+        with self._lock:
+            if cache_key in self._options_cache:
+                ts, data = self._options_cache[cache_key]
+                if now - ts < self.OPTIONS_TTL:
+                    return data
 
         try:
             import yfinance as yf
@@ -517,7 +545,9 @@ class PriceFetcher:
                 "near_expiry": nearest,
             }
 
-            self._options_cache[cache_key] = (now, result)
+            with self._lock:
+                self._evict_stale(self._options_cache, self.OPTIONS_TTL)
+                self._options_cache[cache_key] = (now, result)
             return result
 
         except Exception as exc:
@@ -589,7 +619,7 @@ class PriceFetcher:
         """
         now = time.time()
         cache_key = "_commodities_ext"
-        if hasattr(self, "_commodity_ext_cache") and self._commodity_ext_cache is not None:
+        if self._commodity_ext_cache is not None:
             ts, data = self._commodity_ext_cache
             if now - ts < self.COMMODITY_EXT_TTL:
                 return data
@@ -635,7 +665,7 @@ class PriceFetcher:
             }
         """
         now = time.time()
-        if hasattr(self, "_sector_cache_data") and self._sector_cache_data is not None:
+        if self._sector_cache_data is not None:
             ts, data = self._sector_cache_data
             if now - ts < self.SECTOR_TTL:
                 return data

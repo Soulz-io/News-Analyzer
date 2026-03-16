@@ -258,6 +258,8 @@ class RSSFetcher:
                     continue
 
             final.append(art)
+            recent_titles.add(title_lower)
+            recent_titles_list.append(title_lower)
 
         logger.info(
             "Title dedup: %d -> %d articles",

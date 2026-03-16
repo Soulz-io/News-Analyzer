@@ -55,27 +55,27 @@ async def fetch_and_process() -> None:
 
         logger.info("Fetched %d new articles.", len(new_articles))
 
-        # --- 2. NLP pipeline ---
+        # --- 2. NLP pipeline (CPU-heavy: run in thread to avoid blocking event loop) ---
         from .nlp_pipeline import process_batch
 
-        briefs = process_batch(new_articles)
+        briefs = await asyncio.to_thread(process_batch, new_articles)
         logger.info("Produced %d article briefs.", len(briefs))
 
         if not briefs:
             return
 
-        # --- 3. Narrative tracking ---
+        # --- 3. Narrative tracking (DB-heavy: run in thread) ---
         from .narrative_tracker import update_narratives, detect_runups
 
-        updated_timelines = update_narratives(briefs)
+        updated_timelines = await asyncio.to_thread(update_narratives, briefs)
         changed_names = [t.narrative_name for t in updated_timelines]
-        runups = detect_runups(changed_narratives=changed_names)
+        runups = await asyncio.to_thread(detect_runups, changed_narratives=changed_names)
         logger.info("Active run-ups after detection: %d", len(runups))
 
-        # --- 4. Probability updates ---
+        # --- 4. Probability updates (DB-heavy: run in thread) ---
         from .probability_engine import update_probabilities
 
-        updates = update_probabilities(briefs)
+        updates = await asyncio.to_thread(update_probabilities, briefs)
         logger.info("Probability updates recorded: %d", len(updates))
 
     except Exception:
@@ -89,7 +89,7 @@ async def prediction_scoring() -> None:
     logger.info("=== prediction_scoring cycle START ===")
     try:
         from .prediction_scorer import score_predictions
-        count = score_predictions()
+        count = await asyncio.to_thread(score_predictions)
         logger.info("Prediction scoring: %d resolved.", count)
     except Exception:
         logger.exception("prediction_scoring cycle FAILED.")
@@ -102,7 +102,7 @@ async def deep_analysis_job() -> None:
     logger.info("=== deep_analysis cycle START ===")
     try:
         from .deep_analysis import run_deep_analysis
-        report = run_deep_analysis(period_days=7)
+        report = await asyncio.to_thread(run_deep_analysis, period_days=7)
         if report:
             logger.info("Deep analysis complete: report %d created.", report.id)
         else:
@@ -338,7 +338,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     yield
 
     # --- Shutdown ---
-    scheduler.shutdown(wait=False)
+    scheduler.shutdown(wait=True)
     logger.info("Scheduler shut down.")
 
 
@@ -347,7 +347,7 @@ async def polymarket_refresh() -> None:
     logger.info("=== polymarket_refresh cycle START ===")
     try:
         from .polymarket import update_polymarket_matches
-        count = update_polymarket_matches()
+        count = await asyncio.to_thread(update_polymarket_matches)
         logger.info("Polymarket refresh: %d matches updated.", count)
     except Exception:
         logger.exception("polymarket_refresh cycle FAILED.")
@@ -489,6 +489,9 @@ async def proximity_update() -> None:
             if updated:
                 session.commit()
                 logger.info("Proximity: updated %d consequences.", updated)
+        except Exception:
+            session.rollback()
+            raise
         finally:
             session.close()
 
@@ -648,7 +651,7 @@ async def confidence_scoring() -> None:
     try:
         from .confidence_scorer import update_trading_signals
 
-        signals = update_trading_signals()
+        signals = await asyncio.to_thread(update_trading_signals)
         buy_plus = sum(1 for s in signals if s.signal_level in ("BUY", "STRONG_BUY"))
         logger.info(
             "Confidence scoring: %d signals (%d BUY+).", len(signals), buy_plus

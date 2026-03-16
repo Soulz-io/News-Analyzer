@@ -222,7 +222,15 @@ def update_narratives(briefs: List[ArticleBrief]) -> List[NarrativeTimeline]:
     try:
         for narrative_name, cluster_id, cluster_briefs in work_items:
             article_count = len(cluster_briefs)
-            sources = {b.article.source for b in cluster_briefs if b.article}
+            # Safely extract sources — briefs may be detached from their original session
+            sources = set()
+            for b in cluster_briefs:
+                try:
+                    if b.article:
+                        sources.add(b.article.source)
+                except Exception:
+                    # Brief is detached from session; skip
+                    pass
             regions = {b.region for b in cluster_briefs}
             avg_sentiment = (
                 sum(b.sentiment for b in cluster_briefs) / article_count
@@ -257,7 +265,7 @@ def update_narratives(briefs: List[ArticleBrief]) -> List[NarrativeTimeline]:
                     existing.avg_sentiment = (existing.avg_sentiment * old_n + avg_sentiment * new_n) / total_n
                     existing.intensity_score = (existing.intensity_score * old_n + avg_intensity * new_n) / total_n
                 existing.article_count = total_n
-                existing.sources_count = max(existing.sources_count, len(sources))
+                existing.sources_count = existing.sources_count + len(sources)  # Accumulate (upper bound of distinct sources)
                 existing.unique_regions = max(existing.unique_regions, len(regions))
                 existing.topic_cluster_id = cluster_id
                 row = existing

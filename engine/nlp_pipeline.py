@@ -14,6 +14,7 @@ For each fetched Article the pipeline produces an ArticleBrief containing:
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Any
 
@@ -427,7 +428,7 @@ def classify_intensity(sentiment: float, text: str) -> str:
       - low:         everything else
     """
     text_lower = text.lower()
-    threat_count = sum(1 for kw in THREAT_KEYWORDS if kw in text_lower)
+    threat_count = sum(1 for kw in THREAT_KEYWORDS if re.search(r'\b' + re.escape(kw) + r'\b', text_lower))
 
     if sentiment < -0.7 and threat_count >= 3:
         return "critical"
@@ -453,9 +454,9 @@ def score_urgency(text: str, source: str = "") -> float:
     text_lower = text.lower()
 
     # Urgency keyword count
-    urgency_hits = sum(1 for kw in URGENCY_HIGH if kw in text_lower)
-    action_hits = sum(1 for kw in URGENCY_ACTION if kw in text_lower)
-    planning_hits = sum(1 for kw in URGENCY_PLANNING if kw in text_lower)
+    urgency_hits = sum(1 for kw in URGENCY_HIGH if re.search(r'\b' + re.escape(kw) + r'\b', text_lower))
+    action_hits = sum(1 for kw in URGENCY_ACTION if re.search(r'\b' + re.escape(kw) + r'\b', text_lower))
+    planning_hits = sum(1 for kw in URGENCY_PLANNING if re.search(r'\b' + re.escape(kw) + r'\b', text_lower))
 
     # Base score from keywords
     score = min(urgency_hits * 0.25 + action_hits * 0.15, 0.7)
@@ -481,7 +482,7 @@ def classify_event_type(text: str) -> str:
     text_lower = text.lower()
     type_scores = {}
     for event_type, keywords in EVENT_TYPES.items():
-        hits = sum(1 for kw in keywords if kw in text_lower)
+        hits = sum(1 for kw in keywords if re.search(r'\b' + re.escape(kw) + r'\b', text_lower))
         if hits > 0:
             type_scores[event_type] = hits
 
@@ -703,7 +704,12 @@ def process_batch(articles: List[Article]) -> List[ArticleBrief]:
         try:
             topic_model = _get_topic_model()
             if topic_model is not None:
-                topics, _probs = topic_model.fit_transform(texts_for_clustering)
+                try:
+                    # Try to use existing fitted model for consistent cluster IDs
+                    topics, _probs = topic_model.transform(texts_for_clustering)
+                except Exception:
+                    # First batch or model not fitted yet — do initial fit
+                    topics, _probs = topic_model.fit_transform(texts_for_clustering)
                 for idx, brief in enumerate(briefs):
                     brief.topic_cluster_id = int(topics[idx]) if topics[idx] != -1 else None
                 logger.info(

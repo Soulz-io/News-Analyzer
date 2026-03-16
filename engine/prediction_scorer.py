@@ -122,8 +122,12 @@ def score_predictions() -> int:
             was_yes = node.status == "confirmed_yes"
             # We predicted correctly if our yes_probability > 0.5 and outcome was yes,
             # or yes_probability <= 0.5 and outcome was no
+            # Skip neutral predictions (no meaningful signal)
+            if abs((node.yes_probability or 0.5) - 0.5) < 0.01:
+                total_resolved -= 1  # Don't count neutral predictions
+                continue
             if (node.yes_probability > 0.5 and was_yes) or (
-                node.yes_probability <= 0.5 and not was_yes
+                node.yes_probability < 0.5 and not was_yes
             ):
                 correct += 1
 

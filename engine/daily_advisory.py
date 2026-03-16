@@ -313,7 +313,10 @@ def _compute_composite_score(
     m = momentum_data.get(candidate["ticker"], {})
     sma = m.get("sma_signal", "neutral")
     vol = m.get("volume_trend", "normal")
-    mom = {"bullish": 0.8, "neutral": 0.5, "bearish": 0.2}.get(sma, 0.5)
+    if direction == "bearish":
+        mom = {"bullish": 0.2, "neutral": 0.5, "bearish": 0.8}.get(sma, 0.5)
+    else:
+        mom = {"bullish": 0.8, "neutral": 0.5, "bearish": 0.2}.get(sma, 0.5)
     if vol == "above":
         mom = min(1.0, mom + 0.2)
 
@@ -769,7 +772,7 @@ Today is {datetime.now().strftime('%A %d %B %Y')}.
 Overall stance: {stance}
 Fear & Greed Index: {fg.get('score', '?')} ({fg.get('label', '?')})
 VIX: {vix.get('price', '?')} ({vix.get('change_pct', '?')}% change)
-Oil (Brent): ${oil.get('price', '?')} ({oil.get('change_pct', '?')}% change)
+Oil (WTI): ${oil.get('price', '?')} ({oil.get('change_pct', '?')}% change)
 {deep_ctx}{divergence_ctx}
 === BUY CANDIDATES ===
 {buy_summary or '(none)'}
@@ -1781,7 +1784,7 @@ def evaluate_open_advisories() -> Dict[str, Any]:
                             target_date = target_dt.date()
                             target_candle = None
                             for c in candles:
-                                c_date = datetime.fromisoformat(c["date"]).date() if isinstance(c["date"], str) else c["date"]
+                                c_date = datetime.fromisoformat(c["time"]).date() if isinstance(c["time"], str) else c["time"]
                                 if c_date >= target_date:
                                     target_candle = c
                                     break

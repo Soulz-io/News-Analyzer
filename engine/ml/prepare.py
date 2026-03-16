@@ -221,8 +221,7 @@ def _extract_swarm_features(conn) -> pd.DataFrame:
     """
     df = pd.read_sql_query(query, conn)
     # Encode verdict as numeric
-    verdict_map = {"strong_yes": 2, "yes": 1, "lean_yes": 0.5,
-                   "neutral": 0, "lean_no": -0.5, "no": -1, "strong_no": -2}
+    verdict_map = {"STRONG_BUY": 2, "BUY": 1, "HOLD": 0, "SELL": -1, "STRONG_SELL": -2}
     if not df.empty:
         df["swarm_verdict_encoded"] = df["swarm_verdict"].map(verdict_map).fillna(0)
         df["swarm_direction_encoded"] = df["swarm_direction"].map(
@@ -367,21 +366,15 @@ def _extract_labels(conn) -> pd.DataFrame:
                         row[f"profitable_{horizon_name}"] = 1 if adjusted_return > 0.5 else 0
                         has_price_labels = True
 
-        # Fallback: proxy labels from signal confidence + run-up score
+        # No price labels available — cannot create reliable proxy labels
+        # Mark as NaN so training drops these rows (avoids circular self-reinforcement)
         if not has_price_labels:
-            # Composite proxy: high confidence signals on strong run-ups
-            # are considered "profitable" as a training bootstrap
-            conf = row.get("signal_confidence", 0) or 0
-            score = row.get("runup_score", 0) or 0
-            bullish = row.get("bullish_ratio", 0.5) or 0.5
-
-            # Proxy: score > 50 AND confidence > 0.5 AND bullish_ratio > 0.5
-            proxy_signal = 1 if (score > 50 and conf > 0.5 and bullish > 0.5) else 0
-
             for h in ["1d", "3d", "7d"]:
-                row[f"profitable_{h}"] = proxy_signal
-                row[f"price_change_{h}"] = 0.0
-                row[f"adjusted_return_{h}"] = 0.0
+                row[f"profitable_{h}"] = float("nan")
+                row[f"price_change_{h}"] = float("nan")
+                row[f"adjusted_return_{h}"] = float("nan")
+            row["has_price_labels"] = False
+            logger.warning("No price snapshot data for labels; rows will be excluded from training.")
 
         rows.append(row)
 

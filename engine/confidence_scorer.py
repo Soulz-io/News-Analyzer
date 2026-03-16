@@ -28,7 +28,7 @@ from datetime import datetime, date, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from .db import (
     get_session,
@@ -577,19 +577,23 @@ def _calculate_ml_component(run_up: RunUp, session: Session) -> Dict[str, Any]:
     try:
         from .ml.inference import predict_signal, get_model_status
 
-        status = get_model_status()
-        score = predict_signal(run_up.id)
+        model_status = get_model_status()
+        ml_score = predict_signal(run_up.id)
+
+        # If ML model is not available, contribute nothing (truly neutral)
+        if model_status.get("status") != "active" or abs(ml_score - 0.5) < 0.001:
+            return {"score": 0.0, "model_status": model_status.get("status", "unavailable"), "raw_prediction": ml_score}
 
         return {
-            "score": round(score, 4),
-            "model_status": status.get("status", "unknown"),
-            "model_trained_at": status.get("trained_at"),
+            "score": round(ml_score, 4),
+            "model_status": model_status.get("status", "unknown"),
+            "model_trained_at": model_status.get("trained_at"),
         }
     except ImportError:
-        return {"score": 0.5, "model_status": "not_installed"}
+        return {"score": 0.0, "model_status": "not_installed"}
     except Exception:
         logger.exception("ML prediction failed for %s", run_up.narrative_name)
-        return {"score": 0.5, "model_status": "error"}
+        return {"score": 0.0, "model_status": "error"}
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +654,7 @@ def calculate_confidence(run_up: RunUp, session: Session) -> Dict[str, Any]:
         ml = _calculate_ml_component(run_up, session)
     except Exception:
         logger.exception("ML component failed for %s, defaulting to neutral", run_up.narrative_name)
-        ml = {"score": 0.5, "model_status": "error"}
+        ml = {"score": 0.0, "model_status": "error"}
 
     confidence = (
         W_RUNUP * runup_norm
@@ -698,7 +702,17 @@ def _find_primary_ticker(
         ticker_scores: Dict[str, float] = defaultdict(float)
         ticker_direction: Dict[str, float] = defaultdict(float)  # net direction weight
 
-        for node in run_up.decision_nodes:
+        # Batch-load all relationships to avoid N+1 queries
+        nodes = (
+            session.query(DecisionNode)
+            .options(
+                joinedload(DecisionNode.consequences).joinedload(Consequence.stock_impacts)
+            )
+            .filter(DecisionNode.run_up_id == run_up.id)
+            .all()
+        )
+
+        for node in nodes:
             if node.status != "open":
                 continue
 

@@ -194,6 +194,7 @@ class RunUp(Base):
     __tablename__ = "run_ups"
     __table_args__ = (
         Index("idx_runup_status", "status"),
+        Index("idx_runup_narrative", "narrative_name"),
     )
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
@@ -348,6 +349,10 @@ class StockImpact(Base):
     """A stock or ETF affected by a specific consequence."""
 
     __tablename__ = "stock_impacts"
+    __table_args__ = (
+        Index("idx_si_consequence", "consequence_id"),
+        Index("idx_si_ticker", "ticker"),
+    )
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
     consequence_id: int = Column(
@@ -448,6 +453,10 @@ class Prediction(Base):
     """A concrete prediction made by an agent against a run-up/node/consequence."""
 
     __tablename__ = "predictions"
+    __table_args__ = (
+        Index("idx_pred_runup", "run_up_id"),
+        Index("idx_pred_outcome", "outcome"),
+    )
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
     run_up_id: int = Column(Integer, ForeignKey("run_ups.id"), nullable=False)
@@ -712,35 +721,40 @@ class SwarmVerdict(Base):
 
 _engine = None
 _SessionLocal = None
+_factory_lock = __import__("threading").Lock()
 
 
 def _get_engine():
-    """Create or return the singleton SQLAlchemy engine."""
+    """Create or return the singleton SQLAlchemy engine (thread-safe)."""
     global _engine
     if _engine is None:
-        _engine = create_engine(
-            config.database_uri,
-            echo=False,
-            future=True,
-            connect_args={"check_same_thread": False},  # required for SQLite
-        )
-        # Enable WAL mode for better concurrent read performance with SQLite
-        @event.listens_for(_engine, "connect")
-        def _set_sqlite_pragma(dbapi_conn, connection_record):
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.close()
+        with _factory_lock:
+            if _engine is None:  # double-check after acquiring lock
+                _engine = create_engine(
+                    config.database_uri,
+                    echo=False,
+                    future=True,
+                    connect_args={"check_same_thread": False},  # required for SQLite
+                )
+                # Enable WAL mode for better concurrent read performance with SQLite
+                @event.listens_for(_engine, "connect")
+                def _set_sqlite_pragma(dbapi_conn, connection_record):
+                    cursor = dbapi_conn.cursor()
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                    cursor.execute("PRAGMA foreign_keys=ON")
+                    cursor.close()
 
-        logger.info("Database engine created: %s", config.database_uri)
+                logger.info("Database engine created: %s", config.database_uri)
     return _engine
 
 
 def get_session_factory():
-    """Return the session factory, creating it if necessary."""
+    """Return the session factory, creating it if necessary (thread-safe)."""
     global _SessionLocal
     if _SessionLocal is None:
-        _SessionLocal = sessionmaker(bind=_get_engine(), expire_on_commit=False)
+        with _factory_lock:
+            if _SessionLocal is None:  # double-check after acquiring lock
+                _SessionLocal = sessionmaker(bind=_get_engine(), expire_on_commit=False)
     return _SessionLocal
 
 
