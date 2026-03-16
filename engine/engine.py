@@ -15,8 +15,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import AsyncGenerator
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -885,6 +889,149 @@ app.add_middleware(
 
 # Include the API router (all routes are under /api)
 app.include_router(api_router)
+
+# ---------------------------------------------------------------------------
+# Standalone UI serving (when not behind OpenClaw gateway)
+# Translates gateway-style ?_api=X queries to internal engine routes, and
+# serves a bundled HTML dashboard at the root URL.
+# ---------------------------------------------------------------------------
+_UI_DIR = Path(__file__).resolve().parent.parent / "ui"
+
+# ── API dispatch map: _api value → (method, engine_path_template) ────
+# Mirrors the TypeScript http-handler.ts routing table.
+_API_DISPATCH: dict[str, str] = {
+    "overview": "/api/dashboard/overview",
+    "status": "/api/status",
+    "signals": "/api/signals",
+    "signals-history": "/api/signals/history",
+    "signals-refresh": "/api/signals/refresh",
+    "indicators": "/api/indicators",
+    "analysis": "/api/analysis/latest",
+    "analysis-run": "/api/analysis/run",
+    "advisory": "/api/advisory/latest",
+    "advisory-generate": "/api/advisory/generate",
+    "feeds": "/api/feeds",
+    "budget": "/api/budget",
+    "apikey": "/api/settings/api-key",
+    "swarm-status": "/api/swarm/status",
+    "swarm-cycle": "/api/swarm/run-cycle",
+    "polymarket-refresh": "/api/polymarket/refresh",
+    "prediction-score": "/api/predictions/score",
+    "telegram-status": "/api/telegram/status",
+    "telegram-configure": "/api/telegram/configure",
+    "telegram-test": "/api/telegram/test",
+    "telegram-send-advisory": "/api/telegram/send-advisory",
+    "portfolio-holdings": "/api/portfolio/holdings",
+    "portfolio-alignment": "/api/portfolio/alignment",
+    "focus": "/api/focus",
+    "focus-polymarket-link": "/api/focus/polymarket-link",
+    # ML endpoints (V2)
+    "ml-status": "/api/ml/status",
+    "ml-predictions": "/api/ml/predictions",
+    "ml-retrain": "/api/ml/retrain",
+    "ml-feature-importance": "/api/ml/feature-importance",
+}
+# Parameterised routes: _api value → (query_param, path_template)
+_API_PARAM_DISPATCH: dict[str, tuple[str, str]] = {
+    "tree": ("id", "/api/dashboard/tree/{val}"),
+    "polymarket": ("id", "/api/polymarket/{val}"),
+    "swarm-verdict": ("nodeId", "/api/swarm/verdict/{val}"),
+    "swarm-verdicts": ("runUpId", "/api/swarm/verdicts/{val}"),
+    "price": ("ticker", "/api/price/{val}"),
+    "price-chart": ("ticker", "/api/price/{val}/chart"),
+    "focus-regenerate-tree": ("id", "/api/focus/regenerate-tree/{val}"),
+}
+
+if _UI_DIR.is_dir():
+    from starlette.responses import HTMLResponse, RedirectResponse
+    from starlette.requests import Request as StarletteRequest
+    import re as _re
+
+    _ui_cache: dict = {"html": None, "mtime": 0.0}
+
+    def _build_bundle() -> str:
+        """Build a self-contained HTML bundle like the gateway does."""
+        css_path = _UI_DIR / "app.css"
+        js_path = _UI_DIR / "app.js"
+        css = css_path.read_text("utf-8") if css_path.exists() else ""
+        js = js_path.read_text("utf-8") if js_path.exists() else ""
+        # Rewrite API_BASE to use the same path (gateway compat)
+        js = _re.sub(
+            r'const API_BASE\s*=\s*["\'][^"\']*["\']',
+            'const API_BASE = "/plugins/openclaw-news-analyzer"',
+            js,
+        )
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>News Analyzer — V2</title>
+  <style>{css}</style>
+  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+  <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+  <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module">{js}</script>
+</body>
+</html>"""
+
+    def _get_bundle() -> str:
+        js_path = _UI_DIR / "app.js"
+        mtime = js_path.stat().st_mtime if js_path.exists() else 0
+        if _ui_cache["html"] is None or mtime > _ui_cache["mtime"]:
+            _ui_cache["html"] = _build_bundle()
+            _ui_cache["mtime"] = mtime
+        return _ui_cache["html"]
+
+    @app.get("/plugins/openclaw-news-analyzer", include_in_schema=False)
+    @app.post("/plugins/openclaw-news-analyzer", include_in_schema=False)
+    @app.put("/plugins/openclaw-news-analyzer", include_in_schema=False)
+    @app.delete("/plugins/openclaw-news-analyzer", include_in_schema=False)
+    async def _gateway_compat(request: StarletteRequest):
+        """Handle gateway-style _api queries and serve the bundled dashboard."""
+        api_action = request.query_params.get("_api")
+
+        if not api_action:
+            # No _api param → serve the dashboard HTML
+            return HTMLResponse(_get_bundle())
+
+        # --- Parameterised routes ---
+        if api_action in _API_PARAM_DISPATCH:
+            qp, tpl = _API_PARAM_DISPATCH[api_action]
+            val = request.query_params.get(qp, "")
+            target = tpl.replace("{val}", val)
+            # Forward extra query params (like period for price-chart)
+            extra = {k: v for k, v in request.query_params.items() if k not in ("_api", qp)}
+            if extra:
+                qs = "&".join(f"{k}={v}" for k, v in extra.items())
+                target = f"{target}?{qs}"
+            return RedirectResponse(url=target, status_code=307)
+
+        # --- Simple routes ---
+        if api_action in _API_DISPATCH:
+            target = _API_DISPATCH[api_action]
+            # Forward extra query params
+            extra = {k: v for k, v in request.query_params.items() if k != "_api"}
+            if extra:
+                qs = "&".join(f"{k}={v}" for k, v in extra.items())
+                target = f"{target}?{qs}"
+            return RedirectResponse(url=target, status_code=307)
+
+        # Unknown _api action
+        return HTMLResponse(
+            f'{{"error": "Unknown _api action: {api_action}"}}',
+            status_code=404,
+            media_type="application/json",
+        )
+
+    @app.get("/", include_in_schema=False)
+    async def _root_redirect():
+        """Redirect root to the dashboard."""
+        return RedirectResponse(url="/plugins/openclaw-news-analyzer")
 
 
 # ---------------------------------------------------------------------------
