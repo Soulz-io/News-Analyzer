@@ -457,6 +457,7 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
         session.query(PolymarketMatch)
         .join(RunUp, PolymarketMatch.run_up_id == RunUp.id)
         .filter(RunUp.status == "active")
+        .filter(RunUp.merged_into_id.is_(None))
         .filter(PolymarketMatch.outcome_yes_price >= 0.97)
         .filter(PolymarketMatch.decision_node_id.isnot(None))
         .all()
@@ -469,6 +470,11 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
             .first()
         )
         if node is None or node.status != "open":
+            continue
+
+        # Only confirm nodes for non-merged run-ups
+        run_up = session.query(RunUp).get(node.run_up_id) if node.run_up_id else None
+        if not run_up or run_up.merged_into_id is not None:
             continue
 
         node.status = "confirmed_yes"
@@ -499,6 +505,7 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
         session.query(PolymarketMatch)
         .join(RunUp, PolymarketMatch.run_up_id == RunUp.id)
         .filter(RunUp.status == "active")
+        .filter(RunUp.merged_into_id.is_(None))
         .filter(PolymarketMatch.outcome_yes_price <= 0.03)
         .filter(PolymarketMatch.decision_node_id.isnot(None))
         .all()
@@ -511,6 +518,11 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
             .first()
         )
         if node is None or node.status != "open":
+            continue
+
+        # Only confirm nodes for non-merged run-ups
+        run_up = session.query(RunUp).get(node.run_up_id) if node.run_up_id else None
+        if not run_up or run_up.merged_into_id is not None:
             continue
 
         node.status = "confirmed_no"

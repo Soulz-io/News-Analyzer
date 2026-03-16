@@ -778,8 +778,8 @@ def _log_usage(
             db.commit()
         finally:
             db.close()
-    except Exception:
-        pass  # Non-critical
+    except Exception as e:
+        logger.debug("Failed to log token usage: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -1753,11 +1753,11 @@ def _build_enrichment_summary(context: Dict[str, str]) -> str:
         first_line = nm.split("\n")[0] if "\n" in nm else nm
         parts.append(first_line[:100])
 
-    # Price momentum
+    # Price momentum (first 3 lines for richer signal)
     pm = context.get("price_momentum", "")
     if pm:
-        first_line = pm.split("\n")[0] if "\n" in pm else pm
-        parts.append(first_line[:100])
+        pm_summary = "\n".join(pm.split("\n")[:3])
+        parts.append(pm_summary[:300])
 
     # Military posture headline
     mi = context.get("military_indicators", "")

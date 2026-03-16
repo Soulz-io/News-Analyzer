@@ -12,6 +12,7 @@ For each fetched Article the pipeline produces an ArticleBrief containing:
   - BERTopic clustering (batch level)
 """
 
+import html
 import json
 import logging
 import re
@@ -345,11 +346,20 @@ def extract_keywords(text: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 def analyze_sentiment(text: str) -> float:
-    """Return VADER compound sentiment score in [-1, +1]."""
+    """Return VADER compound sentiment score in [-1, +1].
+
+    Applies a 0.7 dampening factor because VADER is optimised for social-media
+    text.  Geopolitical/financial headlines tend to be sensational, causing
+    VADER to produce extreme scores that over-weight sentiment in downstream
+    intensity classification.
+    """
     analyzer = _get_vader()
     try:
         scores = analyzer.polarity_scores(text)
-        return scores["compound"]
+        compound = scores["compound"]
+        # Dampen extreme VADER scores — VADER is social-media-optimized, not geopolitical
+        compound = compound * 0.7
+        return compound
     except Exception:
         logger.exception("Sentiment analysis failed.")
         return 0.0
@@ -536,7 +546,10 @@ def process_article(article: Article, feed_region: str = "global") -> Optional[A
     """
     try:
         # Combine title + description for richer analysis
-        raw_text = f"{article.title}. {article.description or ''}"
+        # Decode HTML entities from RSS feeds (e.g. &amp; &lt; &#39;)
+        title = html.unescape(article.title or "")
+        description = html.unescape(article.description or "")
+        raw_text = f"{title}. {description}"
 
         # 1. Language detection
         lang = detect_language(raw_text)
@@ -620,7 +633,10 @@ def process_batch(articles: List[Article]) -> List[ArticleBrief]:
     from concurrent.futures import ThreadPoolExecutor
 
     def _prepare(article):
-        raw_text = f"{article.title}. {article.description or ''}"
+        # Decode HTML entities from RSS feeds (e.g. &amp; &lt; &#39;)
+        title = html.unescape(article.title or "")
+        description = html.unescape(article.description or "")
+        raw_text = f"{title}. {description}"
         lang = detect_language(raw_text)
         english_text = translate_to_english(raw_text, lang)
         return {
@@ -640,14 +656,15 @@ def process_batch(articles: List[Article]) -> List[ArticleBrief]:
     # --- Phase 3: Per-doc enrichment ---
     briefs: List[ArticleBrief] = []
     texts_for_clustering: List[str] = []
+    lang_updates: List[Tuple[int, str]] = []  # (article_id, lang) for batch persistence
 
     for article, prep, doc in zip(articles, prep_results, docs):
         try:
             english_text = prep["text"]
             feed_region = prep["feed_region"]
 
-            # Set original language on article
-            article.original_lang = prep["lang"]
+            # Collect language for batch persistence (articles may be detached)
+            lang_updates.append((article.id, prep["lang"]))
 
             # NER
             entities = extract_entities(doc)
@@ -729,6 +746,11 @@ def process_batch(articles: List[Article]) -> List[ArticleBrief]:
     try:
         for brief in briefs:
             session.add(brief)
+        # Batch-update original_lang on articles (they may be detached from any session)
+        for article_id, lang in lang_updates:
+            session.query(Article).filter(Article.id == article_id).update(
+                {"original_lang": lang}, synchronize_session=False
+            )
         session.commit()
         logger.info("Saved %d article briefs.", len(briefs))
     except Exception:

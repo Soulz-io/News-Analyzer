@@ -545,9 +545,13 @@ def _calculate_swarm_component(run_up: RunUp, session: Session) -> Dict[str, Any
         if not verdict:
             return {"score": 0.0, "verdict": None, "confidence": 0.0}
 
+        # Decay verdicts older than 24h — halve confidence per day stale
+        age_hours = (datetime.utcnow() - verdict.created_at).total_seconds() / 3600
+        staleness_factor = max(0.1, 1.0 - (age_hours - 24) / 48) if age_hours > 24 else 1.0
+
         position = _VERDICT_POSITION.get(verdict.verdict, 0.5)
         deviation = abs(position - 0.5) * 2.0  # scale to 0-1
-        score = deviation * verdict.confidence
+        score = deviation * verdict.confidence * staleness_factor
 
         return {
             "score": round(min(1.0, score), 4),
@@ -742,7 +746,7 @@ def _find_primary_ticker(
             return None, None
 
         best = max(bunq_tickers, key=lambda t: ticker_scores[t])
-        direction = "bullish" if ticker_direction[best] > 0 else "bearish"
+        direction = "bullish" if ticker_direction[best] >= 0 else "bearish"
         return best, direction
 
     except Exception:

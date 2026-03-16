@@ -421,34 +421,46 @@ def _robust_json_parse(text: str) -> Dict:
         pass
 
     # 2. Find outermost { ... } via brace matching
-    depth = 0
-    end_idx = 0
-    in_string = False
-    escape_next = False
+    # First, find the first JSON start character (skip any preamble text)
+    start = -1
     for i, ch in enumerate(text):
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == '\\' and in_string:
-            escape_next = True
-            continue
-        if ch == '"' and not escape_next:
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0:
-                end_idx = i + 1
-                break
-    if end_idx:
-        try:
-            return json.loads(text[:end_idx])
-        except json.JSONDecodeError:
-            pass
+        if ch in ('{', '['):
+            start = i
+            break
+    if start == -1:
+        # No JSON start character found; skip to repair step
+        pass
+    else:
+        open_ch = text[start]
+        close_ch = '}' if open_ch == '{' else ']'
+        depth = 0
+        end_idx = 0
+        in_string = False
+        escape_next = False
+        for i, ch in enumerate(text[start:], start):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == '\\' and in_string:
+                escape_next = True
+                continue
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    end_idx = i + 1
+                    break
+        if end_idx:
+            try:
+                return json.loads(text[start:end_idx])
+            except json.JSONDecodeError:
+                pass
 
     # 3. Truncated JSON repair — close open strings, arrays, objects
     repair = text.rstrip()
@@ -695,9 +707,11 @@ def _generate_narrative(
 
     def _fmt_rec(r: Dict, direction: str) -> str:
         c = r.get("components", {})
+        ccy = r.get("currency", "USD")
+        ccy_sym = {"EUR": "\u20ac", "USD": "$", "GBP": "\u00a3", "GBp": "\u00a3", "CHF": "CHF "}.get(ccy, ccy + " ")
         parts = [
             f"  Ticker: {r['ticker']} ({r['name']})",
-            f"  Price: ${r.get('current_price', '?')}",
+            f"  Price: {ccy_sym}{r.get('current_price', '?')} ({ccy})",
             f"  Composite: {r['composite_score']:.3f} ({direction})",
             f"  Geopolitical narrative: {r.get('narrative', 'n/a')}",
             f"  Signal level: {r.get('signal_level', '?')}",
@@ -814,6 +828,9 @@ Return STRICT JSON (no text before/after):
   ]
 }}
 Only use tickers from the candidates above. Be specific and actionable.
+Note: Prices shown are in the stock's native currency (USD for US equities,
+EUR for Tradegate-listed). Stop-loss and take-profit levels should always
+include the currency label (e.g. "$142.50" or "€128.30").
 Write as if briefing a trader before market open."""
 
     model = _select_advisory_model()
@@ -1171,9 +1188,15 @@ def _compute_risk_levels(
     Uses ATR (Average True Range) for volatility-adjusted levels.
     Higher VIX → wider stops to avoid whipsaws.
     Falls back to percentage-based levels if ATR is unavailable.
+
+    Note: prices are in the stock's native currency (typically USD for US
+    equities via yfinance, EUR for Tradegate-listed).  The ``currency``
+    field in the returned dict indicates which currency the levels are
+    denominated in so downstream consumers can convert or label correctly.
     """
     price = rec.get("current_price")
     action = rec.get("action", "BUY")
+    currency = rec.get("currency", "USD")  # yfinance default is USD
     if not price or price <= 0:
         return {}
 
@@ -1215,6 +1238,7 @@ def _compute_risk_levels(
             "risk_pct": risk_pct,
             "reward_pct": reward_pct,
             "reward_risk": round(reward_pct / risk_pct, 2) if risk_pct > 0 else 0,
+            "currency": currency,
             "method": "atr_based",
         }
     else:
@@ -1237,6 +1261,7 @@ def _compute_risk_levels(
             "risk_pct": sl_pct,
             "reward_pct": tp_pct,
             "reward_risk": round(tp_pct / sl_pct, 2),
+            "currency": currency,
             "method": "pct_fallback",
         }
 
@@ -1853,10 +1878,17 @@ def evaluate_open_advisories() -> Dict[str, Any]:
             total_checks, total_hits, accuracy,
         )
 
-        # Save overall stats
-        _save_setting(session, "advisory_total_checks", str(total_checks))
-        _save_setting(session, "advisory_total_hits", str(total_hits))
-        _save_setting(session, "advisory_accuracy", str(round(accuracy, 2)))
+        # Accumulate overall stats (load previous totals, add this run's counts)
+        prev_checks_row = session.query(EngineSettings).get("advisory_total_checks")
+        prev_hits_row = session.query(EngineSettings).get("advisory_total_hits")
+        prev_checks = int(prev_checks_row.value) if prev_checks_row and prev_checks_row.value else 0
+        prev_hits = int(prev_hits_row.value) if prev_hits_row and prev_hits_row.value else 0
+        cumulative_checks = prev_checks + total_checks
+        cumulative_hits = prev_hits + total_hits
+        cumulative_accuracy = (cumulative_hits / cumulative_checks * 100) if cumulative_checks > 0 else 0
+        _save_setting(session, "advisory_total_checks", str(cumulative_checks))
+        _save_setting(session, "advisory_total_hits", str(cumulative_hits))
+        _save_setting(session, "advisory_accuracy", str(round(cumulative_accuracy, 2)))
         session.commit()
 
         return {

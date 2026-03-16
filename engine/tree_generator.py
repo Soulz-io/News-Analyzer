@@ -14,7 +14,7 @@ import json
 import logging
 import re
 import time as _time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
 from sqlalchemy import func
@@ -182,11 +182,13 @@ def _collect_briefs_for_runup(
             kw_parts = set(run_up.narrative_name.lower()[len(r) + 1:].split("-"))
             break
 
-    # Query briefs matching the region
+    # Query briefs matching the region (last 14 days only)
+    cutoff = datetime.utcnow() - timedelta(days=14)
     briefs = (
         session.query(ArticleBrief)
         .join(Article)
         .filter(ArticleBrief.region.isnot(None))
+        .filter(ArticleBrief.processed_at >= cutoff)
         .order_by(Article.pub_date.desc().nullslast())
         .limit(500)
         .all()
@@ -483,10 +485,20 @@ def _call_claude(
 # Tree storage
 # ---------------------------------------------------------------------------
 
-def _store_tree(run_up_id: int, tree_data: Dict, session: Session) -> DecisionNode:
+def _store_tree(run_up_id: int, tree_data: Dict, session: Session) -> Optional[DecisionNode]:
     """Store a generated decision tree as DecisionNode + Consequence records."""
+    # Validate required LLM output fields
+    question = tree_data.get("question", "")
+    if not question or not isinstance(question, str):
+        logger.warning("Invalid tree: missing or empty 'question' field")
+        return None
+    yes_prob = tree_data.get("yes_probability", 0.5)
+    if not isinstance(yes_prob, (int, float)):
+        yes_prob = 0.5
+    yes_prob = max(0.01, min(0.99, float(yes_prob)))
+    tree_data["yes_probability"] = yes_prob
+
     now = datetime.utcnow()
-    yes_prob = max(0.05, min(0.95, tree_data.get("yes_probability", 0.5)))
 
     # Create root decision node
     root = DecisionNode(
