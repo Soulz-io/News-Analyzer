@@ -1942,10 +1942,20 @@ function renderMyPortfolio() {
   const totalValue = items.reduce((sum, h) => sum + (h.value_eur || 0), 0);
   const totalPnl = items.reduce((sum, h) => sum + (h.pnl_eur || 0), 0);
 
+  // Signal freshness indicator
+  const signalTs = align && align.last_signal_update
+    ? new Date(align.last_signal_update)
+    : null;
+  const signalAge = signalTs ? Math.round((Date.now() - signalTs.getTime()) / 60000) : null;
+  const freshnessLabel = signalAge != null
+    ? (signalAge < 5 ? "🟢 Live" : signalAge < 60 ? `🟢 ${signalAge} min geleden` : signalAge < 120 ? `🟡 ${Math.round(signalAge / 60)}u geleden` : `🔴 ${Math.round(signalAge / 60)}u geleden`)
+    : "";
+
   let html = `<div class="portfolio-holdings">
     <div class="advisory-section-label">
       💼 Mijn Portfolio
       <span class="portfolio-total">${totalValue > 0 ? `€${formatNum(totalValue, 2)}` : ""}</span>
+      ${freshnessLabel ? `<span class="portfolio-freshness" title="Laatste signaal update: ${signalTs ? signalTs.toLocaleString() : '—'}">${freshnessLabel}</span>` : ""}
       <button class="btn btn--xs" data-edit-portfolio style="margin-left:auto">Bewerken</button>
     </div>`;
 
@@ -1998,6 +2008,7 @@ function renderMyPortfolio() {
         </div>
         ${h.reasoning ? `<div class="portfolio-card__reasoning">${_esc(h.reasoning)}</div>` : ""}
         ${h.composite_score != null ? `<div class="portfolio-card__score">Score: ${Number(h.composite_score).toFixed(2)}</div>` : ""}
+        ${h.source && h.source !== "none" ? `<div class="portfolio-card__source">${{"advisory":"📋 Advisory","live_signal":"⚡ Live signaal","swarm":"🐝 Swarm consensus","advisory_sector":"📋 Sector outlook","sector_detect":"📊 Sector"}[h.source] || h.source}</div>` : ""}
       </div>`;
     }
     html += `</div>`;

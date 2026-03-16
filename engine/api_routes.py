@@ -2512,10 +2512,16 @@ def portfolio_holdings_update(
 
 @router.get("/portfolio/alignment")
 def portfolio_alignment(db: Session = Depends(_get_db)):
-    """Compare current portfolio against latest advisory and return alignment analysis."""
+    """Compare current portfolio against latest advisory + live signals and return alignment analysis.
+
+    Data freshness hierarchy (newest wins):
+      1. TradingSignal  — updated every 30 min by confidence_scorer
+      2. SwarmVerdict    — updated every 60 min by swarm_consensus
+      3. DailyAdvisory   — generated once at 07:30 UTC
+    """
     from .db import EngineSettings
 
-    # 1. Get holdings
+    # ── 1. Load holdings ────────────────────────────────────────
     s = db.query(EngineSettings).get("portfolio_holdings")
     holdings = []
     if s and s.value:
@@ -2527,7 +2533,7 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
     if not holdings:
         return {"alignment": [], "message": "No portfolio holdings configured."}
 
-    # 1b. Enrich holdings with live prices
+    # ── 1b. Enrich with live prices ─────────────────────────────
     from .price_fetcher import get_price_fetcher
     pf = get_price_fetcher()
     for h in holdings:
@@ -2549,20 +2555,21 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
             h["value_eur"] = 0.0
             h["pnl_eur"] = 0.0
 
-    # 2. Get latest advisory
+    # ── 2. Load daily advisory (base layer) ─────────────────────
     report = (
         db.query(AnalysisReport)
         .filter(AnalysisReport.report_type == "daily_advisory")
         .order_by(AnalysisReport.created_at.desc())
         .first()
     )
-    if not report:
-        return {"alignment": [], "message": "No advisory generated yet."}
-
-    try:
-        advisory = json.loads(report.report_json)
-    except Exception:
-        return {"alignment": [], "message": "Failed to parse advisory."}
+    advisory = {}
+    advisory_ts = None
+    if report:
+        try:
+            advisory = json.loads(report.report_json)
+            advisory_ts = report.created_at
+        except Exception:
+            pass
 
     buy_map = {
         r["ticker"]: r for r in advisory.get("buy_recommendations", [])
@@ -2571,7 +2578,53 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
         r["ticker"]: r for r in advisory.get("sell_recommendations", [])
     }
 
-    # 3. Analyse each holding
+    # ── 3. Load fresh TradingSignals (every 30 min) ─────────────
+    # Latest non-superseded signal per ticker
+    from sqlalchemy import and_
+    held_tickers = {h["ticker"] for h in holdings}
+    signal_map: Dict[str, TradingSignal] = {}
+    if held_tickers:
+        fresh_signals = (
+            db.query(TradingSignal)
+            .filter(
+                TradingSignal.ticker.in_(held_tickers),
+                TradingSignal.superseded_by_id.is_(None),
+            )
+            .order_by(TradingSignal.created_at.desc())
+            .all()
+        )
+        for sig in fresh_signals:
+            if sig.ticker and sig.ticker not in signal_map:
+                signal_map[sig.ticker] = sig
+
+    # ── 4. Load fresh SwarmVerdicts (every 60 min) ──────────────
+    verdict_map: Dict[str, SwarmVerdict] = {}
+    if held_tickers:
+        fresh_verdicts = (
+            db.query(SwarmVerdict)
+            .filter(
+                SwarmVerdict.primary_ticker.in_(held_tickers),
+                SwarmVerdict.superseded_at.is_(None),
+            )
+            .order_by(SwarmVerdict.created_at.desc())
+            .all()
+        )
+        for v in fresh_verdicts:
+            if v.primary_ticker and v.primary_ticker not in verdict_map:
+                verdict_map[v.primary_ticker] = v
+
+    # Track most recent signal update for freshness indicator
+    latest_signal_ts = None
+    for sig in signal_map.values():
+        if latest_signal_ts is None or sig.created_at > latest_signal_ts:
+            latest_signal_ts = sig.created_at
+    for v in verdict_map.values():
+        if latest_signal_ts is None or v.created_at > latest_signal_ts:
+            latest_signal_ts = v.created_at
+    if latest_signal_ts is None:
+        latest_signal_ts = advisory_ts
+
+    # ── 5. Build alignment per holding ──────────────────────────
     alignment = []
     for h in holdings:
         t = h["ticker"]
@@ -2582,6 +2635,7 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
             "pnl_eur": h.get("pnl_eur", 0),
         }
 
+        # --- 5a. Base signal from daily advisory ---
         if t in buy_map:
             rec = buy_map[t]
             entry["signal"] = "HOLD_ADD"
@@ -2589,6 +2643,7 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
             entry["reasoning"] = rec.get("reasoning", "In BUY aanbevelingen")
             entry["composite_score"] = rec.get("composite_score")
             entry["rank"] = rec.get("rank")
+            entry["source"] = "advisory"
         elif t in sell_map:
             rec = sell_map[t]
             entry["signal"] = "REDUCE"
@@ -2596,6 +2651,7 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
             entry["reasoning"] = rec.get("reasoning", "In SELL aanbevelingen")
             entry["composite_score"] = rec.get("composite_score")
             entry["rank"] = rec.get("rank")
+            entry["source"] = "advisory"
         else:
             # Check sector alignment
             sector_outlook = advisory.get("sectors_outlook", [])
@@ -2613,22 +2669,34 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
                     entry["signal"] = "NEUTRAL"
                     entry["label"] = "⚪ Geen signaal"
                 entry["reasoning"] = best.get("reasoning", "")
+                entry["source"] = "advisory_sector"
             else:
-                # Detect sector from ticker/name even without outlook match
                 _sector = _detect_sector(t, h.get("name", ""))
                 if _sector:
                     entry["signal"] = "HOLD"
                     entry["label"] = f"🟢 Aanhouden — {_sector}"
                     entry["reasoning"] = "Geen actief signaal; positie behouden."
+                    entry["source"] = "sector_detect"
                 else:
                     entry["signal"] = "NEUTRAL"
                     entry["label"] = "⚪ Geen signaal"
                     entry["reasoning"] = "Niet in huidige advisory — geen actie nodig"
+                    entry["source"] = "none"
+
+        # --- 5b. Override / enrich with fresh TradingSignal ---
+        ts = signal_map.get(t)
+        if ts and (advisory_ts is None or ts.created_at > advisory_ts):
+            _apply_trading_signal(entry, ts)
+
+        # --- 5c. Override / enrich with fresh SwarmVerdict ---
+        sv = verdict_map.get(t)
+        if sv and (advisory_ts is None or sv.created_at > advisory_ts):
+            _apply_swarm_verdict(entry, sv)
 
         alignment.append(entry)
 
-    # 4. Missed opportunities: BUY recs not in portfolio
-    held_tickers = {h["ticker"] for h in holdings}
+    # ── 6. Missed opportunities ─────────────────────────────────
+    # From advisory BUY recs not in portfolio
     missed = [
         {
             "ticker": r["ticker"],
@@ -2641,13 +2709,112 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
         for r in advisory.get("buy_recommendations", [])
         if r["ticker"] not in held_tickers
     ]
+    # Also add fresh STRONG_BUY/BUY signals not in portfolio and not in advisory
+    missed_tickers = {m["ticker"] for m in missed} | held_tickers
+    all_strong_signals = (
+        db.query(TradingSignal)
+        .filter(
+            TradingSignal.signal_level.in_(["BUY", "STRONG_BUY"]),
+            TradingSignal.superseded_by_id.is_(None),
+            TradingSignal.ticker.isnot(None),
+        )
+        .order_by(TradingSignal.confidence.desc())
+        .limit(20)
+        .all()
+    )
+    for sig in all_strong_signals:
+        if sig.ticker and sig.ticker not in missed_tickers:
+            missed.append({
+                "ticker": sig.ticker,
+                "name": sig.narrative_name or sig.ticker,
+                "action": sig.signal_level,
+                "composite_score": round(sig.confidence, 3),
+                "reasoning": sig.reasoning or f"{sig.signal_level} signaal (conf={sig.confidence:.0%})",
+                "current_price": None,
+                "source": "live_signal",
+            })
+            missed_tickers.add(sig.ticker)
 
     return {
         "alignment": alignment,
         "missed_opportunities": missed,
         "market_stance": advisory.get("market_stance"),
         "advisory_date": advisory.get("generated_at"),
+        "last_signal_update": latest_signal_ts.isoformat() if latest_signal_ts else None,
     }
+
+
+def _apply_trading_signal(entry: dict, ts: "TradingSignal") -> None:
+    """Override alignment entry with a fresh TradingSignal if it provides a stronger/different signal."""
+    level = ts.signal_level  # WATCH / ALERT / BUY / STRONG_BUY
+    direction = (ts.direction or "").lower()  # bullish / bearish
+    conf = ts.confidence
+
+    # Signal strength ranking for upgrade logic
+    _SIGNAL_RANK = {"NEUTRAL": 0, "HOLD": 1, "WATCH": 2, "HOLD_ADD": 3, "REDUCE": 3}
+    current_rank = _SIGNAL_RANK.get(entry.get("signal", "NEUTRAL"), 0)
+
+    if direction == "bearish":
+        # Bearish signal → WATCH or REDUCE
+        if level in ("BUY", "STRONG_BUY") and conf >= 0.60:
+            entry["signal"] = "REDUCE"
+            entry["label"] = f"⚠️ Afbouwen — bearish signaal ({conf:.0%})"
+            entry["reasoning"] = ts.reasoning or f"Bearish {level} signaal met {conf:.0%} confidence"
+            entry["composite_score"] = round(conf, 3)
+            entry["source"] = "live_signal"
+        elif current_rank < 2:
+            entry["signal"] = "WATCH"
+            entry["label"] = f"🟡 Monitoren — bearish {level} ({conf:.0%})"
+            if not entry.get("reasoning") or entry["source"] in ("sector_detect", "none"):
+                entry["reasoning"] = ts.reasoning or f"Bearish trading signaal"
+            entry["source"] = "live_signal"
+    else:
+        # Bullish (default) signal → upgrade to HOLD / HOLD_ADD
+        if level in ("BUY", "STRONG_BUY") and conf >= 0.60:
+            if current_rank < 3:
+                entry["signal"] = "HOLD_ADD"
+                entry["label"] = f"✅ Aanhouden + bijkopen — {level} ({conf:.0%})"
+                entry["reasoning"] = ts.reasoning or f"Bullish {level} signaal met {conf:.0%} confidence"
+                entry["composite_score"] = round(conf, 3)
+                entry["source"] = "live_signal"
+        elif level == "ALERT" and conf >= 0.50:
+            if current_rank < 2:
+                entry["signal"] = "HOLD"
+                entry["label"] = f"🟢 Aanhouden — ALERT signaal ({conf:.0%})"
+                if not entry.get("reasoning") or entry["source"] in ("sector_detect", "none"):
+                    entry["reasoning"] = ts.reasoning or f"Bullish alert signaal"
+                entry["source"] = "live_signal"
+
+
+def _apply_swarm_verdict(entry: dict, sv: "SwarmVerdict") -> None:
+    """Override alignment entry with a fresh SwarmVerdict if it provides a stronger signal."""
+    verdict = (sv.verdict or "").upper()  # STRONG_BUY / BUY / HOLD / SELL / STRONG_SELL
+    conf = sv.confidence or 0.0
+
+    _SIGNAL_RANK = {"NEUTRAL": 0, "HOLD": 1, "WATCH": 2, "HOLD_ADD": 3, "REDUCE": 3}
+    current_rank = _SIGNAL_RANK.get(entry.get("signal", "NEUTRAL"), 0)
+
+    if verdict in ("SELL", "STRONG_SELL") and conf >= 0.50:
+        if current_rank < 3 or entry.get("signal") != "REDUCE":
+            entry["signal"] = "REDUCE"
+            entry["label"] = f"⚠️ Afbouwen — swarm {verdict} ({conf:.0%})"
+            summary = sv.summary[:120] if hasattr(sv, "summary") and sv.summary else f"Swarm {verdict} met {conf:.0%} consensus"
+            entry["reasoning"] = summary
+            entry["composite_score"] = round(conf, 3)
+            entry["source"] = "swarm"
+    elif verdict in ("BUY", "STRONG_BUY") and conf >= 0.55:
+        if current_rank < 3:
+            entry["signal"] = "HOLD_ADD"
+            entry["label"] = f"✅ Aanhouden + bijkopen — swarm {verdict} ({conf:.0%})"
+            summary = sv.summary[:120] if hasattr(sv, "summary") and sv.summary else f"Swarm {verdict} met {conf:.0%} consensus"
+            entry["reasoning"] = summary
+            entry["composite_score"] = round(conf, 3)
+            entry["source"] = "swarm"
+    elif verdict == "HOLD" and conf >= 0.50:
+        if current_rank < 1:
+            entry["signal"] = "HOLD"
+            entry["label"] = f"🟢 Aanhouden — swarm consensus ({conf:.0%})"
+            entry["source"] = "swarm"
 
 
 def _match_holding_sectors(
