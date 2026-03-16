@@ -344,8 +344,8 @@ def _compute_composite_score(
 
 def _get_market_context() -> Dict[str, Any]:
     """Fetch market indicators for the advisory context section."""
-    from .price_fetcher import PriceFetcher
-    pf = PriceFetcher()
+    from .price_fetcher import get_price_fetcher
+    pf = get_price_fetcher()
 
     fg = pf.get_fear_greed()
     indicators = pf.get_market_indicators()
@@ -824,13 +824,20 @@ Write as if briefing a trader before market open."""
             messages=[{"role": "user", "content": prompt}],
         )
         text = resp.content[0].text.strip()
-        # Strip markdown fences
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        if text.startswith("json"):
-            text = text[4:]
+        # Robust markdown fence stripping (handles nested/mid-text fences)
+        import re
+        # Try extracting JSON from markdown code block first
+        md_match = re.search(r'```(?:json)?\s*\n?(.*?)```', text, re.DOTALL)
+        if md_match:
+            text = md_match.group(1).strip()
+        else:
+            # Fallback: simple strip
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            if text.startswith("json"):
+                text = text[4:]
 
         clean = text.strip()
         result = _robust_json_parse(clean)
@@ -1709,8 +1716,8 @@ def evaluate_open_advisories() -> Dict[str, Any]:
     """
     logger.info("Evaluating open advisories across all horizons...")
     session = get_session()
-    from .price_fetcher import PriceFetcher
-    pf = PriceFetcher()
+    from .price_fetcher import get_price_fetcher
+    pf = get_price_fetcher()
 
     total_checks = 0
     total_hits = 0

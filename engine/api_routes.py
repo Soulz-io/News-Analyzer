@@ -278,14 +278,18 @@ def get_briefs_for_node(node_id: int, db: Session = Depends(_get_db)):
     if not all_kw:
         return []
 
-    # Fetch recent briefs and filter by keyword overlap
+    # Fetch recent briefs with SQL pre-filter, then refine in Python
     cutoff = datetime.utcnow() - timedelta(days=14)
-    briefs = (
-        db.query(ArticleBrief)
-        .filter(ArticleBrief.processed_at >= cutoff)
-        .all()
-    )
 
+    # SQL pre-filter: only load briefs whose keywords_json contains at least one keyword
+    from sqlalchemy import or_
+    kw_filters = [ArticleBrief.keywords_json.contains(kw) for kw in list(all_kw)[:20]]
+    base_q = db.query(ArticleBrief).filter(ArticleBrief.processed_at >= cutoff)
+    if kw_filters:
+        base_q = base_q.filter(or_(*kw_filters))
+    briefs = base_q.all()
+
+    # Refine: exact keyword overlap count
     relevant = []
     for b in briefs:
         bkw = set(_parse_kw(b.keywords_json))
@@ -856,17 +860,22 @@ def get_decision_tree(run_up_id: int, db: Session = Depends(_get_db)):
     if not nodes:
         raise HTTPException(404, detail="No decision tree found for this run-up.")
 
+    # Batch-load all consequences for this tree (1 query instead of N)
+    node_ids = [n.id for n in nodes]
+    all_consequences = (
+        db.query(Consequence)
+        .filter(Consequence.decision_node_id.in_(node_ids))
+        .order_by(Consequence.decision_node_id, Consequence.order)
+        .all()
+    ) if node_ids else []
+    cons_by_node = {}
+    for c in all_consequences:
+        cons_by_node.setdefault(c.decision_node_id, []).append(c)
+
     result = []
     for n in nodes:
         nd = _node_to_dict(n)
-        # Attach consequences
-        consequences = (
-            db.query(Consequence)
-            .filter(Consequence.decision_node_id == n.id)
-            .order_by(Consequence.order)
-            .all()
-        )
-        nd["consequences"] = [_consequence_to_dict(c) for c in consequences]
+        nd["consequences"] = [_consequence_to_dict(c) for c in cons_by_node.get(n.id, [])]
         result.append(nd)
 
     return result
@@ -1123,34 +1132,76 @@ def dashboard_overview(db: Session = Depends(_get_db)):
         )
         .all()
     )
+    # --- Batch queries to avoid N+1 (all run-up IDs at once) ---
+    all_ru_ids = [ru.id for ru in active_runup_rows]
+
+    # Batch: node counts per run-up
+    node_count_rows = (
+        db.query(DecisionNode.run_up_id, func.count(DecisionNode.id))
+        .filter(DecisionNode.run_up_id.in_(all_ru_ids))
+        .group_by(DecisionNode.run_up_id)
+        .all()
+    ) if all_ru_ids else []
+    node_counts = dict(node_count_rows)
+
     # Only include run-ups that actually have decision nodes
-    active_runup_rows = [
-        ru for ru in active_runup_rows
-        if db.query(DecisionNode).filter(DecisionNode.run_up_id == ru.id).count() > 0
-    ]
+    active_runup_rows = [ru for ru in active_runup_rows if node_counts.get(ru.id, 0) > 0]
     # Filter out expired run-ups with very few articles (noise)
     active_runup_rows = [
         ru for ru in active_runup_rows
         if not (ru.status == "expired" and (ru.article_count_total or 0) < 10)
     ]
+    filtered_ids = [ru.id for ru in active_runup_rows]
 
-    # Enrich run-ups with root decision node info
+    # Batch: root decision nodes (depth==0)
+    root_nodes_rows = (
+        db.query(DecisionNode)
+        .filter(DecisionNode.run_up_id.in_(filtered_ids), DecisionNode.depth == 0)
+        .all()
+    ) if filtered_ids else []
+    root_by_runup = {n.run_up_id: n for n in root_nodes_rows}
+
+    # Batch: latest swarm verdicts per run-up
+    from sqlalchemy import and_
+    if filtered_ids:
+        sv_subq = (
+            db.query(
+                SwarmVerdict.run_up_id,
+                func.max(SwarmVerdict.created_at).label("max_created"),
+            )
+            .filter(
+                SwarmVerdict.run_up_id.in_(filtered_ids),
+                SwarmVerdict.superseded_at.is_(None),
+            )
+            .group_by(SwarmVerdict.run_up_id)
+            .subquery()
+        )
+        latest_verdicts = (
+            db.query(SwarmVerdict)
+            .join(
+                sv_subq,
+                and_(
+                    SwarmVerdict.run_up_id == sv_subq.c.run_up_id,
+                    SwarmVerdict.created_at == sv_subq.c.max_created,
+                ),
+            )
+            .all()
+        )
+    else:
+        latest_verdicts = []
+    verdict_by_runup = {sv.run_up_id: sv for sv in latest_verdicts}
+
+    # Enrich run-ups using batched data (no per-runup queries)
     runups_out = []
     for ru in active_runup_rows:
         rd = _runup_to_dict(ru)
-        # Find root decision node for this run-up
-        root_node = (
-            db.query(DecisionNode)
-            .filter(DecisionNode.run_up_id == ru.id, DecisionNode.depth == 0)
-            .first()
-        )
+        root_node = root_by_runup.get(ru.id)
         if root_node:
             rd["root_question"] = root_node.question
             rd["root_probability"] = round((root_node.yes_probability or 0.5) * 100, 1)
         else:
             rd["root_question"] = ""
             rd["root_probability"] = 0
-        # Days active
         if ru.start_date:
             rd["days_active"] = (date.today() - ru.start_date).days
         else:
@@ -1161,28 +1212,32 @@ def dashboard_overview(db: Session = Depends(_get_db)):
         rd["article_count"] = ru.article_count_total
         rd["active"] = ru.status == "active"
         rd["status"] = ru.status
-        rd["node_count"] = db.query(DecisionNode).filter(
-            DecisionNode.run_up_id == ru.id
-        ).count()
-        # Latest swarm verdict for this run-up
-        sv = (
-            db.query(SwarmVerdict)
-            .filter(SwarmVerdict.run_up_id == ru.id, SwarmVerdict.superseded_at.is_(None))
-            .order_by(SwarmVerdict.created_at.desc())
-            .first()
-        )
+        rd["node_count"] = node_counts.get(ru.id, 0)
+        sv = verdict_by_runup.get(ru.id)
         rd["swarm_verdict"] = sv.verdict if sv else None
         rd["swarm_confidence"] = round(sv.confidence * 100) if sv else None
         runups_out.append(rd)
 
-    # Prediction scoreboard stats
-    predictions = db.query(Prediction).all()
-    total_preds = len(predictions)
-    verified = [p for p in predictions if p.outcome != "pending"]
-    correct = sum(1 for p in verified if p.outcome == "correct")
-    incorrect = sum(1 for p in verified if p.outcome == "incorrect")
-    partial = sum(1 for p in verified if p.outcome == "partial")
-    accuracy = (correct + partial * 0.5) / len(verified) * 100 if verified else 0.0
+    # Prediction scoreboard stats (SQL aggregation — no full table load)
+    outcome_counts = dict(
+        db.query(Prediction.outcome, func.count(Prediction.id))
+        .group_by(Prediction.outcome)
+        .all()
+    )
+    total_preds = sum(outcome_counts.values())
+    correct = outcome_counts.get("correct", 0)
+    incorrect = outcome_counts.get("incorrect", 0)
+    partial = outcome_counts.get("partial", 0)
+    verified_count = correct + incorrect + partial
+    accuracy = (correct + partial * 0.5) / verified_count * 100 if verified_count else 0.0
+
+    # Recent predictions for the recent_outcomes display (limited query)
+    recent_predictions = (
+        db.query(Prediction)
+        .order_by(Prediction.created_at.desc())
+        .limit(10)
+        .all()
+    )
 
     # Recent intensity distribution
     cutoff = datetime.utcnow() - timedelta(hours=24)
@@ -1204,9 +1259,15 @@ def dashboard_overview(db: Session = Depends(_get_db)):
         .limit(20)
         .all()
     )
+    # Batch-load RunUp objects for resolved nodes (avoid N+1)
+    resolved_ru_ids = list({n.run_up_id for n in resolved_nodes if n.run_up_id})
+    resolved_runups = {
+        ru.id: ru for ru in db.query(RunUp).filter(RunUp.id.in_(resolved_ru_ids)).all()
+    } if resolved_ru_ids else {}
+
     resolved_out = []
     for node in resolved_nodes:
-        ru = db.query(RunUp).get(node.run_up_id) if node.run_up_id else None
+        ru = resolved_runups.get(node.run_up_id) if node.run_up_id else None
         resolved_out.append({
             "node_id": node.id,
             "question": node.question,
@@ -1239,7 +1300,7 @@ def dashboard_overview(db: Session = Depends(_get_db)):
                     "outcome": p.outcome,
                     "date": p.verified_at.isoformat() if p.verified_at else (p.created_at.isoformat() if p.created_at else None),
                 }
-                for p in sorted(predictions, key=lambda x: x.created_at or datetime.min, reverse=True)[:10]
+                for p in recent_predictions
             ],
         },
         "total_articles": total_articles,
@@ -1270,22 +1331,70 @@ def dashboard_tree(run_up_id: int, db: Session = Depends(_get_db)):
         .all()
     )
 
-    tree_nodes = []
-    for n in nodes:
-        consequences = (
-            db.query(Consequence)
-            .filter(Consequence.decision_node_id == n.id)
-            .order_by(Consequence.order)
+    # --- Batch-load all related data to avoid N+1 queries ---
+    tree_node_ids = [n.id for n in nodes]
+
+    # Batch: all consequences for all nodes
+    all_tree_cons = (
+        db.query(Consequence)
+        .filter(Consequence.decision_node_id.in_(tree_node_ids))
+        .order_by(Consequence.decision_node_id, Consequence.order)
+        .all()
+    ) if tree_node_ids else []
+    tree_cons_by_node = {}
+    for c in all_tree_cons:
+        tree_cons_by_node.setdefault(c.decision_node_id, []).append(c)
+
+    # Batch: all stock impacts for all consequences
+    all_cons_ids = [c.id for c in all_tree_cons]
+    all_tree_impacts = (
+        db.query(StockImpact)
+        .filter(StockImpact.consequence_id.in_(all_cons_ids))
+        .all()
+    ) if all_cons_ids else []
+    impacts_by_cons = {}
+    for si in all_tree_impacts:
+        impacts_by_cons.setdefault(si.consequence_id, []).append(si)
+
+    # Batch: latest swarm verdicts for all nodes
+    from sqlalchemy import and_
+    if tree_node_ids:
+        tree_sv_subq = (
+            db.query(
+                SwarmVerdict.decision_node_id,
+                func.max(SwarmVerdict.created_at).label("max_created"),
+            )
+            .filter(
+                SwarmVerdict.decision_node_id.in_(tree_node_ids),
+                SwarmVerdict.superseded_at.is_(None),
+            )
+            .group_by(SwarmVerdict.decision_node_id)
+            .subquery()
+        )
+        tree_verdicts = (
+            db.query(SwarmVerdict)
+            .join(
+                tree_sv_subq,
+                and_(
+                    SwarmVerdict.decision_node_id == tree_sv_subq.c.decision_node_id,
+                    SwarmVerdict.created_at == tree_sv_subq.c.max_created,
+                ),
+            )
             .all()
         )
+    else:
+        tree_verdicts = []
+    tree_verdict_by_node = {sv.decision_node_id: sv for sv in tree_verdicts}
+
+    tree_nodes = []
+    for n in nodes:
+        consequences = tree_cons_by_node.get(n.id, [])
         cons_dicts = []
         for c in consequences:
             cd = _consequence_to_dict(c)
-            # Add branch_probability and effective_probability
             branch_prob = n.yes_probability if c.branch == "yes" else n.no_probability
             cd["branch_probability"] = round(branch_prob, 4)
             cd["effective_probability"] = round(branch_prob * c.probability, 4)
-            # Proximity tracking
             cd["proximity_pct"] = c.proximity_pct
             if c.proximity_pct is not None and c.price_thresholds_json:
                 try:
@@ -1293,7 +1402,6 @@ def dashboard_tree(run_up_id: int, db: Session = Depends(_get_db)):
                     if thresholds:
                         th = thresholds[0]
                         asset = th.get("asset", "?")
-                        direction = th.get("direction", "above")
                         target = th.get("value", 0)
                         arrow = "\u2192"
                         cd["proximity_display"] = f"{asset} {arrow} ${target:.0f} ({c.proximity_pct:.0f}%)"
@@ -1301,25 +1409,10 @@ def dashboard_tree(run_up_id: int, db: Session = Depends(_get_db)):
                     cd["proximity_display"] = None
             else:
                 cd["proximity_display"] = None
-            # Attach stock impacts
-            impacts = (
-                db.query(StockImpact)
-                .filter(StockImpact.consequence_id == c.id)
-                .all()
-            )
-            cd["stock_impacts"] = [_stock_impact_to_dict(si) for si in impacts]
+            cd["stock_impacts"] = [_stock_impact_to_dict(si) for si in impacts_by_cons.get(c.id, [])]
             cons_dicts.append(cd)
 
-        # Swarm verdict for this node (latest non-superseded)
-        sv = (
-            db.query(SwarmVerdict)
-            .filter(
-                SwarmVerdict.decision_node_id == n.id,
-                SwarmVerdict.superseded_at.is_(None),
-            )
-            .order_by(SwarmVerdict.created_at.desc())
-            .first()
-        )
+        sv = tree_verdict_by_node.get(n.id)
         swarm_data = None
         if sv:
             swarm_data = {

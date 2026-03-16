@@ -235,6 +235,7 @@ class DecisionNode(Base):
     __tablename__ = "decision_nodes"
     __table_args__ = (
         Index("idx_dn_runup_status", "run_up_id", "status"),
+        Index("idx_dn_parent", "parent_node_id"),
     )
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)

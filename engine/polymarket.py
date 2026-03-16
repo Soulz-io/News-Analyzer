@@ -449,6 +449,7 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
     Returns the number of nodes confirmed.
     """
     confirmed_count = 0
+    newly_confirmed_ids = []  # Track which nodes we confirm (avoid re-querying all)
 
     # --- YES branch: market strongly says YES ---
     yes_matches = (
@@ -474,6 +475,7 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
             f"{match.outcome_yes_price:.0%} — auto-confirmed"
         )
         confirmed_count += 1
+        newly_confirmed_ids.append(node.id)
         logger.info(
             "Auto-confirmed YES: node %d (question=%r) — Polymarket at %.0f%%",
             node.id, node.question[:80], match.outcome_yes_price * 100,
@@ -503,6 +505,7 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
             f"{match.outcome_no_price:.0%} NO — auto-confirmed"
         )
         confirmed_count += 1
+        newly_confirmed_ids.append(node.id)
         logger.info(
             "Auto-confirmed NO: node %d (question=%r) — Polymarket NO at %.0f%%",
             node.id, node.question[:80], match.outcome_no_price * 100,
@@ -512,13 +515,12 @@ def _auto_confirm_resolved_markets(session: Session) -> int:
         session.commit()
         logger.info("Auto-confirmed %d decision nodes from Polymarket.", confirmed_count)
 
-        # Trigger cascading child-tree generation for each confirmed node
+        # Trigger cascading child-tree generation for newly confirmed nodes only
         confirmed_nodes = (
             session.query(DecisionNode)
-            .filter(DecisionNode.status.in_(["confirmed_yes", "confirmed_no"]))
-            .filter(DecisionNode.confirmed_at.isnot(None))
+            .filter(DecisionNode.id.in_(newly_confirmed_ids))
             .all()
-        )
+        ) if newly_confirmed_ids else []
         for node in confirmed_nodes:
             # Only generate children if this node doesn't already have child nodes
             has_children = (

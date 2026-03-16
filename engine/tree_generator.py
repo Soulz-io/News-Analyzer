@@ -127,8 +127,8 @@ Respond with this exact JSON structure:
         "keywords": ["track1", "track2", "track3"],
         "stock_impacts": [
           {{
-            "ticker": "SPY",
-            "name": "S&P 500 ETF",
+            "ticker": "CSPX.AS",
+            "name": "iShares Core S&P 500 UCITS",
             "asset_type": "etf",
             "direction": "bullish",
             "magnitude": "low",
@@ -504,10 +504,14 @@ def _store_tree(run_up_id: int, tree_data: Dict, session: Session) -> DecisionNo
             session.add(cons)
             session.flush()  # need cons.id for stock impacts
 
-            # Store stock impacts for this consequence
+            # Store stock impacts for this consequence (bunq-validated)
             for si_data in cons_data.get("stock_impacts", []):
                 ticker = si_data.get("ticker", "").strip().upper()
                 if not ticker:
+                    continue
+                from .bunq_stocks import is_available_on_bunq
+                if not is_available_on_bunq(ticker):
+                    logger.debug("Skipping non-bunq ticker %s in tree stock impact", ticker)
                     continue
                 si = StockImpact(
                     consequence_id=cons.id,
@@ -1011,6 +1015,10 @@ def _store_child_tree(
             for si_data in cons_data.get("stock_impacts", []):
                 ticker = si_data.get("ticker", "").strip().upper()
                 if not ticker:
+                    continue
+                from .bunq_stocks import is_available_on_bunq
+                if not is_available_on_bunq(ticker):
+                    logger.debug("Skipping non-bunq ticker %s in child tree", ticker)
                     continue
                 si = StockImpact(
                     consequence_id=cons.id,

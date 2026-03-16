@@ -661,8 +661,8 @@ Write a JSON response:
   ],
   "sell_signals": [
     {{
-      "ticker": "SPY",
-      "name": "S&P 500 ETF",
+      "ticker": "CSPX.AS",
+      "name": "iShares Core S&P 500 UCITS",
       "reasoning": "Why consider selling — 1 sentence",
       "narrative": "which narrative",
       "urgency": "medium"

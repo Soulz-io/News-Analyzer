@@ -32,6 +32,8 @@ class PriceFetcher:
     ECONOMIC_TTL = 3600     # 1 hour
 
     def __init__(self) -> None:
+        import threading
+        self._lock = threading.Lock()
         self._quote_cache: Dict[str, Tuple[float, Dict]] = {}
         self._chart_cache: Dict[str, Tuple[float, List]] = {}
         self._indicator_cache: Optional[Tuple[float, Dict]] = None
@@ -52,13 +54,14 @@ class PriceFetcher:
         ticker = ticker.upper().strip()
         now = time.time()
 
-        # --- cache check ---
-        if ticker in self._quote_cache:
-            ts, data = self._quote_cache[ticker]
-            if now - ts < self.QUOTE_TTL:
-                logger.debug("Quote cache HIT for %s", ticker)
-                return data
-            logger.debug("Quote cache EXPIRED for %s", ticker)
+        # --- cache check (thread-safe) ---
+        with self._lock:
+            if ticker in self._quote_cache:
+                ts, data = self._quote_cache[ticker]
+                if now - ts < self.QUOTE_TTL:
+                    logger.debug("Quote cache HIT for %s", ticker)
+                    return data
+                logger.debug("Quote cache EXPIRED for %s", ticker)
 
         logger.info("Fetching quote for %s via yfinance", ticker)
         try:
@@ -99,7 +102,8 @@ class PriceFetcher:
                 "currency": currency,
                 "name": name,
             }
-            self._quote_cache[ticker] = (now, result)
+            with self._lock:
+                self._quote_cache[ticker] = (now, result)
             return result
 
         except Exception as exc:

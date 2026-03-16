@@ -187,10 +187,13 @@ class RSSFetcher:
         if not articles:
             return []
 
-        # --- Level 1: exact link match against DB ---
+        # --- Level 1: exact link match against DB (only check incoming batch) ---
+        incoming_links = [a["link"] for a in articles]
         existing_links = {
             row[0]
-            for row in session.query(Article.link).all()
+            for row in session.query(Article.link)
+            .filter(Article.link.in_(incoming_links))
+            .all()
         }
 
         unique_by_link = [a for a in articles if a["link"] not in existing_links]
