@@ -1526,6 +1526,21 @@ def _get_portfolio_context(node: DecisionNode, db) -> str:
         if not holdings:
             return ""
 
+        # Compute live values for each holding
+        from .price_fetcher import get_price_fetcher
+        _pf = get_price_fetcher()
+        for h in holdings:
+            shares = float(h.get("shares", 0))
+            if shares > 0:
+                q = _pf.get_quote(h["ticker"])
+                if "error" not in q:
+                    price_eur = _pf.convert_to_eur(q["price"], q.get("currency", "EUR"))
+                    h["value_eur"] = round(shares * price_eur, 2)
+                else:
+                    h["value_eur"] = round(shares * float(h.get("avg_buy_price_eur", 0)), 2)
+            elif not h.get("value_eur"):
+                h["value_eur"] = 0
+
         lines = ["USER PORTFOLIO (bunq Stocks):"]
         total = sum(h.get("value_eur", 0) for h in holdings)
         for h in holdings:

@@ -11,6 +11,15 @@ from typing import List, Dict, Optional
 
 import yaml
 
+# Load .env file BEFORE any os.getenv() calls
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path, override=False)
+except ImportError:
+    pass  # python-dotenv not installed; rely on env vars and DB fallback
+
 logger = logging.getLogger(__name__)
 
 # Base directory for the engine package

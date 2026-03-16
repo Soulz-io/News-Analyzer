@@ -2364,19 +2364,110 @@ def advisory_generate():
 
 @router.get("/portfolio/holdings")
 def portfolio_holdings(db: Session = Depends(_get_db)):
-    """Return user's current portfolio holdings."""
+    """Return user's portfolio holdings with LIVE valuations from yfinance."""
     from .db import EngineSettings
+    from .price_fetcher import get_price_fetcher
+
     s = db.query(EngineSettings).get("portfolio_holdings")
     if not s or not s.value:
-        return {"holdings": [], "total_value": 0}
+        return {"holdings": [], "total_value": 0, "total_cost": 0, "total_pnl": 0, "total_pnl_pct": 0}
     try:
         holdings = json.loads(s.value)
     except (json.JSONDecodeError, ValueError):
         holdings = []
+    if not holdings:
+        return {"holdings": [], "total_value": 0, "total_cost": 0, "total_pnl": 0, "total_pnl_pct": 0}
 
-    total = sum(h.get("value_eur", 0) for h in holdings)
-    total_pnl = sum(h.get("pnl_eur", 0) for h in holdings)
-    return {"holdings": holdings, "total_value": round(total, 2), "total_pnl": round(total_pnl, 2)}
+    pf = get_price_fetcher()
+    enriched = []
+
+    for h in holdings:
+        ticker = h["ticker"]
+        shares = float(h.get("shares", 0))
+        avg_buy = float(h.get("avg_buy_price_eur", 0))
+
+        # Legacy holding (old format with static value_eur, no shares)
+        if shares == 0 and h.get("value_eur", 0) > 0:
+            enriched.append({
+                "ticker": ticker,
+                "name": h.get("name", ticker),
+                "shares": 0,
+                "avg_buy_price_eur": 0,
+                "current_value_eur": round(h.get("value_eur", 0), 2),
+                "cost_basis_eur": 0,
+                "pnl_eur": round(h.get("pnl_eur", 0), 2),
+                "pnl_pct": None,
+                "change_pct": 0,
+                "live_price": None,
+                "live_price_eur": None,
+                "currency": None,
+                "legacy": True,
+            })
+            continue
+
+        if shares <= 0:
+            continue
+
+        # Fetch live price
+        quote = pf.get_quote(ticker)
+
+        if "error" in quote:
+            # Cannot price — include with cost basis only
+            cost_basis = round(shares * avg_buy, 2)
+            enriched.append({
+                "ticker": ticker,
+                "name": h.get("name", ticker),
+                "shares": shares,
+                "avg_buy_price_eur": avg_buy,
+                "live_price": None,
+                "live_price_eur": None,
+                "currency": None,
+                "current_value_eur": cost_basis,
+                "cost_basis_eur": cost_basis,
+                "pnl_eur": 0,
+                "pnl_pct": 0,
+                "change_pct": 0,
+                "error": "Price unavailable",
+            })
+            continue
+
+        live_price = quote["price"]
+        currency = quote.get("currency", "EUR")
+        live_price_eur = round(pf.convert_to_eur(live_price, currency), 4)
+
+        current_value = round(shares * live_price_eur, 2)
+        cost_basis = round(shares * avg_buy, 2)
+        pnl = round(current_value - cost_basis, 2)
+        pnl_pct = round((pnl / cost_basis) * 100, 2) if cost_basis > 0 else 0.0
+
+        enriched.append({
+            "ticker": ticker,
+            "name": h.get("name", ticker),
+            "shares": shares,
+            "avg_buy_price_eur": avg_buy,
+            "live_price": live_price,
+            "live_price_eur": live_price_eur,
+            "currency": currency,
+            "current_value_eur": current_value,
+            "cost_basis_eur": cost_basis,
+            "pnl_eur": pnl,
+            "pnl_pct": pnl_pct,
+            "change_pct": quote.get("change_pct", 0),
+        })
+
+    # Portfolio totals
+    total_value = round(sum(e.get("current_value_eur", 0) for e in enriched), 2)
+    total_cost = round(sum(e.get("cost_basis_eur", 0) for e in enriched), 2)
+    total_pnl = round(sum(e.get("pnl_eur", 0) for e in enriched), 2)
+    total_pnl_pct = round((total_pnl / total_cost) * 100, 2) if total_cost > 0 else 0.0
+
+    return {
+        "holdings": enriched,
+        "total_value": total_value,
+        "total_cost": total_cost,
+        "total_pnl": total_pnl,
+        "total_pnl_pct": total_pnl_pct,
+    }
 
 
 @router.put("/portfolio/holdings")
@@ -2384,23 +2475,26 @@ def portfolio_holdings_update(
     payload: Dict[str, Any] = Body(...),
     db: Session = Depends(_get_db),
 ):
-    """Update user's current portfolio holdings.
+    """Update user's portfolio holdings.
 
-    Body: { "holdings": [ {"ticker": "XOM", "name": "Exxon Mobil", "value_eur": 10.89}, ... ] }
+    Body: { "holdings": [ {"ticker": "XOM", "name": "Exxon", "shares": 10, "avg_buy_price_eur": 95.50}, ... ] }
     """
     holdings = payload.get("holdings", [])
 
-    # Validate
+    # Validate and clean
     cleaned = []
     for h in holdings:
         ticker = (h.get("ticker") or "").strip().upper()
         if not ticker:
             continue
+        shares = float(h.get("shares", 0))
+        if shares <= 0:
+            continue
         cleaned.append({
             "ticker": ticker,
             "name": h.get("name", ticker),
-            "value_eur": round(float(h.get("value_eur", 0)), 2),
-            "pnl_eur": round(float(h.get("pnl_eur", 0)), 2),
+            "shares": round(shares, 6),
+            "avg_buy_price_eur": round(float(h.get("avg_buy_price_eur", 0)), 4),
             "updated_at": datetime.utcnow().isoformat(),
         })
 
@@ -2413,8 +2507,7 @@ def portfolio_holdings_update(
         db.add(s)
     db.commit()
 
-    total = sum(c["value_eur"] for c in cleaned)
-    return {"success": True, "holdings": cleaned, "total_value": round(total, 2)}
+    return {"success": True, "count": len(cleaned)}
 
 
 @router.get("/portfolio/alignment")
@@ -2433,6 +2526,28 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
 
     if not holdings:
         return {"alignment": [], "message": "No portfolio holdings configured."}
+
+    # 1b. Enrich holdings with live prices
+    from .price_fetcher import get_price_fetcher
+    pf = get_price_fetcher()
+    for h in holdings:
+        shares = float(h.get("shares", 0))
+        avg_buy = float(h.get("avg_buy_price_eur", 0))
+        if shares > 0:
+            quote = pf.get_quote(h["ticker"])
+            if "error" not in quote:
+                price_eur = pf.convert_to_eur(quote["price"], quote.get("currency", "EUR"))
+                h["value_eur"] = round(shares * price_eur, 2)
+                cost = shares * avg_buy
+                h["pnl_eur"] = round(h["value_eur"] - cost, 2)
+            else:
+                h["value_eur"] = round(shares * avg_buy, 2)
+                h["pnl_eur"] = 0.0
+        elif h.get("value_eur"):
+            pass  # legacy format: keep static value
+        else:
+            h["value_eur"] = 0.0
+            h["pnl_eur"] = 0.0
 
     # 2. Get latest advisory
     report = (

@@ -2399,7 +2399,7 @@ function _showPortfolioEditor() {
   const holdings = (state.advisory || {}).portfolio_holdings || [];
   const align = state.portfolioAlignment;
   const currentItems = (align && align.alignment) ? align.alignment : holdings.map(h => ({
-    ticker: h.ticker, name: h.name, value_eur: h.value_eur,
+    ticker: h.ticker, name: h.name, shares: h.shares || 0, avg_buy_price_eur: h.avg_buy_price_eur || 0,
   }));
 
   let rows = "";
@@ -2407,8 +2407,8 @@ function _showPortfolioEditor() {
     rows += `<tr>
       <td><input type="text" class="portfolio-edit__ticker" value="${_esc(h.ticker)}" placeholder="XOM" style="width:70px"></td>
       <td><input type="text" class="portfolio-edit__name" value="${_esc(h.name)}" placeholder="Exxon Mobil" style="width:150px"></td>
-      <td><input type="number" class="portfolio-edit__value" value="${h.value_eur || 0}" step="0.01" min="0" style="width:80px"></td>
-      <td><input type="number" class="portfolio-edit__pnl" value="${h.pnl_eur || 0}" step="0.01" style="width:80px"></td>
+      <td><input type="number" class="portfolio-edit__shares" value="${h.shares || ''}" step="0.01" min="0" style="width:70px"></td>
+      <td><input type="number" class="portfolio-edit__avgbuy" value="${h.avg_buy_price_eur || ''}" step="0.01" min="0" style="width:80px"></td>
       <td><button class="btn btn--xs btn--danger portfolio-edit__remove">✕</button></td>
     </tr>`;
   }
@@ -2416,8 +2416,8 @@ function _showPortfolioEditor() {
   rows += `<tr>
     <td><input type="text" class="portfolio-edit__ticker" value="" placeholder="XOM" style="width:70px"></td>
     <td><input type="text" class="portfolio-edit__name" value="" placeholder="Naam" style="width:150px"></td>
-    <td><input type="number" class="portfolio-edit__value" value="" step="0.01" min="0" style="width:80px"></td>
-    <td><input type="number" class="portfolio-edit__pnl" value="" step="0.01" style="width:80px"></td>
+    <td><input type="number" class="portfolio-edit__shares" value="" step="0.01" min="0" style="width:70px"></td>
+    <td><input type="number" class="portfolio-edit__avgbuy" value="" step="0.01" min="0" style="width:80px"></td>
     <td><button class="btn btn--xs btn--danger portfolio-edit__remove">✕</button></td>
   </tr>`;
 
@@ -2430,10 +2430,10 @@ function _showPortfolioEditor() {
     </div>
     <div class="modal__body">
       <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:12px">
-        Voer je Bunq Stocks posities in (ticker + huidige waarde in EUR).
+        Voer je Bunq Stocks posities in (ticker + aantal shares + gemiddelde koopprijs in EUR).
       </p>
       <table class="portfolio-edit__table">
-        <thead><tr><th>Ticker</th><th>Naam</th><th>Waarde (€)</th><th>P&L (€)</th><th></th></tr></thead>
+        <thead><tr><th>Ticker</th><th>Naam</th><th>Shares</th><th>Koopprijs (€)</th><th></th></tr></thead>
         <tbody id="portfolio-edit-rows">${rows}</tbody>
       </table>
       <button class="btn btn--xs" id="portfolio-add-row" style="margin-top:8px">+ Positie toevoegen</button>
@@ -2461,8 +2461,8 @@ function _showPortfolioEditor() {
     tr.innerHTML = `
       <td><input type="text" class="portfolio-edit__ticker" value="" placeholder="XOM" style="width:70px"></td>
       <td><input type="text" class="portfolio-edit__name" value="" placeholder="Naam" style="width:150px"></td>
-      <td><input type="number" class="portfolio-edit__value" value="" step="0.01" min="0" style="width:80px"></td>
-      <td><input type="number" class="portfolio-edit__pnl" value="" step="0.01" style="width:80px"></td>
+      <td><input type="number" class="portfolio-edit__shares" value="" step="0.01" min="0" style="width:70px"></td>
+      <td><input type="number" class="portfolio-edit__avgbuy" value="" step="0.01" min="0" style="width:80px"></td>
       <td><button class="btn btn--xs btn--danger portfolio-edit__remove">✕</button></td>
     `;
     tbody.appendChild(tr);
@@ -2478,10 +2478,10 @@ function _showPortfolioEditor() {
     for (const row of rowEls) {
       const ticker = (row.querySelector(".portfolio-edit__ticker")?.value || "").trim().toUpperCase();
       const name = (row.querySelector(".portfolio-edit__name")?.value || "").trim();
-      const value = parseFloat(row.querySelector(".portfolio-edit__value")?.value || "0");
-      const pnl = parseFloat(row.querySelector(".portfolio-edit__pnl")?.value || "0");
-      if (ticker && value > 0) {
-        holdings.push({ ticker, name: name || ticker, value_eur: value, pnl_eur: pnl });
+      const shares = parseFloat(row.querySelector(".portfolio-edit__shares")?.value || "0");
+      const avgBuy = parseFloat(row.querySelector(".portfolio-edit__avgbuy")?.value || "0");
+      if (ticker && shares > 0) {
+        holdings.push({ ticker, name: name || ticker, shares, avg_buy_price_eur: avgBuy });
       }
     }
 

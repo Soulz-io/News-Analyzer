@@ -1487,12 +1487,27 @@ def generate_daily_advisory() -> Optional[AnalysisReport]:
 
 
 def _get_portfolio_value(session) -> float:
-    """Get total portfolio value from configured holdings, or default."""
+    """Get total portfolio value from configured holdings using LIVE prices, or default."""
     try:
         s = session.query(EngineSettings).get("portfolio_holdings")
         if s and s.value:
             holdings = json.loads(s.value)
-            total = sum(h.get("value_eur", 0) for h in holdings)
+            if not holdings:
+                return DEFAULT_PORTFOLIO_EUR
+            from .price_fetcher import get_price_fetcher
+            pf = get_price_fetcher()
+            total = 0.0
+            for h in holdings:
+                shares = float(h.get("shares", 0))
+                if shares > 0:
+                    quote = pf.get_quote(h["ticker"])
+                    if "error" not in quote:
+                        price_eur = pf.convert_to_eur(quote["price"], quote.get("currency", "EUR"))
+                        total += shares * price_eur
+                    else:
+                        total += shares * float(h.get("avg_buy_price_eur", 0))
+                elif h.get("value_eur", 0) > 0:
+                    total += h["value_eur"]  # legacy format
             if total > 0:
                 return total
     except Exception:
@@ -1539,6 +1554,21 @@ def _build_portfolio_context(
     for rec in advisory.get("buy_recommendations", []) + advisory.get("sell_recommendations", []):
         n = (rec.get("narrative") or "").lower()
         active_narratives.add(n)
+
+    # Compute live values for each holding
+    from .price_fetcher import get_price_fetcher
+    _pf = get_price_fetcher()
+    for h in holdings:
+        shares = float(h.get("shares", 0))
+        if shares > 0:
+            q = _pf.get_quote(h["ticker"])
+            if "error" not in q:
+                price_eur = _pf.convert_to_eur(q["price"], q.get("currency", "EUR"))
+                h["value_eur"] = round(shares * price_eur, 2)
+            else:
+                h["value_eur"] = round(shares * float(h.get("avg_buy_price_eur", 0)), 2)
+        elif not h.get("value_eur"):
+            h["value_eur"] = 0
 
     total_value = sum(h.get("value_eur", 0) for h in holdings)
     actions = []

@@ -795,6 +795,52 @@ class PriceFetcher:
         return result
 
 
+    # ------------------------------------------------------------------
+    # Currency conversion to EUR
+    # ------------------------------------------------------------------
+    def convert_to_eur(self, price: float, currency: str) -> float:
+        """Convert a price from *currency* to EUR using live FX rates.
+
+        Handles: USD, GBP, GBp (pence), CHF.  EUR passes through.
+        Falls back to hardcoded estimates when FX fetch fails.
+        FX quotes are cached with the standard QUOTE_TTL (5 min).
+        """
+        if not currency or currency == "EUR" or price <= 0:
+            return price
+
+        currency = currency.upper().strip()
+
+        if currency == "USD":
+            fx = self.get_quote("EURUSD=X")
+            if "error" not in fx and fx.get("price", 0) > 0:
+                return price / fx["price"]
+            return price / 1.08  # fallback
+
+        if currency == "GBP":
+            fx = self.get_quote("GBPEUR=X")
+            if "error" not in fx and fx.get("price", 0) > 0:
+                return price * fx["price"]
+            return price * 1.17
+
+        if currency in ("GBX", "GBP", "GBp"):
+            # GBp = pence sterling
+            price_gbp = price / 100.0 if currency in ("GBX", "GBp") else price
+            fx = self.get_quote("GBPEUR=X")
+            if "error" not in fx and fx.get("price", 0) > 0:
+                return price_gbp * fx["price"]
+            return price_gbp * 1.17
+
+        if currency == "CHF":
+            fx = self.get_quote("CHFEUR=X")
+            if "error" not in fx and fx.get("price", 0) > 0:
+                return price * fx["price"]
+            return price * 1.06
+
+        # Unknown currency — pass through with warning
+        logger.warning("Unknown currency %r for FX conversion, returning raw price", currency)
+        return price
+
+
 # ---------------------------------------------------------------------------
 # Module-level singleton
 # ---------------------------------------------------------------------------
