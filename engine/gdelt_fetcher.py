@@ -89,43 +89,65 @@ class GdeltFetcher:
             "timespan": timespan,
         }
 
-        try:
-            logger.info("GDELT: querying %r (timespan=%s)", query, timespan)
+        max_attempts = 3
+        data = None
+        for attempt in range(max_attempts):
+            try:
+                logger.info("GDELT: querying %r (timespan=%s, attempt %d/%d)", query, timespan, attempt + 1, max_attempts)
 
-            response = httpx.get(
-                self.GDELT_API_BASE,
-                params=params,
-                timeout=self._timeout,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (compatible; OpenClawNewsAnalyzer/1.0; "
-                        "+https://github.com/openclaw)"
-                    ),
-                },
-            )
-
-            if response.status_code != 200:
-                logger.warning(
-                    "GDELT: query %r returned HTTP %d -- skipping.",
-                    query,
-                    response.status_code,
+                response = httpx.get(
+                    self.GDELT_API_BASE,
+                    params=params,
+                    timeout=self._timeout,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (compatible; OpenClawNewsAnalyzer/1.0; "
+                            "+https://github.com/openclaw)"
+                        ),
+                    },
                 )
+
+                if response.status_code == 429 and attempt < max_attempts - 1:
+                    import time
+                    wait = 2 ** (attempt + 1)
+                    logger.warning("GDELT: rate limited on %r — retrying in %ds", query, wait)
+                    time.sleep(wait)
+                    continue
+
+                if response.status_code != 200:
+                    logger.warning(
+                        "GDELT: query %r returned HTTP %d — skipping.",
+                        query,
+                        response.status_code,
+                    )
+                    return []
+
+                data = response.json()
+                break  # Success
+
+            except (httpx.TimeoutException, httpx.HTTPError) as exc:
+                if attempt < max_attempts - 1:
+                    import time
+                    wait = 2 ** (attempt + 1)
+                    logger.warning("GDELT: %s on %r — retrying in %ds (attempt %d/%d)", exc, query, wait, attempt + 1, max_attempts)
+                    time.sleep(wait)
+                    continue
+                logger.warning("GDELT: failed after %d attempts on %r: %s", max_attempts, query, exc)
+                return []
+            except ValueError:
+                if attempt < max_attempts - 1:
+                    import time
+                    wait = 2 ** (attempt + 1)
+                    logger.warning("GDELT: invalid JSON on %r — retrying in %ds (attempt %d/%d)", query, wait, attempt + 1, max_attempts)
+                    time.sleep(wait)
+                    continue
+                logger.warning("GDELT: invalid JSON response for query %r after %d attempts", query, max_attempts)
+                return []
+            except Exception:
+                logger.exception("GDELT: unexpected error querying %r", query)
                 return []
 
-            data = response.json()
-
-        except httpx.TimeoutException:
-            logger.warning("GDELT: timeout querying %r", query)
-            return []
-        except httpx.HTTPError as exc:
-            logger.warning("GDELT: HTTP error querying %r: %s", query, exc)
-            return []
-        except ValueError:
-            # json() decoding failed
-            logger.warning("GDELT: invalid JSON response for query %r", query)
-            return []
-        except Exception:
-            logger.exception("GDELT: unexpected error querying %r", query)
+        if data is None:
             return []
 
         raw_articles = data.get("articles") or []

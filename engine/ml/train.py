@@ -136,33 +136,27 @@ def train(force: bool = False) -> dict:
         features_df, labels_df = extract_all()
 
     if features_df.empty:
-        print("ERROR: No features available. Run prepare.py first.")
+        logger.error("No features available. Run prepare.py first.")
         return {}
 
     if labels_df.empty:
-        print("ERROR: No labeled data available. Need price outcome data.")
+        logger.error("No labeled data available. Need price outcome data.")
         return {}
 
     X, y, feature_cols = _select_features(features_df, labels_df)
 
     if X is None or len(X) == 0:
-        print(f"ERROR: No valid training samples after merge.")
+        logger.error("No valid training samples after merge.")
         return {}
 
     n_samples = len(X)
     n_positive = int(np.sum(y == 1))
     n_features = X.shape[1]
 
-    print(f"data_samples: {n_samples}")
-    print(f"data_positive: {n_positive}")
-    print(f"data_features: {n_features}")
+    logger.info("data_samples: %d, data_positive: %d, data_features: %d", n_samples, n_positive, n_features)
 
     if n_samples < MIN_TRAINING_SAMPLES and not force:
-        print(f"WARNING: Only {n_samples} samples (need {MIN_TRAINING_SAMPLES}). "
-              f"Use --force to train anyway.")
-        print("sharpe_ratio: 0.000000")
-        print("hit_rate: 0.0000")
-        print("brier_score: 1.000000")
+        logger.warning("Only %d samples (need %d). Use --force to train anyway.", n_samples, MIN_TRAINING_SAMPLES)
         return {}
 
     # TimeSeriesSplit cross-validation
@@ -246,13 +240,11 @@ def train(force: bool = False) -> dict:
     with open(_METADATA_PATH, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    # Print metrics (for autoresearch loop grep)
-    print(format_metrics(metrics))
-    print(f"training_seconds: {metadata['training_seconds']}")
-    print(f"\nTop features:")
-    for fname, fimp in top_features:
-        print(f"  {fname}: {fimp:.4f}")
-    print(f"\nModel saved: {_MODEL_PATH}")
+    # Log metrics (compatible with autoresearch grep)
+    logger.info(format_metrics(metrics))
+    logger.info("training_seconds: %s", metadata['training_seconds'])
+    logger.info("Top features: %s", ", ".join(f"{k}={v:.4f}" for k, v in top_features))
+    logger.info("Model saved: %s", _MODEL_PATH)
 
     return metadata
 

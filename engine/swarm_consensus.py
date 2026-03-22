@@ -55,6 +55,14 @@ OPENROUTER_RPM_LIMIT = 18  # OpenRouter free: 20 req/min → margin
 
 _groq_timestamps: List[float] = []
 _openrouter_timestamps: List[float] = []
+_groq_lock = asyncio.Lock()
+_openrouter_lock = asyncio.Lock()
+
+# Circuit breaker: track consecutive failures per provider
+_provider_failures: Dict[str, int] = {"groq": 0, "openrouter": 0}
+_provider_blocked_until: Dict[str, float] = {"groq": 0.0, "openrouter": 0.0}
+CIRCUIT_BREAKER_THRESHOLD = 5      # failures before tripping
+CIRCUIT_BREAKER_COOLDOWN = 120     # 2 minutes cooldown
 
 MAX_TOKENS = 2048
 
@@ -91,13 +99,21 @@ MAX_EVALS_PER_NODE_PER_DAY = 8  # Anti-loop: max evaluations per node per 24h
 # Expert agent definitions
 # ---------------------------------------------------------------------------
 
+def get_active_experts() -> List[Dict[str, str]]:
+    """Return only enabled experts."""
+    return [e for e in EXPERTS if e.get("enabled", True)]
+
+
 EXPERTS: List[Dict[str, str]] = [
     {
         "id": "geopolitical",
         "name": "Geopolitical Analyst",
         "emoji": "🌍",
+        "enabled": True,
         "provider": "openrouter",  # PAID Llama 70B — reliable, no rate limits
         "model": "llama-70b-paid",
+        "fallback_provider": "groq",        # Budget fallback: same model, free provider
+        "fallback_model": "llama-70b",
         "system": (
             "You are a senior geopolitical analyst at a hedge fund. "
             "You specialize in power dynamics between nation-states, military "
@@ -110,6 +126,7 @@ EXPERTS: List[Dict[str, str]] = [
         "id": "energy",
         "name": "Energy & Commodities Trader",
         "emoji": "⛽",
+        "enabled": True,
         "provider": "groq",      # Llama 3.3 70B
         "model": "llama-70b",
         "system": (
@@ -124,8 +141,11 @@ EXPERTS: List[Dict[str, str]] = [
         "id": "macro",
         "name": "Macro Economist",
         "emoji": "📊",
+        "enabled": True,
         "provider": "openrouter",  # PAID GPT-OSS 120B — strong analytical
         "model": "gpt-oss-120b",
+        "fallback_provider": "openrouter",   # Budget fallback: free Nemotron
+        "fallback_model": "nemotron-120b",
         "system": (
             "You are a macro economist at a major investment bank. You focus on "
             "central bank policy (Fed, ECB, BOJ), inflation dynamics, GDP growth, "
@@ -139,8 +159,11 @@ EXPERTS: List[Dict[str, str]] = [
         "id": "sentiment",
         "name": "Sentiment Analyst",
         "emoji": "📰",
-        "provider": "openrouter",  # UPGRADED: Qwen3.5 397B MoE — 12x more reasoning power
-        "model": "qwen35-397b",
+        "enabled": True,
+        "provider": "openrouter",  # Qwen3 235B MoE — was qwen35-397b (23x cheaper output)
+        "model": "qwen3-235b",
+        "fallback_provider": "openrouter",   # Budget fallback: free Hermes 405B
+        "fallback_model": "hermes-405b",
         "system": (
             "You are a sentiment and behavioral finance analyst. You track news "
             "narrative intensity, social media momentum, retail investor positioning, "
@@ -153,6 +176,7 @@ EXPERTS: List[Dict[str, str]] = [
         "id": "technical",
         "name": "Technical Analyst",
         "emoji": "📈",
+        "enabled": True,
         "provider": "groq",      # Scout 17B MoE — yet another token budget!
         "model": "scout-17b",
         "system": (
@@ -167,6 +191,7 @@ EXPERTS: List[Dict[str, str]] = [
         "id": "risk",
         "name": "Risk Manager",
         "emoji": "🛡️",
+        "enabled": True,
         "provider": "openrouter",  # FREE Nemotron 120B — fallback to Groq
         "model": "nemotron-120b",
         "system": (
@@ -181,8 +206,11 @@ EXPERTS: List[Dict[str, str]] = [
         "id": "contrarian",
         "name": "Contrarian",
         "emoji": "🔄",
+        "enabled": True,
         "provider": "openrouter",  # PAID Qwen3 235B MoE — diverse reasoning
         "model": "qwen3-235b",
+        "fallback_provider": "groq",         # Budget fallback: free Qwen3 32B
+        "fallback_model": "qwen3-32b",
         "system": (
             "You are a contrarian investor and devil's advocate. Your role is to "
             "challenge the consensus view. When others are bullish, find reasons for "
@@ -195,6 +223,7 @@ EXPERTS: List[Dict[str, str]] = [
         "id": "supplychain",
         "name": "Supply Chain & Second-Order Analyst",
         "emoji": "🔗",
+        "enabled": True,
         "provider": "groq",      # Qwen3 32B — different reasoning than Llama (audit Fix 4)
         "model": "qwen3-32b",
         "system": (
@@ -219,6 +248,7 @@ EXPERTS: List[Dict[str, str]] = [
         "id": "portfolio",
         "name": "Portfolio Risk Advisor",
         "emoji": "💼",
+        "enabled": True,
         "provider": "openrouter",  # FREE Hermes 405B — deepest reasoning (audit Fix 4)
         "model": "hermes-405b",
         "system": (
@@ -247,6 +277,7 @@ EXPERTS: List[Dict[str, str]] = [
         "id": "military",
         "name": "Military Strategy Analyst",
         "emoji": "🎖️",
+        "enabled": True,
         "provider": "groq",      # Llama 70B — strong reasoning, free
         "model": "llama-70b",
         "system": (
@@ -275,6 +306,7 @@ EXPERTS: List[Dict[str, str]] = [
         "id": "regulatory",
         "name": "Regulatory & Sanctions Analyst",
         "emoji": "⚖️",
+        "enabled": True,
         "provider": "groq",      # Qwen3 32B — good for structured legal analysis
         "model": "qwen3-32b",
         "system": (
@@ -302,6 +334,7 @@ EXPERTS: List[Dict[str, str]] = [
         "id": "sector",
         "name": "Sector Rotation Analyst",
         "emoji": "🏭",
+        "enabled": True,
         "provider": "openrouter",  # FREE Nemotron 120B — strong reasoning
         "model": "nemotron-120b",
         "system": (
@@ -327,13 +360,316 @@ EXPERTS: List[Dict[str, str]] = [
             "entry logic: 'Rotate INTO [sector] via [ticker] BECAUSE [catalyst]'."
         ),
     },
+    # ── 13th expert: Emerging Opportunities (active by default) ──
+    {
+        "id": "emerging_opportunities",
+        "name": "Emerging Opportunities Analyst",
+        "emoji": "🔮",
+        "enabled": True,
+        "provider": "openrouter",
+        "model": "qwen3-235b",
+        "fallback_provider": "groq",
+        "fallback_model": "qwen3-32b",
+        "system": (
+            "You are an emerging opportunities analyst who looks BEYOND the obvious. "
+            "When everyone focuses on oil, you analyze nuclear energy, renewables, and shipping. "
+            "When defense is hot, you examine cybersecurity, space tech, and rare earth miners. "
+            "Your specialty: "
+            "1) SECOND-ORDER BENEFICIARIES: If sector X is in the news, who benefits indirectly? "
+            "E.g., if oil spikes → look at nuclear (CCJ, LEU), LNG shippers (FLNG), energy storage. "
+            "2) ALTERNATIVE PLAYS: For every obvious trade, find the non-obvious alternative. "
+            "3) CROSS-SECTOR CONNECTIONS: A Middle East crisis doesn't just affect oil — "
+            "it affects shipping insurance, desalination, food imports, construction. "
+            "4) CONTRARIAN OPPORTUNITIES: What's being ignored while everyone watches the headline? "
+            "Always name SPECIFIC tickers and explain the non-obvious causal chain."
+        ),
+    },
+    # ── Optional experts (disabled by default — enable via Settings) ──────
+    {
+        "id": "nuclear",
+        "name": "Nuclear Energy Analyst",
+        "emoji": "☢️",
+        "enabled": False,
+        "provider": "groq",
+        "model": "llama-70b",
+        "system": "You are a nuclear energy sector analyst. You track uranium prices (UXC spot/term), enrichment capacity (SWU), reactor construction pipelines, SMR developers (NuScale, X-energy), and fuel cycle companies (CCJ, LEU, UEC, DNN). You understand NRC licensing, geopolitical uranium supply (Kazakhstan, Niger, Australia), and how energy policy shifts create long-term demand catalysts for nuclear.",
+    },
+    {
+        "id": "crypto",
+        "name": "Cryptocurrency Strategist",
+        "emoji": "₿",
+        "enabled": False,
+        "provider": "groq",
+        "model": "qwen3-32b",
+        "system": "You are a cryptocurrency and digital assets strategist. You track BTC, ETH, and major altcoins, DeFi protocols, stablecoin flows, on-chain metrics (whale movements, exchange reserves), and regulatory developments (SEC, MiCA). You understand how geopolitical events drive crypto as a safe haven or risk asset, and how mining hash rate shifts signal market moves.",
+    },
+    {
+        "id": "realestate",
+        "name": "Real Estate & REITs Analyst",
+        "emoji": "🏠",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "nemotron-120b",
+        "system": "You are a real estate and REIT analyst. You track commercial and residential real estate trends, REIT valuations (VNQ, VNQI), interest rate sensitivity, cap rate compression/expansion, and how geopolitical events affect property markets (migration flows, foreign investment, sanctions on oligarch properties). You focus on European REITs and property stocks available on Xetra.",
+    },
+    {
+        "id": "pharma",
+        "name": "Pharmaceutical & Biotech Analyst",
+        "emoji": "💊",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "gpt-oss-120b",
+        "system": "You are a pharmaceutical and biotech analyst. You track drug pipelines, FDA/EMA approvals, clinical trial results, patent cliffs, and biosimilar competition. You understand how geopolitical events affect pharma supply chains (API sourcing from India/China), drug pricing policy, and pandemic preparedness spending. Name specific tickers and catalysts.",
+    },
+    {
+        "id": "aitech",
+        "name": "AI & Technology Analyst",
+        "emoji": "🤖",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "qwen3-235b",
+        "system": "You are an AI and technology sector analyst. You track AI chip demand (NVDA, AMD, INTC), cloud infrastructure (AMZN, MSFT, GOOGL), AI model companies, and the broader tech stack. You understand export controls on AI chips, data center power requirements, and how geopolitical tensions affect tech supply chains and market access.",
+    },
+    {
+        "id": "agriculture",
+        "name": "Agricultural Commodities Trader",
+        "emoji": "🌾",
+        "enabled": False,
+        "provider": "groq",
+        "model": "llama-70b",
+        "system": "You are an agricultural commodities trader. You track wheat, corn, soybeans, fertilizers (potash, phosphate, nitrogen), and soft commodities. You understand how geopolitical events affect food supply chains — Black Sea grain corridors, fertilizer export bans, drought/flood impacts. You track companies like ADM, BG, MOS, NTR, CF, and agricultural ETFs.",
+    },
+    {
+        "id": "water",
+        "name": "Water & Natural Resources Analyst",
+        "emoji": "💧",
+        "enabled": False,
+        "provider": "groq",
+        "model": "qwen3-32b",
+        "system": "You are a water and natural resources analyst. You track water utilities, desalination technology, water infrastructure companies (XYL, AWK, WTS, WTRG), and water scarcity trends. You understand how climate change, population growth, and geopolitical conflicts affect water access and the investment case for water infrastructure.",
+    },
+    {
+        "id": "space",
+        "name": "Space & Satellite Industry Analyst",
+        "emoji": "🛰️",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "hermes-405b",
+        "system": "You are a space and satellite industry analyst. You track launch providers, satellite operators (IRDM, VSAT), space defense (LMT Space, LDOS), earth observation (MAXR), and commercial space companies. You understand how geopolitical tensions drive demand for satellite communications, surveillance, and GPS alternatives.",
+    },
+    {
+        "id": "cybersecurity",
+        "name": "Cybersecurity Threat Analyst",
+        "emoji": "🔒",
+        "enabled": False,
+        "provider": "groq",
+        "model": "llama-70b",
+        "system": "You are a cybersecurity threat and market analyst. You track cyber attacks, ransomware trends, state-sponsored hacking, and how these events drive demand for cybersecurity stocks (CRWD, PANW, FTNT, S, ZS). You understand how geopolitical escalation increases cyber threat levels and creates buying opportunities in security companies.",
+    },
+    {
+        "id": "insurance",
+        "name": "Insurance & Catastrophe Risk Analyst",
+        "emoji": "🏛️",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "nemotron-120b",
+        "system": "You are an insurance and catastrophe risk analyst. You track reinsurance pricing, catastrophe bonds, war risk insurance premiums, and how geopolitical events affect insurance markets. You follow companies like BRK.B, MKL, RE, RNR, and understand how shipping insurance (P&I clubs), political risk insurance, and trade credit insurance react to geopolitical shocks.",
+    },
+    {
+        "id": "luxury",
+        "name": "Luxury & Consumer Goods Analyst",
+        "emoji": "👜",
+        "enabled": False,
+        "provider": "groq",
+        "model": "qwen3-32b",
+        "system": "You are a luxury and consumer goods analyst. You track LVMH (MC.PA), Hermès (RMS.PA), Kering (KER.PA), Richemont (CFR.SW), and consumer sentiment. You understand how geopolitical events, sanctions (Russian oligarch spending), Chinese consumer confidence, and currency movements affect luxury demand and pricing power.",
+    },
+    {
+        "id": "demographics",
+        "name": "Demographics & Population Analyst",
+        "emoji": "👥",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "hermes-405b",
+        "system": "You are a demographics and population trends analyst. You track aging populations, migration patterns, urbanization, and labor market shifts. You understand how demographic mega-trends create 5-10 year investment themes: healthcare demand, pension systems, housing, education, and consumer behavior shifts across regions.",
+    },
+    {
+        "id": "climate",
+        "name": "Climate & ESG Analyst",
+        "emoji": "🌡️",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "gpt-oss-120b",
+        "system": "You are a climate and ESG analyst. You track carbon credit markets (EUA), clean energy investments, CBAM implementation, ESG fund flows, and stranded asset risk. You understand how climate policy (EU Green Deal, IRA) creates winners and losers, and how extreme weather events affect commodity prices, insurance costs, and infrastructure spending.",
+    },
+    {
+        "id": "shipping",
+        "name": "Shipping & Logistics Analyst",
+        "emoji": "🚢",
+        "enabled": False,
+        "provider": "groq",
+        "model": "llama-70b",
+        "system": "You are a shipping and logistics analyst. You track container rates (SCFI, FBX), bulk shipping (BDI), tanker rates, and chokepoint risks (Suez, Hormuz, Malacca, Panama). You follow companies like MAERSK.B, ZIM, STNG, INSW, and understand how geopolitical disruptions to shipping routes create price spikes and rerouting opportunities.",
+    },
+    {
+        "id": "centralbank",
+        "name": "Central Bank Policy Analyst",
+        "emoji": "🏦",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "qwen3-235b",
+        "system": "You are a central bank policy analyst. You track Fed, ECB, BOJ, PBOC, and BOE policy decisions, forward guidance, dot plots, and balance sheet operations. You understand how geopolitical shocks force central banks to choose between inflation fighting and financial stability, and how these decisions affect rates, currencies, and equity markets.",
+    },
+    {
+        "id": "emergingmarkets",
+        "name": "Emerging Markets Specialist",
+        "emoji": "🌏",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "nemotron-120b",
+        "system": "You are an emerging markets specialist. You track EM equities (EEM, VWO), EM bonds, frontier markets, and country-specific risks. You understand how geopolitical events differentially affect EMs — commodity exporters vs importers, dollarized economies, and countries caught in great power competition. You track EM ETFs available on European exchanges.",
+    },
+    {
+        "id": "privateequity",
+        "name": "Private Equity & VC Analyst",
+        "emoji": "🦄",
+        "enabled": False,
+        "provider": "groq",
+        "model": "qwen3-32b",
+        "system": "You are a PE and VC market analyst tracking publicly listed alternatives managers (KKR, BX, APO, ARES, CG) and their portfolio exposure to geopolitical risk. You understand how credit conditions, deal flow, and exit markets are affected by geopolitical uncertainty, and how this creates opportunities in listed PE vehicles and BDCs.",
+    },
+    {
+        "id": "credit",
+        "name": "Debt & Credit Markets Analyst",
+        "emoji": "📋",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "gpt-oss-120b",
+        "system": "You are a credit markets analyst. You track investment grade and high-yield spreads (LQD, HYG), CDS indices (iTraxx, CDX), sovereign debt (CDS spreads for at-risk countries), and distressed debt opportunities. You understand how geopolitical events trigger credit events, rating downgrades, and flight-to-quality flows between sovereign and corporate bonds.",
+    },
+    {
+        "id": "forex",
+        "name": "Foreign Exchange Strategist",
+        "emoji": "💱",
+        "enabled": False,
+        "provider": "groq",
+        "model": "llama-70b",
+        "system": "You are a foreign exchange strategist. You track major pairs (EUR/USD, USD/JPY, GBP/USD), EM currencies, and safe-haven flows (CHF, JPY, gold). You understand how geopolitical events trigger currency moves through trade balance effects, capital flows, interest rate differentials, and risk sentiment shifts. You recommend currency-hedged ETFs when appropriate.",
+    },
+    {
+        "id": "politicalrisk",
+        "name": "Political Risk Analyst",
+        "emoji": "🗳️",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "hermes-405b",
+        "system": "You are a political risk analyst focused on elections, regime changes, and policy shifts. You track global elections calendars, polling data, policy platform analysis, and how political transitions affect market sectors. You understand populism, trade protectionism, and how political ideology shifts create sector rotation opportunities.",
+    },
+    {
+        "id": "sanctions_detection",
+        "name": "Sanctions Evasion Detector",
+        "emoji": "🔍",
+        "enabled": False,
+        "provider": "groq",
+        "model": "qwen3-32b",
+        "system": "You are a sanctions evasion detection analyst. You track ship-to-ship transfers, dark fleet movements, front companies, and alternative payment systems used to circumvent sanctions. You understand how sanctions evasion patterns create risk for compliant companies and opportunities for enforcement technology providers.",
+    },
+    {
+        "id": "media",
+        "name": "Media & Propaganda Analyst",
+        "emoji": "📺",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "nemotron-120b",
+        "system": "You are a media and propaganda analyst. You track state media narratives, information operations, social media amplification campaigns, and how coordinated messaging affects market sentiment. You understand the difference between genuine news events and manufactured narratives, and how to discount propaganda-driven market moves.",
+    },
+    {
+        "id": "infrastructure",
+        "name": "Infrastructure & Construction Analyst",
+        "emoji": "🏗️",
+        "enabled": False,
+        "provider": "groq",
+        "model": "llama-70b",
+        "system": "You are an infrastructure and construction analyst. You track government infrastructure spending (US IIJA, EU recovery plans), construction materials (steel, cement, aggregates), and engineering companies (VMC, MLM, AECOM, HOCHTIEF). You understand how geopolitical events drive reconstruction spending, military base construction, and border infrastructure investment.",
+    },
+    {
+        "id": "automotive",
+        "name": "Automotive & EV Industry Analyst",
+        "emoji": "🚗",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "qwen3-235b",
+        "system": "You are an automotive and EV industry analyst. You track legacy automakers (BMW, VW, STLA), EV pure-plays (TSLA, RIVN, NIO), battery makers (CATL, LG), and charging infrastructure. You understand how geopolitical events affect auto supply chains (chips, rare earths, steel), EV adoption policies, and how energy prices drive the ICE-to-EV transition economics.",
+    },
+    {
+        "id": "semiconductors",
+        "name": "Semiconductor & Chip Supply Analyst",
+        "emoji": "🔬",
+        "enabled": False,
+        "provider": "groq",
+        "model": "qwen3-32b",
+        "system": "You are a semiconductor supply chain analyst. You track TSMC, Samsung, Intel, ASML, and the entire chip supply chain. You understand export controls (Entity List, CHIPS Act), fab construction timelines, and how Taiwan Strait tensions create existential risk for the global chip supply. You track inventory cycles, book-to-bill ratios, and end-market demand shifts.",
+    },
+    {
+        "id": "foodsecurity",
+        "name": "Food Security & Famine Analyst",
+        "emoji": "🍞",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "hermes-405b",
+        "system": "You are a food security analyst. You track global food price indices (FAO), grain trade flows, fertilizer availability, and regions at risk of food crises. You understand how geopolitical conflicts disrupt food supply chains, create refugee flows that strain neighboring economies, and how food insecurity leads to political instability that creates further market risk.",
+    },
+    {
+        "id": "migration",
+        "name": "Migration & Refugee Impact Analyst",
+        "emoji": "🌐",
+        "enabled": False,
+        "provider": "groq",
+        "model": "llama-70b",
+        "system": "You are a migration and refugee impact analyst. You track displacement patterns, border policy changes, and how population movements affect labor markets, housing, healthcare, and social services budgets. You understand how migration creates investment opportunities in housing construction, healthcare expansion, and consumer staples in receiving countries.",
+    },
+    {
+        "id": "telecom",
+        "name": "Telecommunications Analyst",
+        "emoji": "📡",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "nemotron-120b",
+        "system": "You are a telecommunications analyst. You track 5G deployment, fiber infrastructure, submarine cable routes, and telecom operators (DTE.DE, ORAN, VOD). You understand how geopolitical events affect internet connectivity (cable cuts, sanctions on tech), spectrum auctions, and how conflicts drive demand for satellite communications (Starlink competitors).",
+    },
+    {
+        "id": "mining",
+        "name": "Mining & Rare Earth Analyst",
+        "emoji": "⛏️",
+        "enabled": False,
+        "provider": "groq",
+        "model": "qwen3-32b",
+        "system": "You are a mining and rare earth elements analyst. You track critical minerals (lithium, cobalt, nickel, rare earths), mining jurisdictions, and supply chain concentration risks (China's dominance in REE processing). You follow companies like ALB, LAC, MP, LTHM, and understand how export controls, resource nationalism, and EV demand create structural supply deficits.",
+    },
+    {
+        "id": "tourism",
+        "name": "Tourism & Travel Industry Analyst",
+        "emoji": "✈️",
+        "enabled": False,
+        "provider": "openrouter",
+        "model": "gpt-oss-120b",
+        "system": "You are a tourism and travel industry analyst. You track airlines (LHA.DE, AF.PA, IAG.L), hotel chains (MAR, HLT), online travel (BKNG, ABNB), and cruise lines (RCL, CCL). You understand how geopolitical events affect travel demand, airspace closures, visa restrictions, and travel insurance costs. You identify which travel companies benefit from route disruptions.",
+    },
 ]
 
 # ---------------------------------------------------------------------------
 # Round prompts
 # ---------------------------------------------------------------------------
 
-ROUND1_USER = """\
+# --- Round 1 prompt split for prefix caching ---
+# The data context (question, consequences, market data, etc.) goes into the
+# first system message.  The expert-specific analysis instruction goes into the
+# user message.  Because _trim_context_for_expert blanks out irrelevant fields
+# per expert, the shared context is not fully identical across experts — but
+# experts that share the same provider/model and similar allowed fields will
+# still benefit from partial prefix caching.
+
+ROUND1_SHARED_CONTEXT = """\
 DECISION NODE: {question}
 Timeline: {timeline}
 Current probability (YES): {yes_prob}%
@@ -372,13 +708,19 @@ MARKET CONTEXT:
 
 {portfolio_context}
 
----
+{swarm_memory}"""
 
+ROUND1_EXPERT_INSTRUCTION = """\
 As the {expert_name}, analyze this decision node from your expertise.
 Use ALL the data above — news sentiment, narrative momentum, prediction markets, \
 probability trail, price momentum, military posture, news-price correlation, and forward outlook.
 If portfolio holdings are shown above, consider how this event impacts the user's specific positions.
 Cross-reference the news-price correlation data to validate whether narrative shifts actually move these tickers.
+If SWARM MEMORY is provided above, use it as baseline context:
+- Consider whether new developments confirm or challenge the previous verdict.
+- Note probability trajectory trends — is the situation escalating or de-escalating?
+- Flag any surprises or unexpected shifts since last evaluation.
+- Do NOT blindly anchor to the previous probability — re-evaluate from first principles with new evidence.
 Provide your INDEPENDENT assessment in this JSON format:
 {{
   "assessment": "Your 2-3 sentence analysis from your domain expertise",
@@ -392,7 +734,16 @@ Provide your INDEPENDENT assessment in this JSON format:
 }}
 Respond with JSON only."""
 
-ROUND2_USER = """\
+# --- Round 2 prompt split for prefix caching ---
+# The shared context (assessments, enrichment, disagreement) is IDENTICAL across
+# all experts and goes into the first system message.  The expert-specific
+# instruction is short and goes into the user message.  This lets the LLM
+# provider cache the large shared prefix and bill only incremental tokens for
+# each additional expert call (~60% fewer billed input tokens).
+
+ROUND2_SHARED_CONTEXT = """\
+ROUND 2 DEBATE CONTEXT
+
 Here are the Round 1 assessments from ALL experts on this decision:
 
 DECISION: {question}
@@ -403,15 +754,15 @@ SHARED INTELLIGENCE SUMMARY:
 {enrichment_summary}
 
 EXPERT DISAGREEMENT MAP:
-{disagreement_map}
+{disagreement_map}"""
 
----
-
+ROUND2_EXPERT_INSTRUCTION = """\
 As the {expert_name}, you now see what your colleagues think.
 The SHARED INTELLIGENCE SUMMARY contains the key data all experts had access to.
 Use it to validate or challenge the other experts' data interpretation.
 CHALLENGE or REFINE your position. Where do you DISAGREE? What data point did others misinterpret?
 Did anyone ignore the military posture, forward outlook, or news-price correlation data?
+IMPORTANT: If your revised probability moves more than 5 points toward the group median compared to your Round 1 estimate, you MUST cite a specific data point or expert argument that justifies the shift. "The other experts convinced me" is NOT valid — only new evidence or a factual correction you overlooked counts.
 
 Update your assessment in this JSON format:
 {{
@@ -428,11 +779,17 @@ Respond with JSON only."""
 
 ROUND3_SYNTHESIS = """\
 You are a portfolio manager writing the narrative summary for a trading decision.
-The quantitative verdict (direction, confidence, tickers, probability) is already computed.
-Your job is ONLY to write human-readable narrative fields.
+The quantitative verdict is already computed deterministically — you CANNOT change it.
+Your job is ONLY to write human-readable narrative fields explaining the rationale.
 
 DECISION NODE: {question}
 Timeline: {timeline}
+
+COMPUTED VERDICT (deterministic — do NOT override):
+Direction: {verdict_direction}
+Confidence: {verdict_confidence}%
+YES probability: {verdict_probability}%
+Primary ticker: {verdict_ticker} ({verdict_ticker_direction})
 
 ROUND 2 EXPERT ASSESSMENTS (after debate):
 {all_round2_assessments}
@@ -441,10 +798,10 @@ ROUND 2 EXPERT ASSESSMENTS (after debate):
 
 Respond with this JSON (narrative fields ONLY):
 {{
-  "entry_reasoning": "2-3 sentences: why enter this trade NOW or why wait",
-  "exit_trigger": "What event or price level triggers the exit",
-  "risk_note": "Key risk the experts flagged",
-  "dissent_note": "Strongest contrarian objection from the panel"
+  "entry_reasoning": "2-3 sentences: why enter this trade NOW or why wait — reference the expert assessments",
+  "exit_trigger": "What event or price level triggers the exit — be specific with numbers",
+  "risk_note": "Key risk the experts flagged — include the concrete invalidation trigger",
+  "dissent_note": "Strongest contrarian objection from the panel — name which expert disagreed and why"
 }}
 Respond with JSON only."""
 
@@ -492,21 +849,71 @@ def _get_openrouter_client() -> Optional[OpenAI]:
 def _get_client_and_model(expert: Dict) -> Tuple[Optional[OpenAI], str]:
     """Return the appropriate client and model for an expert.
 
+    Budget-aware: downgrades paid experts to free fallbacks when budget is tight.
     Falls back to Groq if OpenRouter is not configured.
     """
     provider = expert.get("provider", "groq")
     model_key = expert.get("model", "llama-70b")
+    expert_id = expert.get("id", "?")
 
+    # --- Budget gate for paid OpenRouter experts ---
+    _FREE_OR_MODELS = {"nemotron-120b", "hermes-405b"}
+    is_free = (provider == "groq" or model_key in _FREE_OR_MODELS)
+
+    if not is_free and provider == "openrouter":
+        try:
+            from .tree_generator import get_budget_tier, BudgetTier, can_spend
+            tier = get_budget_tier()
+
+            if tier == BudgetTier.BLOCKED:
+                logger.warning("BLOCKED: skipping paid expert %s entirely.", expert_id)
+                return None, ""
+
+            if tier in (BudgetTier.ECONOMY, BudgetTier.EMERGENCY):
+                # Downgrade to free fallback model
+                fb_provider = expert.get("fallback_provider")
+                fb_model = expert.get("fallback_model")
+                if fb_provider and fb_model:
+                    logger.info(
+                        "%s tier: downgrading %s → %s/%s (free)",
+                        tier.value.upper(), expert_id, fb_provider, fb_model,
+                    )
+                    return _get_client_and_model({"provider": fb_provider, "model": fb_model})
+                logger.info("%s tier: no fallback for %s, skipping.", tier.value.upper(), expert_id)
+                return None, ""
+
+            # PREMIUM/STANDARD — pre-flight cost check for paid models
+            actual_model = OPENROUTER_MODELS.get(model_key, "")
+            pricing = _MODEL_PRICING.get(actual_model)
+            if pricing:
+                est_cost_usd = 1500 * pricing[0] + 800 * pricing[1]
+                est_cost_eur = est_cost_usd * _USD_TO_EUR
+                if not can_spend(est_cost_eur):
+                    logger.warning(
+                        "Pre-flight: %s (€%.4f) would exceed ceiling — using fallback.",
+                        expert_id, est_cost_eur,
+                    )
+                    fb_provider = expert.get("fallback_provider")
+                    fb_model = expert.get("fallback_model")
+                    if fb_provider and fb_model:
+                        return _get_client_and_model({"provider": fb_provider, "model": fb_model})
+                    return None, ""
+        except ImportError:
+            pass  # tree_generator not available — proceed without budget check
+
+    # --- Standard routing (unchanged) ---
     if provider == "openrouter":
         client = _get_openrouter_client()
         if client is not None:
             model_name = OPENROUTER_MODELS.get(model_key, OPENROUTER_MODELS.get("hermes-405b"))
             return client, model_name
         # Fallback to Groq
-        logger.debug("OpenRouter unavailable for %s — falling back to Groq", expert["id"])
+        logger.debug("OpenRouter unavailable for %s — falling back to Groq", expert_id)
 
     # Resolve Groq model from mapping
     client = _get_groq_client()
+    if client is None:
+        return None, ""
     groq_model = GROQ_MODELS.get(model_key, GROQ_DEFAULT_MODEL)
     return client, groq_model
 
@@ -530,16 +937,28 @@ async def _rate_limited_call(
     timestamps = _openrouter_timestamps if is_openrouter else _groq_timestamps
     rpm_limit = OPENROUTER_RPM_LIMIT if is_openrouter else GROQ_RPM_LIMIT
     provider_name = "OpenRouter" if is_openrouter else "Groq"
+    lock = _openrouter_lock if is_openrouter else _groq_lock
+    provider_key = "openrouter" if is_openrouter else "groq"
 
-    # --- Rate limiter ---
-    now = time.time()
-    timestamps[:] = [t for t in timestamps if now - t < 60]
-    if len(timestamps) >= rpm_limit:
-        wait_time = 60 - (now - timestamps[0]) + 0.5
-        logger.debug("%s rate limit — waiting %.1fs", provider_name, wait_time)
-        await asyncio.sleep(wait_time)
+    # --- Circuit breaker check ---
+    if time.time() < _provider_blocked_until.get(provider_key, 0):
+        remaining = _provider_blocked_until[provider_key] - time.time()
+        logger.warning("%s circuit breaker OPEN (%.0fs remaining) — skipping call", provider_name, remaining)
+        return None
 
-    timestamps.append(time.time())
+    # --- Rate limiter (with async lock for thread safety) ---
+    async with lock:
+        now = time.time()
+        timestamps[:] = [t for t in timestamps if now - t < 60]
+        if len(timestamps) >= rpm_limit:
+            wait_time = 60 - (now - timestamps[0]) + 0.5
+            logger.debug("%s rate limit — waiting %.1fs", provider_name, wait_time)
+            await asyncio.sleep(wait_time)
+            # Re-prune after sleep to account for elapsed time
+            now = time.time()
+            timestamps[:] = [t for t in timestamps if now - t < 60]
+
+        timestamps.append(time.time())
 
     # --- API call (sync in thread to not block event loop) ---
     try:
@@ -588,7 +1007,11 @@ async def _rate_limited_call(
             **kwargs,
         )
 
-        content = response.choices[0].message.content.strip()
+        raw_content = response.choices[0].message.content
+        if raw_content is None:
+            logger.warning("%s returned None content for %s.", provider_name, purpose)
+            return None
+        content = raw_content.strip()
 
         # Log usage
         usage = response.usage
@@ -600,12 +1023,23 @@ async def _rate_limited_call(
 
         # Parse JSON (handle markdown wrapping and thinking tags)
         parsed = _parse_json_response(content, provider_name, model)
+        # Circuit breaker: reset on success
+        _provider_failures[provider_key] = 0
         # Sanitize numeric fields to prevent LLM hallucination
         return _sanitize_expert_response(parsed) if parsed else None
 
     except Exception as e:
         error_str = str(e)
         logger.error("%s API call failed (model=%s): %s", provider_name, model, e)
+
+        # Circuit breaker: track consecutive failures
+        _provider_failures[provider_key] = _provider_failures.get(provider_key, 0) + 1
+        if _provider_failures[provider_key] >= CIRCUIT_BREAKER_THRESHOLD:
+            _provider_blocked_until[provider_key] = time.time() + CIRCUIT_BREAKER_COOLDOWN
+            logger.warning(
+                "%s circuit breaker TRIPPED after %d consecutive failures — blocking for %ds",
+                provider_name, _provider_failures[provider_key], CIRCUIT_BREAKER_COOLDOWN,
+            )
 
         # Don't recurse if we're already in a fallback attempt
         if _is_fallback:
@@ -741,12 +1175,12 @@ def _sanitize_expert_response(response: Dict) -> Dict:
     return response
 
 
-# Per-token pricing (USD) for paid models — used for cost tracking
+# Per-token pricing (USD) for paid models — used for cost tracking & budget gating
+# qwen3.5-397b removed: was €1.53/day (23x more expensive output than qwen3-235b)
 _MODEL_PRICING = {
     "meta-llama/llama-3.3-70b-instruct": (1e-7, 3.2e-7),
     "openai/gpt-oss-120b": (3.9e-8, 1.9e-7),
     "qwen/qwen3-235b-a22b-2507": (7.1e-8, 1e-7),
-    "qwen/qwen3.5-397b-a17b": (3.9e-7, 2.34e-6),
 }
 _USD_TO_EUR = 0.92
 
@@ -896,7 +1330,41 @@ def _get_news_intelligence(node: DecisionNode, db) -> str:
         lines.append(f"Event types: {', '.join(evt_parts[:5])}")
     if kw_parts:
         lines.append(f"Top keywords: {', '.join(kw_parts)}")
+
+    # Entity aggregation (currently entities_json is never surfaced)
+    all_entities = {}
+    for b in briefs:
+        try:
+            ents = json.loads(getattr(b, 'entities_json', '{}') or '{}')
+            for category in ("persons", "organizations", "locations"):
+                for ent in ents.get(category, []):
+                    if ent and len(ent) > 1:
+                        all_entities[ent] = all_entities.get(ent, 0) + 1
+        except Exception:
+            pass
+    if all_entities:
+        top_ents = sorted(all_entities.items(), key=lambda x: -x[1])[:8]
+        lines.append(f"Key actors: {', '.join(f'{e}({c})' for e, c in top_ents)}")
+
     lines.append(f"Source credibility: {avg_cred:.2f} avg | Urgency: {avg_urg:.2f} avg")
+
+    # Top headlines with summaries (currently summaries are never surfaced to experts)
+    top_briefs = sorted(briefs, key=lambda b: getattr(b, 'urgency_score', 0) or 0, reverse=True)[:5]
+    headline_lines = []
+    for b in top_briefs:
+        summary = (getattr(b, 'summary', '') or '')[:120]
+        if summary:
+            src = ''
+            try:
+                if b.article:
+                    src = f"[{b.article.source}] "
+            except Exception:
+                pass
+            sent = getattr(b, 'sentiment', 0) or 0
+            headline_lines.append(f"  • {src}{summary} (sent: {sent:+.2f})")
+    if headline_lines:
+        lines.append("\nTOP HEADLINES:")
+        lines.extend(headline_lines[:5])
 
     return "\n".join(lines)
 
@@ -1570,6 +2038,127 @@ def _get_portfolio_context(node: DecisionNode, db) -> str:
         return ""
 
 
+def _build_swarm_memory(node: DecisionNode, db) -> str:
+    """Build the 'Swarm Memory' briefing from previous evaluations.
+
+    Returns a compact text block that gives experts:
+    1. Previous verdict summary (probability, confidence, action, reasoning)
+    2. Verdict trajectory (how probability evolved over recent evaluations)
+    3. New developments since last evaluation (article count + highlights)
+    4. Surprise factor (what diverged from expectations)
+
+    Cost: 1 DB query for verdicts + 1 for new articles.  ~200 tokens in prompt.
+    """
+    try:
+        # Get recent verdicts for this node (up to 5, newest first)
+        recent_verdicts = (
+            db.query(SwarmVerdict)
+            .filter(SwarmVerdict.decision_node_id == node.id)
+            .order_by(SwarmVerdict.created_at.desc())
+            .limit(5)
+            .all()
+        )
+
+        if not recent_verdicts:
+            return ""  # First evaluation — no memory
+
+        latest = recent_verdicts[0]
+        hours_ago = (datetime.utcnow() - latest.created_at).total_seconds() / 3600
+
+        lines = ["SWARM MEMORY — PREVIOUS EVALUATION BRIEFING:"]
+        lines.append(f"Last evaluated: {hours_ago:.1f}h ago ({latest.created_at.strftime('%Y-%m-%d %H:%M')} UTC)")
+
+        # 1. Previous verdict summary
+        lines.append(f"Previous verdict: {latest.verdict} (confidence: {latest.confidence:.0%})")
+        lines.append(f"Previous YES probability: {latest.yes_probability:.0%}")
+        if latest.entry_reasoning:
+            # Truncate to ~150 chars for token efficiency
+            reasoning = latest.entry_reasoning[:200]
+            if len(latest.entry_reasoning) > 200:
+                reasoning += "..."
+            lines.append(f"Previous reasoning: {reasoning}")
+        if latest.risk_note:
+            lines.append(f"Key risk identified: {latest.risk_note[:120]}")
+        if latest.dissent_note:
+            lines.append(f"Dissent: {latest.dissent_note[:120]}")
+
+        # 2. Verdict trajectory (if multiple evaluations)
+        if len(recent_verdicts) > 1:
+            trajectory = []
+            for v in reversed(recent_verdicts):
+                t = v.created_at.strftime("%d/%m %H:%M")
+                trajectory.append(f"{t}: {v.yes_probability:.0%} ({v.verdict})")
+            lines.append(f"Probability trajectory: {' → '.join(trajectory)}")
+
+            # Detect trend
+            first_prob = recent_verdicts[-1].yes_probability
+            last_prob = latest.yes_probability
+            delta = last_prob - first_prob
+            if abs(delta) > 0.05:
+                direction = "RISING ↑" if delta > 0 else "FALLING ↓"
+                lines.append(f"Trend: {direction} ({delta:+.0%} over {len(recent_verdicts)} evaluations)")
+
+        # 3. New developments since last evaluation
+        from .db import Article, ArticleBrief
+        run_up = db.query(RunUp).get(node.run_up_id)
+        if run_up:
+            new_articles = (
+                db.query(Article)
+                .join(ArticleBrief, ArticleBrief.article_id == Article.id)
+                .filter(
+                    Article.fetched_at > latest.created_at,
+                    ArticleBrief.summary.isnot(None),
+                )
+                .order_by(ArticleBrief.sentiment.desc())
+                .limit(50)
+                .all()
+            )
+
+            # Filter articles related to this narrative (simple keyword match)
+            narrative_words = set(run_up.narrative_name.lower().replace("-", " ").split())
+            relevant = []
+            for a in new_articles:
+                title_words = set(a.title.lower().split())
+                if narrative_words & title_words:
+                    relevant.append(a)
+            relevant = relevant[:5]  # Top 5 most relevant
+
+            if relevant:
+                lines.append(f"\nNEW DEVELOPMENTS ({len(new_articles)} articles since last eval, {len(relevant)} relevant):")
+                for a in relevant:
+                    src = a.source[:25] if a.source else "?"
+                    title = a.title[:100] if a.title else "?"
+                    # Instead of just title, include sentiment and summary
+                    sent_str = ""
+                    summary_snip = ""
+                    try:
+                        if hasattr(a, 'brief') and a.brief:
+                            sent_str = f" (sent:{a.brief.sentiment:+.2f})" if a.brief.sentiment else ""
+                            summary_snip = f" — {(a.brief.summary or '')[:80]}" if a.brief.summary else ""
+                    except Exception:
+                        pass
+                    lines.append(f"  • [{src}] {title}{sent_str}{summary_snip}")
+            else:
+                lines.append(f"\nNew articles since last eval: {len(new_articles)} (none directly narrative-related)")
+
+        # 4. Surprise factor
+        if latest.entry_reasoning and len(recent_verdicts) >= 2:
+            prev = recent_verdicts[1]
+            prob_shift = abs(latest.yes_probability - prev.yes_probability)
+            if prob_shift > 0.10:
+                lines.append(f"\n⚡ SURPRISE: Probability shifted {prob_shift:.0%} between last two evaluations!")
+            verdict_changed = latest.verdict != prev.verdict
+            if verdict_changed:
+                lines.append(f"⚡ VERDICT CHANGED: {prev.verdict} → {latest.verdict}")
+
+        lines.append("")  # trailing newline
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.debug("Swarm memory build failed (non-fatal): %s", e)
+        return ""
+
+
 def _build_node_context(node: DecisionNode, db) -> Dict[str, str]:
     """Build the context strings for a decision node.
 
@@ -1629,6 +2218,9 @@ def _build_node_context(node: DecisionNode, db) -> Dict[str, str]:
     # ── Portfolio context (for portfolio-aware experts) ──
     portfolio_ctx = _safe_ctx(_get_portfolio_context, node, db)
 
+    # ── Swarm Memory (previous verdict + new developments) ──
+    swarm_memory = _build_swarm_memory(node, db)
+
     return {
         # Original fields
         "question": node.question,
@@ -1652,6 +2244,8 @@ def _build_node_context(node: DecisionNode, db) -> Dict[str, str]:
         "forward_outlook": outlook,
         # Portfolio
         "portfolio_context": portfolio_ctx,
+        # Swarm Memory
+        "swarm_memory": swarm_memory,
     }
 
 
@@ -1853,7 +2447,7 @@ _EXPERT_CONTEXT_KEYS: Dict[str, List[str]] = {
     "_common": [
         "question", "timeline", "yes_prob",
         "yes_consequences", "no_consequences", "stock_impacts",
-        "market_context",
+        "market_context", "swarm_memory",
     ],
     # Expert-specific additional fields (audit-improved: each expert gets ALL
     # data relevant to their specialty — see audit Fix 1)
@@ -1913,13 +2507,13 @@ async def _round1_individual(
 
     Each expert may use a different LLM provider/model.
     Context is trimmed per expert to reduce token waste and prevent hallucination.
+    Experts are called concurrently per provider (Groq + OpenRouter in parallel).
     """
-    results = []
 
-    for expert in EXPERTS:
+    async def _call_expert(expert: Dict[str, str]) -> Dict[str, Any]:
         client, model = _get_client_and_model(expert)
         if client is None:
-            results.append({
+            return {
                 "expert_id": expert["id"],
                 "expert_name": expert["name"],
                 "emoji": expert["emoji"],
@@ -1930,14 +2524,11 @@ async def _round1_individual(
                     "trading_action": "HOLD",
                     "confidence": 0,
                 },
-            })
-            continue
+            }
 
-        # Trim context to only fields relevant for this expert
         expert_context = _trim_context_for_expert(context, expert["id"])
-
-        prompt = ROUND1_USER.format(
-            **expert_context,
+        shared_context = ROUND1_SHARED_CONTEXT.format(**expert_context)
+        expert_instruction = ROUND1_EXPERT_INSTRUCTION.format(
             expert_name=expert["name"],
         )
 
@@ -1945,13 +2536,14 @@ async def _round1_individual(
             client,
             model,
             messages=[
-                {"role": "system", "content": expert["system"]},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": shared_context},
+                {"role": "system", "content": f"You are: {expert['name']}. {expert['system']}"},
+                {"role": "user", "content": expert_instruction},
             ],
             purpose="round1",
         )
 
-        results.append({
+        return {
             "expert_id": expert["id"],
             "expert_name": expert["name"],
             "emoji": expert["emoji"],
@@ -1962,9 +2554,34 @@ async def _round1_individual(
                 "trading_action": "HOLD",
                 "confidence": 0,
             },
-        })
+        }
 
-    return results
+    # Run all experts concurrently — rate limiter locks handle per-provider pacing
+    active_experts = get_active_experts()
+    tasks = [_call_expert(expert) for expert in active_experts]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Convert exceptions to default results
+    final = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.error("Round 1 expert %s raised: %s", active_experts[i]["id"], result)
+            final.append({
+                "expert_id": active_experts[i]["id"],
+                "expert_name": active_experts[i]["name"],
+                "emoji": active_experts[i]["emoji"],
+                "model": "error",
+                "response": {
+                    "assessment": "Analysis failed",
+                    "yes_probability_estimate": 50,
+                    "trading_action": "HOLD",
+                    "confidence": 0,
+                },
+            })
+        else:
+            final.append(result)
+
+    return final
 
 
 async def _round2_debate(
@@ -1993,11 +2610,18 @@ async def _round2_debate(
     enrichment_summary = _build_enrichment_summary(context)
     disagreement_map = _build_disagreement_map(round1_results)
 
-    results = []
-    for expert in EXPERTS:
+    # Pre-compute shared context ONCE — identical across all experts (prefix caching)
+    shared_context = ROUND2_SHARED_CONTEXT.format(
+        question=context["question"],
+        all_round1_assessments=all_assessments,
+        enrichment_summary=enrichment_summary,
+        disagreement_map=disagreement_map,
+    )
+
+    async def _debate_expert(expert: Dict[str, str]) -> Dict[str, Any]:
         client, model = _get_client_and_model(expert)
         if client is None:
-            results.append({
+            return {
                 "expert_id": expert["id"],
                 "expert_name": expert["name"],
                 "emoji": expert["emoji"],
@@ -2009,28 +2633,24 @@ async def _round2_debate(
                     "confidence": 0,
                     "agrees_with_majority": True,
                 },
-            })
-            continue
+            }
 
-        prompt = ROUND2_USER.format(
-            question=context["question"],
-            all_round1_assessments=all_assessments,
+        expert_instruction = ROUND2_EXPERT_INSTRUCTION.format(
             expert_name=expert["name"],
-            enrichment_summary=enrichment_summary,
-            disagreement_map=disagreement_map,
         )
 
         response = await _rate_limited_call(
             client,
             model,
             messages=[
-                {"role": "system", "content": expert["system"]},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": shared_context},
+                {"role": "system", "content": f"You are: {expert['name']}. {expert['system']}"},
+                {"role": "user", "content": expert_instruction},
             ],
             purpose="round2",
         )
 
-        results.append({
+        return {
             "expert_id": expert["id"],
             "expert_name": expert["name"],
             "emoji": expert["emoji"],
@@ -2042,9 +2662,34 @@ async def _round2_debate(
                 "confidence": 0,
                 "agrees_with_majority": True,
             },
-        })
+        }
 
-    return results
+    # Run all experts concurrently — rate limiter locks handle per-provider pacing
+    active_experts = get_active_experts()
+    tasks = [_debate_expert(expert) for expert in active_experts]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    final = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.error("Round 2 expert %s raised: %s", active_experts[i]["id"], result)
+            final.append({
+                "expert_id": active_experts[i]["id"],
+                "expert_name": active_experts[i]["name"],
+                "emoji": active_experts[i]["emoji"],
+                "model": "error",
+                "response": {
+                    "revised_assessment": "Debate failed",
+                    "yes_probability_estimate": 50,
+                    "trading_action": "HOLD",
+                    "confidence": 0,
+                    "agrees_with_majority": True,
+                },
+            })
+        else:
+            final.append(result)
+
+    return final
 
 
 def _deterministic_aggregate(
@@ -2058,6 +2703,26 @@ def _deterministic_aggregate(
     Method: weighted median of yes_probability and trading_action, where each
     expert's weight = their self-reported confidence.
     """
+    # Filter out failed experts before aggregation
+    live_results = []
+    failed_count = 0
+    for r in round2_results:
+        resp = r.get("response", {})
+        assessment = resp.get("revised_assessment", "") or resp.get("assessment", "")
+        is_failed = (
+            resp.get("confidence", 50) == 0
+            and resp.get("yes_probability_estimate") == 50
+            and any(kw in (assessment or "").lower() for kw in ("unavailable", "failed", "no llm provider"))
+        )
+        if is_failed:
+            failed_count += 1
+            logger.info("Excluding failed expert from aggregation: %s", r.get("expert_name", "?"))
+        else:
+            live_results.append(r)
+
+    total_experts = len(round2_results)
+    participation_rate = len(live_results) / total_experts if total_experts else 0
+
     ACTION_ORDER = {"STRONG_SELL": 0, "SELL": 1, "HOLD": 2, "BUY": 3, "STRONG_BUY": 4}
     ORDER_TO_ACTION = {v: k for k, v in ACTION_ORDER.items()}
 
@@ -2068,7 +2733,7 @@ def _deterministic_aggregate(
     dissent_notes = []
     assessments = []
 
-    for r in round2_results:
+    for r in live_results:
         resp = r.get("response", {})
         conf = max(1.0, float(resp.get("confidence", 50)))  # min weight 1
         weight = conf / 100.0
@@ -2167,6 +2832,9 @@ def _deterministic_aggregate(
         "consensus_strength": round(consensus_strength),
         "all_ticker_signals": all_signals,
         "aggregation_method": "deterministic_weighted_median",
+        "participation_rate": participation_rate,
+        "experts_responded": len(live_results),
+        "experts_total": total_experts,
     }
 
 
@@ -2202,6 +2870,11 @@ async def _round3_synthesis(
     prompt = ROUND3_SYNTHESIS.format(
         question=context["question"],
         timeline=context["timeline"],
+        verdict_direction=verdict.get("verdict", "HOLD"),
+        verdict_confidence=verdict.get("confidence", 0),
+        verdict_probability=verdict.get("yes_probability", 50),
+        verdict_ticker=verdict.get("primary_ticker", "N/A"),
+        verdict_ticker_direction=verdict.get("ticker_direction", "N/A"),
         all_round2_assessments=all_assessments,
     )
 
@@ -2336,15 +3009,33 @@ async def evaluate_node(node_id: int) -> Optional[Dict[str, Any]]:
 
         # Round 1: Individual analysis (12 calls across providers)
         r1 = await _round1_individual(context)
-        logger.info("Swarm: Round 1 complete for node %d (%d agents)", node_id, len(EXPERTS))
+        logger.info("Swarm: Round 1 complete for node %d (%d agents)", node_id, len(get_active_experts()))
+
+        r1_failed = sum(1 for r in r1 if r.get("model") in ("error", "none")
+                        or (r.get("response", {}).get("confidence") == 0
+                            and "unavailable" in (r.get("response", {}).get("assessment", "")).lower()))
+        if r1_failed > 0:
+            logger.warning("Round 1: %d/%d experts failed", r1_failed, len(r1))
 
         # Round 2: Debate (12 calls across providers)
         r2 = await _round2_debate(context, r1)
-        logger.info("Swarm: Round 2 complete for node %d (%d agents)", node_id, len(EXPERTS))
+        logger.info("Swarm: Round 2 complete for node %d (%d agents)", node_id, len(get_active_experts()))
+
+        r2_failed = sum(1 for r in r2 if r.get("model") in ("error", "none")
+                        or (r.get("response", {}).get("confidence") == 0
+                            and "unavailable" in (r.get("response", {}).get("assessment", "")).lower()))
+        if r2_failed > 0:
+            logger.warning("Round 2: %d/%d experts failed", r2_failed, len(r2))
 
         # Round 3: Deterministic synthesis + optional LLM narrative
         verdict = await _round3_synthesis(context, r2)
         verdict["_context_hash"] = ctx_hash  # Pass to _store_verdict
+
+        MIN_PARTICIPATION = 0.615  # ~8/13 experts must respond
+        if verdict.get("participation_rate", 1.0) < MIN_PARTICIPATION:
+            logger.warning("LOW PARTICIPATION (%.0f%%) — marking as low_confidence",
+                           verdict["participation_rate"] * 100)
+            verdict["confidence"] = min(verdict.get("confidence", 0), 0.15)
         logger.info(
             "Swarm: Verdict for node %d — %s (confidence: %s%%)",
             node_id,
@@ -2376,12 +3067,18 @@ def _store_verdict(
         # Validate primary_ticker against Bunq whitelist
         primary_ticker = verdict.get("primary_ticker")
         if primary_ticker and not is_available_on_bunq(primary_ticker):
-            logger.info(
-                "Swarm: primary_ticker %s not on Bunq — clearing from verdict (node %d)",
-                primary_ticker, node.id,
-            )
-            verdict["primary_ticker"] = None
-            verdict["ticker_direction"] = None
+            from .bunq_stocks import get_eu_equivalents
+            eu_alts = get_eu_equivalents(primary_ticker)
+            if eu_alts:
+                logger.info("Swarm: mapped ticker %s → %s", primary_ticker, eu_alts[0]["ticker"])
+                # Store original for reference, use mapped for downstream
+                verdict["original_ticker"] = primary_ticker
+                primary_ticker = eu_alts[0]["ticker"]
+            else:
+                primary_ticker = None
+            verdict["primary_ticker"] = primary_ticker
+            if not primary_ticker:
+                verdict["ticker_direction"] = None
 
         # Filter all_ticker_signals to Bunq-available only
         raw_signals = verdict.get("all_ticker_signals", [])
@@ -2466,6 +3163,19 @@ async def swarm_consensus_cycle() -> int:
         logger.info("Swarm: disabled (no Groq or OpenRouter API key)")
         return 0
 
+    # Check if BOTH providers have circuit breakers tripped — skip cycle entirely
+    groq_blocked = time.time() < _provider_blocked_until.get("groq", 0)
+    or_blocked = time.time() < _provider_blocked_until.get("openrouter", 0)
+    if groq_blocked and or_blocked:
+        groq_remaining = _provider_blocked_until.get("groq", 0) - time.time()
+        or_remaining = _provider_blocked_until.get("openrouter", 0) - time.time()
+        logger.error(
+            "Swarm: ALL providers circuit-breaker OPEN (Groq: %.0fs, OpenRouter: %.0fs) "
+            "— skipping entire cycle to avoid partial verdicts",
+            groq_remaining, or_remaining,
+        )
+        return 0
+
     # Focus Mode: focused nodes get shorter TTL and priority
     from .focus_manager import get_focused_runup_ids
     focused_ids = set(get_focused_runup_ids())
@@ -2535,6 +3245,15 @@ async def swarm_consensus_cycle() -> int:
 
         evaluated = 0
         for node in batch:
+            # Re-check budget before each node (25 LLM calls per node)
+            try:
+                from .tree_generator import get_budget_tier, BudgetTier
+                if get_budget_tier() == BudgetTier.BLOCKED:
+                    logger.warning("Swarm: BLOCKED tier reached during cycle — stopping.")
+                    break
+            except ImportError:
+                pass
+
             try:
                 result = await evaluate_node(node.id)
                 if result:

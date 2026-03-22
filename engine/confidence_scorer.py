@@ -549,15 +549,30 @@ def _calculate_swarm_component(run_up: RunUp, session: Session) -> Dict[str, Any
         age_hours = (datetime.utcnow() - verdict.created_at).total_seconds() / 3600
         staleness_factor = max(0.1, 1.0 - (age_hours - 24) / 48) if age_hours > 24 else 1.0
 
-        position = _VERDICT_POSITION.get(verdict.verdict, 0.5)
-        deviation = abs(position - 0.5) * 2.0  # scale to 0-1
-        score = deviation * verdict.confidence * staleness_factor
+        verdict_str = verdict.verdict or "HOLD"
+        confidence = verdict.confidence or 0.0
+
+        # NEW: Direct verdict scoring (old formula: |pos-0.5|*2*conf suppressed HOLD to 0)
+        verdict_scores = {
+            "STRONG_BUY": 1.0,
+            "BUY": 0.75,
+            "HOLD": 0.25,  # non-zero so it counts as "active"
+            "SELL": 0.75,
+            "STRONG_SELL": 1.0,
+        }
+        base_score = verdict_scores.get(verdict_str, 0.25)
+        score = base_score * confidence * staleness_factor
 
         return {
             "score": round(min(1.0, score), 4),
-            "verdict": verdict.verdict,
-            "confidence": round(verdict.confidence, 4),
+            "verdict": verdict_str,
+            "confidence": round(confidence, 4),
             "consensus_strength": round(verdict.consensus_strength or 0.0, 4),
+            "entry_reasoning": verdict.entry_reasoning or "",
+            "risk_note": verdict.risk_note or "",
+            "dissent_note": verdict.dissent_note or "",
+            "primary_ticker": verdict.primary_ticker or "",
+            "ticker_direction": verdict.ticker_direction or "",
         }
 
     except Exception:
@@ -660,16 +675,41 @@ def calculate_confidence(run_up: RunUp, session: Session) -> Dict[str, Any]:
         logger.exception("ML component failed for %s, defaulting to neutral", run_up.narrative_name)
         ml = {"score": 0.0, "model_status": "error"}
 
-    confidence = (
-        W_RUNUP * runup_norm
-        + W_SWARM * swarm["score"]
-        + W_POLYMARKET * poly["score"]
-        + W_NEWS_ACCEL * news["score"]
-        + W_SOURCE_CONV * src["score"]
-        + W_ML_PRED * ml["score"]
-    )
+    # Dynamic weight renormalization: when components return 0 (unavailable
+    # data, e.g. no Polymarket match or ML model not trained), redistribute
+    # their weight proportionally among active components so the composite
+    # score is not artificially depressed.
+    #
+    # Safety guard: if too few components have data (< 40% of total weight),
+    # cap the composite score at WATCH level max (0.35) to prevent inflated
+    # signals from sparse data.
+    components_weighted = [
+        (W_RUNUP, runup_norm),
+        (W_SWARM, swarm["score"]),
+        (W_POLYMARKET, poly["score"]),
+        (W_NEWS_ACCEL, news["score"]),
+        (W_SOURCE_CONV, src["score"]),
+        (W_ML_PRED, ml["score"]),
+    ]
+    active_weight_sum = sum(w for w, s in components_weighted if s > 0)
+    if active_weight_sum > 0 and active_weight_sum < 0.99:
+        # Renormalize: scale active component weights so they sum to 1.0
+        renorm_factor = 1.0 / active_weight_sum
+        confidence = sum(w * renorm_factor * s for w, s in components_weighted if s > 0)
+    else:
+        confidence = sum(w * s for w, s in components_weighted)
 
-    signal_level = _classify_level(confidence)
+    # Softer cap: scale down proportionally rather than hard-capping at 0.35
+    if active_weight_sum < 0.4:
+        scale_factor = active_weight_sum / 0.4  # e.g., 0.3 → 0.75x
+        confidence = confidence * scale_factor
+        signal_level = "INSUFFICIENT_DATA" if confidence < 0.35 else _classify_level(confidence)
+        logger.debug(
+            "Confidence capped for %s: active_weight=%.2f < 0.40, conf=%.4f",
+            run_up.narrative_name, active_weight_sum, confidence,
+        )
+    else:
+        signal_level = _classify_level(confidence)
 
     return {
         "confidence": round(confidence, 4),
@@ -701,6 +741,21 @@ def _find_primary_ticker(
     Returns (ticker, direction) or (None, None).
     """
     try:
+        # PRIMARY: Check the latest non-superseded SwarmVerdict for this run-up
+        verdict = (
+            session.query(SwarmVerdict)
+            .filter(
+                SwarmVerdict.run_up_id == run_up.id,
+                SwarmVerdict.superseded_at.is_(None),
+            )
+            .order_by(SwarmVerdict.created_at.desc())
+            .first()
+        )
+        if verdict and verdict.primary_ticker:
+            direction = "bullish" if verdict.ticker_direction == "long" else "bearish"
+            return verdict.primary_ticker, direction
+
+        # FALLBACK: existing DecisionNode -> StockImpact walk
         magnitude_weight = {"low": 1, "moderate": 2, "high": 4, "extreme": 8}
 
         ticker_scores: Dict[str, float] = defaultdict(float)
@@ -780,6 +835,9 @@ def _generate_reasoning(
     swarm = comps.get("swarm_verdict", {})
     if swarm.get("verdict"):
         parts.append(f"Swarm: {swarm['verdict']} ({swarm['confidence']:.0%} conf)")
+        entry_reasoning = swarm.get("entry_reasoning", "")
+        if entry_reasoning:
+            parts.append(f"Analysis: {entry_reasoning[:300]}")
 
     # X/Twitter signal (informational — 0 weight)
     x = comps.get("x_signal", {})
@@ -869,6 +927,19 @@ def update_trading_signals() -> List[TradingSignal]:
                     ru.id,
                 )
                 continue
+
+            # Direct verdict→signal bridge: strong swarm consensus overrides composite
+            swarm = result.get("components", {}).get("swarm_verdict", {})
+            swarm_verdict = swarm.get("verdict")
+            swarm_confidence = swarm.get("confidence", 0)
+            swarm_consensus = swarm.get("consensus_strength", 0)
+
+            if (swarm_verdict in ("BUY", "STRONG_BUY", "SELL", "STRONG_SELL")
+                    and swarm_confidence >= 0.50
+                    and swarm_consensus >= 0.60):
+                result["signal_level"] = swarm_verdict
+                min_conf = {"STRONG_BUY": 0.80, "BUY": 0.70, "STRONG_SELL": 0.80, "SELL": 0.70}
+                result["confidence"] = max(result["confidence"], min_conf.get(swarm_verdict, 0.70))
 
             if result["signal_level"] == "NONE":
                 continue
@@ -970,6 +1041,131 @@ def update_trading_signals() -> List[TradingSignal]:
     except Exception:
         session.rollback()
         logger.exception("Confidence scoring run failed.")
+        return []
+    finally:
+        session.close()
+
+
+# ======================================================================
+# Anomaly Detection — z-score based volume/sentiment monitoring
+# ======================================================================
+
+def detect_anomalies(window_days: int = 7, z_threshold: float = 2.5) -> List[Dict[str, Any]]:
+    """Detect anomalies in article volume, sentiment, and feed success rates.
+
+    Uses a rolling z-score approach: if today's value deviates > z_threshold
+    standard deviations from the rolling mean, flag it as an anomaly.
+
+    Returns a list of anomaly dicts with type, value, z_score, and message.
+    No ML required — pure statistics.
+    """
+    from .db import get_session, Article, ArticleBrief
+
+    session = get_session()
+    anomalies: List[Dict[str, Any]] = []
+
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=window_days + 1)
+
+        # 1. Article volume per day
+        daily_counts = (
+            session.query(
+                func.date(Article.pub_date).label("day"),
+                func.count(Article.id).label("cnt"),
+            )
+            .filter(Article.pub_date >= cutoff)
+            .group_by(func.date(Article.pub_date))
+            .all()
+        )
+
+        if len(daily_counts) >= 3:
+            counts = [r.cnt for r in daily_counts]
+            mean_c = sum(counts) / len(counts)
+            std_c = max(1.0, (sum((c - mean_c) ** 2 for c in counts) / len(counts)) ** 0.5)
+            today_count = counts[-1] if counts else 0
+            z_volume = (today_count - mean_c) / std_c
+            if abs(z_volume) > z_threshold:
+                direction = "spike" if z_volume > 0 else "drop"
+                anomalies.append({
+                    "type": "article_volume",
+                    "value": today_count,
+                    "mean": round(mean_c, 1),
+                    "z_score": round(z_volume, 2),
+                    "message": f"Article volume {direction}: {today_count} (avg {mean_c:.0f}, z={z_volume:.1f})",
+                })
+
+        # 2. Average sentiment per day
+        daily_sentiment = (
+            session.query(
+                func.date(ArticleBrief.created_at).label("day"),
+                func.avg(ArticleBrief.sentiment_score).label("avg_sent"),
+            )
+            .filter(ArticleBrief.created_at >= cutoff)
+            .group_by(func.date(ArticleBrief.created_at))
+            .all()
+        )
+
+        if len(daily_sentiment) >= 3:
+            sents = [r.avg_sent for r in daily_sentiment if r.avg_sent is not None]
+            if len(sents) >= 3:
+                mean_s = sum(sents) / len(sents)
+                std_s = max(0.01, (sum((s - mean_s) ** 2 for s in sents) / len(sents)) ** 0.5)
+                today_sent = sents[-1] if sents else 0
+                z_sent = (today_sent - mean_s) / std_s
+                if abs(z_sent) > z_threshold:
+                    direction = "positive spike" if z_sent > 0 else "negative spike"
+                    anomalies.append({
+                        "type": "sentiment",
+                        "value": round(today_sent, 3),
+                        "mean": round(mean_s, 3),
+                        "z_score": round(z_sent, 2),
+                        "message": f"Sentiment {direction}: {today_sent:.3f} (avg {mean_s:.3f}, z={z_sent:.1f})",
+                    })
+
+        # 3. Articles per source (detect feed failures)
+        source_counts = (
+            session.query(
+                Article.source,
+                func.count(Article.id).label("cnt"),
+            )
+            .filter(Article.pub_date >= datetime.utcnow() - timedelta(days=1))
+            .group_by(Article.source)
+            .all()
+        )
+        # Compare against 7-day average per source
+        source_avg = (
+            session.query(
+                Article.source,
+                func.count(Article.id).label("cnt"),
+            )
+            .filter(Article.pub_date >= cutoff)
+            .group_by(Article.source)
+            .all()
+        )
+        avg_map = {r.source: r.cnt / window_days for r in source_avg}
+        today_map = {r.source: r.cnt for r in source_counts}
+
+        for source, avg_count in avg_map.items():
+            today_count = today_map.get(source, 0)
+            if avg_count >= 1.0 and today_count == 0:
+                anomalies.append({
+                    "type": "feed_silence",
+                    "source": source,
+                    "value": 0,
+                    "mean": round(avg_count, 1),
+                    "z_score": -999,
+                    "message": f"Feed '{source}' produced 0 articles today (avg {avg_count:.1f}/day)",
+                })
+
+        if anomalies:
+            logger.warning("Anomalies detected: %d", len(anomalies))
+            for a in anomalies:
+                logger.warning("  [%s] %s", a["type"], a["message"])
+
+        return anomalies
+
+    except Exception:
+        logger.exception("Anomaly detection failed.")
         return []
     finally:
         session.close()

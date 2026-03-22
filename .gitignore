@@ -13,3 +13,4 @@ engine/ml/data/
 engine/ml/models/*.json
 engine/ml/results.tsv
 engine/ml/run.log
+news.db

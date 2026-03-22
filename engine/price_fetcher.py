@@ -71,6 +71,16 @@ class PriceFetcher:
         contains a single ``error`` key instead.
         """
         ticker = ticker.upper().strip()
+
+        # Normalize common tickers to yfinance-compatible symbols
+        _TICKER_MAP = {
+            "VIX": "^VIX",
+            "DXY": "DX-Y.NYB",
+            "GOLD": "GC=F",
+            "OIL": "CL=F",
+        }
+        ticker = _TICKER_MAP.get(ticker, ticker)
+
         now = time.time()
 
         # --- cache check (thread-safe) ---
@@ -284,7 +294,14 @@ class PriceFetcher:
             # CoinGecko gold price is per troy ounce; convert to per kg
             price_eur_per_oz = float(gold["eur"])
             price_eur_per_kg = round(price_eur_per_oz * OZ_PER_KG, 2)
-            change_pct = round(float(gold.get("eur_24h_change", 0)), 2)
+
+            # Sanity check: gold should be > €50,000/kg
+            if price_eur_per_kg < 50_000:
+                raise ValueError(
+                    f"CoinGecko gold price implausible: €{price_eur_per_kg}/kg"
+                )
+
+            change_pct = round(float(gold.get("eur_24h_change") or 0), 2)
 
             return {
                 "price": price_eur_per_kg,
@@ -315,6 +332,9 @@ class PriceFetcher:
             eur_ticker = yf.Ticker("EURUSD=X")
             eur_info = eur_ticker.fast_info
             eurusd_rate = float(eur_info["lastPrice"])
+
+            if not eurusd_rate or eurusd_rate <= 0:
+                raise ValueError(f"Invalid EURUSD rate: {eurusd_rate}")
 
             # Convert: USD per oz -> EUR per kg
             price_eur_per_kg = round((gold_price_usd * OZ_PER_KG) / eurusd_rate, 2)
@@ -808,7 +828,9 @@ class PriceFetcher:
         if not currency or currency == "EUR" or price <= 0:
             return price
 
-        currency = currency.upper().strip()
+        # Preserve original case for GBp/GBX detection before uppercasing
+        raw_currency = currency.strip()
+        currency = raw_currency.upper()
 
         if currency == "USD":
             fx = self.get_quote("EURUSD=X")
@@ -816,19 +838,19 @@ class PriceFetcher:
                 return price / fx["price"]
             return price / 1.08  # fallback
 
+        if currency == "GBX" or raw_currency in ("GBp", "GBx"):
+            # GBp/GBX = pence sterling → divide by 100 first
+            price_gbp = price / 100.0
+            fx = self.get_quote("GBPEUR=X")
+            if "error" not in fx and fx.get("price", 0) > 0:
+                return price_gbp * fx["price"]
+            return price_gbp * 1.17
+
         if currency == "GBP":
             fx = self.get_quote("GBPEUR=X")
             if "error" not in fx and fx.get("price", 0) > 0:
                 return price * fx["price"]
             return price * 1.17
-
-        if currency in ("GBX", "GBP", "GBp"):
-            # GBp = pence sterling
-            price_gbp = price / 100.0 if currency in ("GBX", "GBp") else price
-            fx = self.get_quote("GBPEUR=X")
-            if "error" not in fx and fx.get("price", 0) > 0:
-                return price_gbp * fx["price"]
-            return price_gbp * 1.17
 
         if currency == "CHF":
             fx = self.get_quote("CHFEUR=X")

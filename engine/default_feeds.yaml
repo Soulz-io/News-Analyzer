@@ -363,3 +363,25 @@ feeds:
   - name: "RAND Corporation"
     url: "https://www.rand.org/content/rand/blog.rss.xml"
     region: "global"
+
+  # Central Asia & Underserved Regions (5) — Red Team identified blind spots
+  - name: "Eurasianet"
+    url: "https://eurasianet.org/feed"
+    region: "europe"
+  - name: "The Diplomat"
+    url: "https://thediplomat.com/feed/"
+    region: "east-asia"
+  - name: "The Irrawaddy"
+    url: "https://www.irrawaddy.com/feed"
+    region: "southeast-asia"
+  - name: "The Africa Report"
+    url: "https://www.theafricareport.com/feed/"
+    region: "africa"
+  - name: "High North News"
+    url: "https://www.highnorthnews.com/en/rss.xml"
+    region: "europe"
+
+  # Defense & Intelligence Analysis (1) — War Zone & Defense One already in main feeds
+  - name: "War on the Rocks"
+    url: "https://warontherocks.com/feed/"
+    region: "global"

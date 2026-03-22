@@ -41,6 +41,10 @@ THREAT_KEYWORDS: set = {
     "emergency", "escalation", "threat", "airstrikes", "drone",
     "casualties", "killed", "death toll", "explosion", "shelling",
     "genocide", "chemical", "biological", "blockade", "siege",
+    # Trade/economic threat terms
+    "tariff", "tariffs", "trade war", "embargo", "retaliatory",
+    "countervailing", "anti-dumping", "protectionist", "trade ban",
+    "export controls", "import ban", "duties",
 }
 
 # Urgency keywords for urgency scoring
@@ -55,6 +59,15 @@ EVENT_TYPES = {
     "economic": {"sanctions", "tariff", "trade", "embargo", "oil price", "inflation", "currency", "gdp", "recession", "investment"},
     "social": {"protest", "demonstration", "unrest", "refugees", "humanitarian", "displacement", "riot", "civil unrest"},
     "legal": {"indictment", "tribunal", "resolution", "icc", "court", "prosecution", "verdict", "ruling", "investigation"},
+    "market_data": {"stock", "stocks", "index", "indices", "futures", "forex",
+                    "yield", "yields", "bond", "bonds", "rally", "selloff",
+                    "trading", "dow", "nasdaq", "s&p", "ftse", "cac",
+                    "nikkei", "dax", "ibex", "gold", "crude", "oil price"},
+    "trade_policy": {"tariff", "tariffs", "trade war", "trade deal",
+                     "import duty", "export ban", "dumping", "wto",
+                     "trade deficit", "trade surplus", "protectionism"},
+    "energy": {"oil", "gas", "opec", "pipeline", "refinery", "lng",
+               "energy crisis", "fuel", "petroleum", "barrel"},
 }
 
 # Source credibility ratings (same as deep_analysis.py but used for per-article scoring)
@@ -213,9 +226,14 @@ def _get_yake():
     return _yake_extractor
 
 
+_topic_model_failed = False
+
+
 def _get_topic_model():
     """Create or return the BERTopic model lazily."""
-    global _topic_model
+    global _topic_model, _topic_model_failed
+    if _topic_model_failed:
+        return None
     if _topic_model is None:
         try:
             from bertopic import BERTopic
@@ -226,9 +244,22 @@ def _get_topic_model():
             )
             logger.info("BERTopic model initialised.")
         except Exception:
-            logger.exception("Failed to initialise BERTopic -- clustering disabled.")
-            _topic_model = None
+            logger.exception("Failed to initialise BERTopic -- clustering permanently disabled.")
+            _topic_model_failed = True
+            return None
     return _topic_model
+
+
+# ---------------------------------------------------------------------------
+# Text normalization
+# ---------------------------------------------------------------------------
+
+def _normalize_for_nlp(text: str) -> str:
+    """Normalize ALL-CAPS text to title case for better spaCy parsing."""
+    alpha_chars = [c for c in text if c.isalpha()]
+    if alpha_chars and sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars) > 0.7:
+        return text.title()
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -345,20 +376,54 @@ def extract_keywords(text: str) -> List[str]:
 # Sentiment
 # ---------------------------------------------------------------------------
 
-def analyze_sentiment(text: str) -> float:
+# Dampening factors by source credibility tier
+_SENTIMENT_DAMPENING = {
+    "wire": 0.85,      # Reuters, AP, AFP — professional, tempered
+    "quality": 0.80,    # BBC, NYT, FT — editorial but measured
+    "general": 0.70,    # Default for unknown sources
+    "tabloid": 0.60,    # Sensational sources
+    "social": 0.55,     # Twitter/X, blogs
+}
+
+
+def _credibility_to_tier(credibility: float) -> str:
+    """Map a source credibility score to a dampening tier."""
+    if credibility >= 0.85:
+        return "wire"
+    elif credibility >= 0.70:
+        return "quality"
+    elif credibility >= 0.50:
+        return "general"
+    elif credibility >= 0.30:
+        return "tabloid"
+    else:
+        return "social"
+
+
+def analyze_sentiment(text: str, source_credibility: float = 0.60) -> float:
     """Return VADER compound sentiment score in [-1, +1].
 
-    Applies a 0.7 dampening factor because VADER is optimised for social-media
-    text.  Geopolitical/financial headlines tend to be sensational, causing
-    VADER to produce extreme scores that over-weight sentiment in downstream
-    intensity classification.
+    Applies a source-type-aware dampening factor because VADER is optimised
+    for social-media text.  Geopolitical/financial headlines tend to be
+    sensational, causing VADER to produce extreme scores that over-weight
+    sentiment in downstream intensity classification.
+
+    Parameters
+    ----------
+    text:
+        The text to analyse.
+    source_credibility:
+        Credibility score of the article source (0.0–1.0).  Higher-credibility
+        sources receive less dampening.  Defaults to 0.60 (general tier).
     """
     analyzer = _get_vader()
     try:
         scores = analyzer.polarity_scores(text)
         compound = scores["compound"]
-        # Dampen extreme VADER scores — VADER is social-media-optimized, not geopolitical
-        compound = compound * 0.7
+        # Dampen extreme VADER scores — factor varies by source credibility tier
+        tier = _credibility_to_tier(source_credibility)
+        dampening = _SENTIMENT_DAMPENING[tier]
+        compound = compound * dampening
         return compound
     except Exception:
         logger.exception("Sentiment analysis failed.")
@@ -381,6 +446,12 @@ def summarize(text: str, sentence_count: int = 0) -> str:
     """
     if sentence_count <= 0:
         sentence_count = config.summary_sentences
+
+    # Short-form content (tweets, headlines): LexRank needs multi-sentence input
+    # For texts under 40 words, use the text directly as summary
+    word_count = len(text.split())
+    if word_count < 40:
+        return text.strip()
 
     try:
         from sumy.parsers.plaintext import PlaintextParser
@@ -438,13 +509,22 @@ def classify_intensity(sentiment: float, text: str) -> str:
       - low:         everything else
     """
     text_lower = text.lower()
-    threat_count = sum(1 for kw in THREAT_KEYWORDS if re.search(r'\b' + re.escape(kw) + r'\b', text_lower))
+    threat_count = sum(1 for kw in THREAT_KEYWORDS if re.search(r'\b' + re.escape(kw) + r'\w*\b', text_lower))
 
-    if sentiment < -0.7 and threat_count >= 3:
-        return "critical"
-    if sentiment < -0.5 and threat_count >= 1:
+    # Keyword-driven intensity (independent of sentiment direction)
+    if threat_count >= 3:
+        if sentiment < -0.5:
+            return "critical"
         return "high-threat"
-    if sentiment < -0.2 or threat_count >= 1:
+    if threat_count >= 1:
+        if sentiment < -0.5:
+            return "high-threat"
+        return "moderate"
+
+    # Sentiment-only fallback
+    if sentiment < -0.7:
+        return "high-threat"
+    if sentiment < -0.3:
         return "moderate"
     return "low"
 
@@ -492,7 +572,7 @@ def classify_event_type(text: str) -> str:
     text_lower = text.lower()
     type_scores = {}
     for event_type, keywords in EVENT_TYPES.items():
-        hits = sum(1 for kw in keywords if re.search(r'\b' + re.escape(kw) + r'\b', text_lower))
+        hits = sum(1 for kw in keywords if re.search(r'\b' + re.escape(kw) + r'\w*\b', text_lower))
         if hits > 0:
             type_scores[event_type] = hits
 
@@ -505,8 +585,17 @@ def classify_event_type(text: str) -> str:
 # Key actor extraction
 # ---------------------------------------------------------------------------
 
-def extract_key_actors(doc) -> list:
-    """Extract key actors (persons/orgs performing actions) from spaCy doc."""
+def extract_key_actors(doc, short_text: bool = False) -> list:
+    """Extract key actors (persons/orgs performing actions) from spaCy doc.
+
+    Parameters
+    ----------
+    doc:
+        A spaCy Doc object.
+    short_text:
+        When True, include entities of type PERSON/ORG even without a
+        parsed nsubj dependency (action set to "mentioned").
+    """
     actors = []
     seen = set()
 
@@ -529,6 +618,13 @@ def extract_key_actors(doc) -> list:
                 "name": name,
                 "type": ent.label_.lower(),
                 "action": action,
+            })
+            seen.add(name.lower())
+        elif short_text:
+            actors.append({
+                "name": name,
+                "type": ent.label_.lower(),
+                "action": "mentioned",
             })
             seen.add(name.lower())
 
@@ -560,14 +656,15 @@ def process_article(article: Article, feed_region: str = "global") -> Optional[A
 
         # 3. NER with spaCy
         nlp = _get_spacy()
-        doc = nlp(english_text[:100_000])  # cap input for safety
+        doc = nlp(_normalize_for_nlp(english_text[:100_000]))  # cap input for safety
         entities = extract_entities(doc)
 
         # 4. Keywords
         keywords = extract_keywords(english_text)
 
-        # 5. Sentiment
-        sentiment = analyze_sentiment(english_text)
+        # 5. Sentiment (with source-aware dampening)
+        credibility = SOURCE_CREDIBILITY.get(article.source, 0.60)
+        sentiment = analyze_sentiment(english_text, source_credibility=credibility)
 
         # 6. Summary
         summary = summarize(english_text)
@@ -650,7 +747,7 @@ def process_batch(articles: List[Article]) -> List[ArticleBrief]:
 
     # --- Phase 2: Batch NER with spaCy nlp.pipe() (3-10x faster) ---
     nlp = _get_spacy()
-    english_texts = [r["text"] for r in prep_results]
+    english_texts = [_normalize_for_nlp(r["text"]) for r in prep_results]
     docs = list(nlp.pipe(english_texts, batch_size=32))
 
     # --- Phase 3: Per-doc enrichment ---
@@ -672,8 +769,11 @@ def process_batch(articles: List[Article]) -> List[ArticleBrief]:
             # Keywords
             keywords = extract_keywords(english_text)
 
+            # Source credibility (needed for sentiment dampening)
+            credibility = SOURCE_CREDIBILITY.get(article.source, 0.60)
+
             # Sentiment
-            sentiment = analyze_sentiment(english_text)
+            sentiment = analyze_sentiment(english_text, source_credibility=credibility)
 
             # Summary
             summary = summarize(english_text)
@@ -686,9 +786,9 @@ def process_batch(articles: List[Article]) -> List[ArticleBrief]:
 
             # New analysis points (v2)
             urgency = score_urgency(english_text, article.source)
-            credibility = SOURCE_CREDIBILITY.get(article.source, 0.60)
             event_type = classify_event_type(english_text)
-            actors = extract_key_actors(doc)
+            is_short = len(english_text.split()) < 40
+            actors = extract_key_actors(doc, short_text=is_short)
 
             brief = ArticleBrief(
                 article_id=article.id,

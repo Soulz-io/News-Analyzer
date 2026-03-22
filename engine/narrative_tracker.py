@@ -144,10 +144,20 @@ def _group_unclustered_by_region_keyword(
         for b in region_briefs:
             kws = brief_kw_map.get(b.id, [])
             if kws:
+                # Filter out the region name itself from keywords to avoid tautological names
+                filtered_kws = [kw for kw in kws if kw.lower() not in region.lower().split('-')]
+                # Fall back to original keywords if all were filtered out
+                candidate_kws = filtered_kws if filtered_kws else kws
                 # Pick the keyword from this brief that is most frequent
                 # in the region overall
-                best_kw = max(kws, key=lambda k: region_kw_freq.get(k, 0))
-                key = f"{region}-{best_kw.replace(' ', '-')}"
+                sorted_kws = sorted(candidate_kws, key=lambda k: region_kw_freq.get(k, 0), reverse=True)
+                # Use top 2 keywords for more specific naming
+                if len(sorted_kws) >= 2:
+                    key = f"{region}-{sorted_kws[0].replace(' ', '-')}-{sorted_kws[1].replace(' ', '-')}"
+                elif sorted_kws:
+                    key = f"{region}-{sorted_kws[0].replace(' ', '-')}"
+                else:
+                    key = f"{region}-general"
             else:
                 key = f"{region}-general"
             pseudo_clusters[key].append(b)
@@ -222,15 +232,18 @@ def update_narratives(briefs: List[ArticleBrief]) -> List[NarrativeTimeline]:
     try:
         for narrative_name, cluster_id, cluster_briefs in work_items:
             article_count = len(cluster_briefs)
-            # Safely extract sources — briefs may be detached from their original session
-            sources = set()
-            for b in cluster_briefs:
-                try:
-                    if b.article:
-                        sources.add(b.article.source)
-                except Exception:
-                    # Brief is detached from session; skip
-                    pass
+            # Count distinct sources via direct query (avoids detached session bug)
+            article_ids = [b.article_id for b in cluster_briefs if hasattr(b, 'article_id') and b.article_id]
+            if article_ids:
+                source_rows = (
+                    session.query(Article.source)
+                    .filter(Article.id.in_(article_ids))
+                    .distinct()
+                    .all()
+                )
+                sources = {row[0] for row in source_rows if row[0]}
+            else:
+                sources = set()
             regions = {b.region for b in cluster_briefs}
             avg_sentiment = (
                 sum(b.sentiment for b in cluster_briefs) / article_count
@@ -238,13 +251,12 @@ def update_narratives(briefs: List[ArticleBrief]) -> List[NarrativeTimeline]:
                 else 0.0
             )
 
-            # Intensity score: weighted average mapped to 0-100
+            # Composite intensity: avg + max + recency
             intensity_map = {"low": 10, "moderate": 40, "high-threat": 70, "critical": 95}
-            avg_intensity = (
-                sum(intensity_map.get(b.intensity, 10) for b in cluster_briefs) / article_count
-                if article_count > 0
-                else 0.0
-            )
+            intensities = [intensity_map.get(getattr(b, 'intensity', 'low') or 'low', 10) for b in cluster_briefs]
+            avg_intensity = sum(intensities) / len(intensities) if intensities else 10
+            max_intensity = max(intensities) if intensities else 10
+            intensity_score = round(0.5 * avg_intensity + 0.5 * max_intensity, 1)
 
             # Upsert
             existing: Optional[NarrativeTimeline] = (
@@ -263,7 +275,7 @@ def update_narratives(briefs: List[ArticleBrief]) -> List[NarrativeTimeline]:
                 total_n = old_n + new_n
                 if total_n > 0:
                     existing.avg_sentiment = (existing.avg_sentiment * old_n + avg_sentiment * new_n) / total_n
-                    existing.intensity_score = (existing.intensity_score * old_n + avg_intensity * new_n) / total_n
+                    existing.intensity_score = (existing.intensity_score * old_n + intensity_score * new_n) / total_n
                 existing.article_count = total_n
                 existing.sources_count = existing.sources_count + len(sources)  # Accumulate (upper bound of distinct sources)
                 existing.unique_regions = max(existing.unique_regions, len(regions))
@@ -278,7 +290,7 @@ def update_narratives(briefs: List[ArticleBrief]) -> List[NarrativeTimeline]:
                     sources_count=len(sources),
                     unique_regions=len(regions),
                     avg_sentiment=avg_sentiment,
-                    intensity_score=avg_intensity,
+                    intensity_score=intensity_score,
                     trend="stable",
                 )
                 session.add(row)
@@ -490,6 +502,19 @@ def detect_runups(threshold: Optional[float] = None, changed_narratives: Optiona
             score = calculate_runup_score(name, session)
             if score < threshold:
                 continue
+
+            # Quality gates: prevent noise narratives from becoming run-ups
+            latest_timeline = (
+                session.query(NarrativeTimeline)
+                .filter(NarrativeTimeline.narrative_name == name)
+                .order_by(NarrativeTimeline.date.desc())
+                .first()
+            )
+            if latest_timeline:
+                if latest_timeline.article_count < 5:
+                    continue  # Too few articles
+                if latest_timeline.sources_count < 2:
+                    continue  # Single-source narrative is unconfirmed
 
             # Check for existing RunUp (active OR merged — don't recreate merged ones)
             existing: Optional[RunUp] = (

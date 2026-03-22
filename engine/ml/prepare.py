@@ -338,12 +338,17 @@ def _extract_labels(conn) -> pd.DataFrame:
     rows = []
     for _, row in df.iterrows():
         row = row.copy()
+        # Initialize all horizon labels to NaN (excluded from training unless overwritten)
+        for h in ["1d", "3d", "7d"]:
+            row[f"profitable_{h}"] = float("nan")
+            row[f"price_change_{h}"] = float("nan")
+            row[f"adjusted_return_{h}"] = float("nan")
         ticker = row["primary_ticker"]
         signal_time = row["signal_created_at"]
         has_price_labels = False
 
         # Try price-based labels first
-        if ticker and signal_time:
+        if pd.notna(ticker) and pd.notna(signal_time):
             signal_dt = pd.to_datetime(signal_time)
             price_query = """
             SELECT price, recorded_at FROM price_snapshots
@@ -382,11 +387,11 @@ def _extract_labels(conn) -> pd.DataFrame:
         return pd.DataFrame()
 
     result = pd.DataFrame(rows)
-    # Ensure label columns exist
+    # Ensure label columns exist (NaN = no data, will be dropped by training)
     for h in ["1d", "3d", "7d"]:
         for col in [f"profitable_{h}", f"price_change_{h}", f"adjusted_return_{h}"]:
             if col not in result.columns:
-                result[col] = 0.0
+                result[col] = float("nan")
 
     return result
 
@@ -502,13 +507,13 @@ def print_stats():
             "price_snapshots": "SELECT COUNT(*) FROM price_snapshots",
             "narrative_timeline": "SELECT COUNT(*) FROM narrative_timeline",
         }
-        print("=" * 50)
-        print("OpenClaw ML Data Statistics")
-        print("=" * 50)
+        logger.info("=" * 50)
+        logger.info("OpenClaw ML Data Statistics")
+        logger.info("=" * 50)
         for name, query in tables.items():
             c.execute(query)
             count = c.fetchone()[0]
-            print(f"  {name:25s}: {count:>6d}")
+            logger.info("  %s: %d", name.ljust(25), count)
 
         # Labeled data estimate
         c.execute("""
@@ -522,10 +527,10 @@ def print_stats():
             WHERE r.merged_into_id IS NULL
         """)
         labeled = c.fetchone()[0]
-        print(f"\n  Labeled run-ups (signal + ticker): {labeled}")
-        print(f"  Min for ML activation: 30")
-        print(f"  Status: {'READY' if labeled >= 30 else f'Need {30 - labeled} more'}")
-        print("=" * 50)
+        logger.info("  Labeled run-ups (signal + ticker): %d", labeled)
+        logger.info("  Min for ML activation: 30")
+        logger.info("  Status: %s", 'READY' if labeled >= 30 else f'Need {30 - labeled} more')
+        logger.info("=" * 50)
     finally:
         conn.close()
 
@@ -536,8 +541,8 @@ if __name__ == "__main__":
         print_stats()
     else:
         features, labels = extract_all()
-        print(f"Features: {features.shape}")
-        print(f"Labels: {labels.shape}")
+        logger.info("Features: %s", features.shape)
+        logger.info("Labels: %s", labels.shape)
         if not features.empty:
-            print(f"\nFeature columns: {list(features.columns)}")
+            logger.info("Feature columns: %s", list(features.columns))
         print_stats()

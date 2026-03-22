@@ -13,6 +13,7 @@ from typing import List, Dict, Optional
 import aiohttp
 import feedparser
 from rapidfuzz import fuzz
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .config import config
 from .db import get_session, Article
@@ -48,6 +49,36 @@ class RSSFetcher:
             self._session = None
 
     # ------------------------------------------------------------------
+    # HTTP fetch with retry (exponential backoff, max 3 attempts)
+    # ------------------------------------------------------------------
+    async def _fetch_raw_with_retry(self, name: str, url: str, _attempt: int = 0) -> Optional[str]:
+        """Fetch raw feed content with up to 3 retries (exponential backoff)."""
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                if self._session is None:
+                    raise RuntimeError("RSSFetcher must be used as an async context manager")
+                async with self._session.get(url) as response:
+                    if response.status == 429:  # Rate limited
+                        wait = 2 ** (attempt + 1)
+                        logger.warning("Feed %s: HTTP 429 — retrying in %ds (attempt %d/%d)", name, wait, attempt + 1, max_attempts)
+                        await asyncio.sleep(wait)
+                        continue
+                    if response.status != 200:
+                        logger.warning("Feed %s returned HTTP %d — skipping.", name, response.status)
+                        return None
+                    return await response.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt < max_attempts - 1:
+                    wait = 2 ** (attempt + 1)
+                    logger.warning("Feed %s: %s — retrying in %ds (attempt %d/%d)", name, exc, wait, attempt + 1, max_attempts)
+                    await asyncio.sleep(wait)
+                else:
+                    logger.warning("Feed %s: failed after %d attempts: %s", name, max_attempts, exc)
+                    return None
+        return None
+
+    # ------------------------------------------------------------------
     # Single-feed fetch
     # ------------------------------------------------------------------
     async def fetch_feed(self, feed: Dict) -> List[Dict]:
@@ -71,17 +102,9 @@ class RSSFetcher:
 
         try:
             logger.info("Fetching feed: %s (%s)", name, url)
-
-            if self._session is None:
-                raise RuntimeError("RSSFetcher must be used as an async context manager")
-
-            async with self._session.get(url) as response:
-                if response.status != 200:
-                    logger.warning(
-                        "Feed %s returned HTTP %d -- skipping.", name, response.status
-                    )
-                    return []
-                raw = await response.text()
+            raw = await self._fetch_raw_with_retry(name, url)
+            if raw is None:
+                return []
 
             parsed = feedparser.parse(raw)
 

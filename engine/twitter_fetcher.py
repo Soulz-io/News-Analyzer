@@ -7,18 +7,24 @@ persisted through the existing ORM so that the downstream NLP pipeline
 (entity extraction, sentiment scoring, narrative clustering) processes
 them identically to RSS-sourced articles.
 
-Rate-budget management
-~~~~~~~~~~~~~~~~~~~~~~
-X Basic plan provides ~10 000 tweet reads / month.  A four-tier priority
-system ensures the most operationally valuable accounts are polled every
-cycle while lower-priority commentary accounts are only checked once a
-day.  Approximate monthly cost at one cycle every two hours:
+Adaptive rate-budget management
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+X Basic plan provides ~10 000 tweet reads / month.  An **adaptive**
+four-tier system defines **target polling intervals** per tier.  The
+scheduler base interval (default 30 min) is combined with these targets
+to auto-calculate the cycle-skip count for each tier.
 
-    Tier 1 (every cycle)   ~6 accts x 12 cycles/day x 30 = 2 160 calls
-    Tier 2 (every 2nd)     ~5 accts x  6 cycles/day x 30 =   900 calls
-    Tier 3 (every 3rd)     ~4 accts x  4 cycles/day x 30 =   480 calls
-    Tier 4 (every 12th)    ~4 accts x  1 cycle /day x 30 =   120 calls
-                                                   Total   ~3 660 calls
+    Tier   Target   Accounts   @30min base        Monthly
+    ----   ------   --------   ---------------    -------
+      1     30 min      3      48 cycles/day      4 320
+      2    120 min     12      12 cycles/day      4 320
+      3    360 min     24       4 cycles/day      2 880
+      4   1440 min     36       1 cycle /day      1 080
+                                          Total  ~12 600
+
+At 120 min base interval the same targets yield ~9 360 calls/month.
+Slight overshoot on Basic is tolerated -- tweepy handles HTTP 429
+gracefully and calls returning 0 tweets don't count as reads.
 
 Authentication
 ~~~~~~~~~~~~~~
@@ -32,6 +38,8 @@ import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import func
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -39,205 +47,116 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 OSINT_ACCOUNTS: Dict[str, Dict[str, Any]] = {
-    # === Tier 1: Military OSINT Trackers (every cycle) =====================
-    "OSINTdefender": {
-        "name": "OSINT Defender",
-        "region": "global",
-        "category": "osint_military",
-        "priority": 1,
-        "credibility": 0.72,
-    },
-    "sentdefender": {
-        "name": "Sentinel OSINT",
-        "region": "global",
-        "category": "osint_military",
-        "priority": 1,
-        "credibility": 0.70,
-    },
-    "IntelCrab": {
-        "name": "IntelCrab",
-        "region": "global",
-        "category": "osint_military",
-        "priority": 1,
-        "credibility": 0.70,
-    },
-    "Nrg8000": {
-        "name": "Nrg8000",
-        "region": "global",
-        "category": "osint_military",
-        "priority": 1,
-        "credibility": 0.68,
-    },
-    "AuroraIntel": {
-        "name": "Aurora Intel",
-        "region": "global",
-        "category": "osint_military",
-        "priority": 1,
-        "credibility": 0.72,
-    },
-    "Faytuks": {
-        "name": "Faytuks",
-        "region": "middle-east",
-        "category": "osint_military",
-        "priority": 1,
-        "credibility": 0.68,
-    },
 
-    # === Tier 2: Trackers + Defense Analysts (every 2nd cycle) =============
-    "AircraftSpots": {
-        "name": "Aircraft Spots",
-        "region": "global",
-        "category": "tracking",
-        "priority": 2,
-        "credibility": 0.74,
-    },
-    "RALee85": {
-        "name": "Rob Lee",
-        "region": "europe",
-        "category": "defense_analyst",
-        "priority": 2,
-        "credibility": 0.78,
-    },
-    "oryxspioenkop": {
-        "name": "Oryx",
-        "region": "europe",
-        "category": "defense_analyst",
-        "priority": 2,
-        "credibility": 0.80,
-    },
-    "Conflicts": {
-        "name": "Conflict News",
-        "region": "global",
-        "category": "osint",
-        "priority": 2,
-        "credibility": 0.70,
-    },
-    "christaborowski": {
-        "name": "Chris Borowski",
-        "region": "europe",
-        "category": "regional",
-        "priority": 2,
-        "credibility": 0.68,
-    },
+    # ═══════════════════════════════════════════════════════════════════════
+    #  TIER 1 — BREAKING (target: every 30 min)
+    #  Fastest, most reliable breaking-news sources.
+    #  Budget: 3 accts × 48 cycles/day × 30 days = 4 320 calls/month
+    # ═══════════════════════════════════════════════════════════════════════
+    "DeItaone":        {"name": "Walter Bloomberg",       "region": "global",        "category": "breaking_market",  "priority": 1, "credibility": 0.85},
+    "BNONews":         {"name": "BNO News",               "region": "global",        "category": "breaking_news",    "priority": 1, "credibility": 0.80},
+    "OSINTdefender":   {"name": "OSINT Defender",         "region": "global",        "category": "osint_military",   "priority": 1, "credibility": 0.72},
 
-    "NoLimitGains": {
-        "name": "NoLimit",
-        "region": "global",
-        "category": "macro_finance",
-        "priority": 2,
-        "credibility": 0.68,
-    },
-    "QuiverQuant": {
-        "name": "Quiver Quantitative",
-        "region": "north-america",
-        "category": "insider_trading",
-        "priority": 1,
-        "credibility": 0.82,
-    },
-    "unusual_whales": {
-        "name": "Unusual Whales",
-        "region": "north-america",
-        "category": "options_flow",
-        "priority": 1,
-        "credibility": 0.78,
-    },
-    "DeItaone": {
-        "name": "Walter Bloomberg",
-        "region": "global",
-        "category": "breaking_market",
-        "priority": 1,
-        "credibility": 0.85,
-    },
-    "BNONews": {
-        "name": "BNO News",
-        "region": "global",
-        "category": "breaking_news",
-        "priority": 1,
-        "credibility": 0.80,
-    },
+    # ═══════════════════════════════════════════════════════════════════════
+    #  TIER 2 — FAST OSINT + MARKETS (target: every 2h)
+    #  High-value OSINT trackers, breaking market feeds, insider flow.
+    #  Budget: 12 accts × 12 cycles/day × 30 days = 4 320 calls/month
+    # ═══════════════════════════════════════════════════════════════════════
+    # -- Military / Conflict OSINT --
+    "sentdefender":    {"name": "Sentinel OSINT",         "region": "global",        "category": "osint_military",   "priority": 2, "credibility": 0.70},
+    "IntelCrab":       {"name": "IntelCrab",              "region": "global",        "category": "osint_military",   "priority": 2, "credibility": 0.70},
+    "AuroraIntel":     {"name": "Aurora Intel",           "region": "global",        "category": "osint_military",   "priority": 2, "credibility": 0.72},
+    "WarMonitors":     {"name": "War Monitors",           "region": "global",        "category": "osint_military",   "priority": 2, "credibility": 0.72},
+    "detresfa_":       {"name": "detresfa (OSINT Legend)", "region": "global",       "category": "osint_military",   "priority": 2, "credibility": 0.78},
+    "Osint613":        {"name": "OSINT 613",              "region": "middle-east",   "category": "osint_military",   "priority": 2, "credibility": 0.72},
+    "Faytuks":         {"name": "Faytuks",                "region": "middle-east",   "category": "osint_military",   "priority": 2, "credibility": 0.68},
+    # -- Breaking Market / Insider Flow --
+    "unusual_whales":  {"name": "Unusual Whales",         "region": "north-america", "category": "options_flow",     "priority": 2, "credibility": 0.78},
+    "QuiverQuant":     {"name": "Quiver Quantitative",    "region": "north-america", "category": "insider_trading",  "priority": 2, "credibility": 0.82},
+    "FirstSquawk":     {"name": "First Squawk",           "region": "global",        "category": "breaking_market",  "priority": 2, "credibility": 0.76},
+    "NoLimitGains":    {"name": "NoLimit",                "region": "global",        "category": "macro_finance",    "priority": 2, "credibility": 0.68},
+    "Nrg8000":         {"name": "Nrg8000",                "region": "global",        "category": "osint_military",   "priority": 2, "credibility": 0.68},
 
-    # === Tier 2: Finance + Macro (every 2nd cycle) ==========================
-    "FirstSquawk": {
-        "name": "First Squawk",
-        "region": "global",
-        "category": "breaking_market",
-        "priority": 2,
-        "credibility": 0.76,
-    },
-    "Fxhedgers": {
-        "name": "Fxhedgers",
-        "region": "global",
-        "category": "macro_finance",
-        "priority": 2,
-        "credibility": 0.68,
-    },
-    "Insider_Trades": {
-        "name": "Insider Trade Alerts",
-        "region": "north-america",
-        "category": "insider_trading",
-        "priority": 2,
-        "credibility": 0.75,
-    },
+    # ═══════════════════════════════════════════════════════════════════════
+    #  TIER 3 — ANALYSTS + INSTITUTIONAL (target: every 6h)
+    #  Defense analysts, geopolitical thinkers, data-driven finance.
+    #  Budget: 24 accts × 4 cycles/day × 30 days = 2 880 calls/month
+    # ═══════════════════════════════════════════════════════════════════════
+    # -- Defense / Conflict Analysts --
+    "Tatarigami_UA":   {"name": "Tatarigami UA",          "region": "europe",        "category": "osint_military",   "priority": 3, "credibility": 0.75},
+    "calibreobscura":  {"name": "Calibre Obscura",        "region": "global",        "category": "osint_military",   "priority": 3, "credibility": 0.74},
+    "RALee85":         {"name": "Rob Lee",                "region": "europe",        "category": "defense_analyst",  "priority": 3, "credibility": 0.78},
+    "oryxspioenkop":   {"name": "Oryx",                   "region": "europe",        "category": "defense_analyst",  "priority": 3, "credibility": 0.80},
+    "AircraftSpots":   {"name": "Aircraft Spots",         "region": "global",        "category": "tracking",         "priority": 3, "credibility": 0.74},
+    "War_Monitoring":  {"name": "War Monitoring",         "region": "global",        "category": "osint_military",   "priority": 3, "credibility": 0.68},
+    "Conflicts":       {"name": "Conflict News",          "region": "global",        "category": "osint",            "priority": 3, "credibility": 0.70},
+    "LongWarJournal":  {"name": "Long War Journal",       "region": "global",        "category": "conflict_analysis","priority": 3, "credibility": 0.80},
+    # -- Institutional Intel --
+    "IABOROWITZ":      {"name": "IISS",                   "region": "global",        "category": "defense_institutional","priority": 3, "credibility": 0.82},
+    "ABOROWITZ":       {"name": "CSIS",                   "region": "global",        "category": "think_tank",       "priority": 3, "credibility": 0.80},
+    "ICG_Updates":     {"name": "Crisis Group",           "region": "global",        "category": "conflict_analysis","priority": 3, "credibility": 0.82},
+    "DefenseIntel":    {"name": "Defense Intelligence",   "region": "global",        "category": "defense_institutional","priority": 3, "credibility": 0.75},
+    # -- Geopolitical Analysts --
+    "ianbremmer":      {"name": "Ian Bremmer (Eurasia Group)","region": "global",    "category": "geopolitical_analyst","priority": 3, "credibility": 0.85},
+    "christaborowski": {"name": "Chris Borowski",         "region": "europe",        "category": "regional",         "priority": 3, "credibility": 0.68},
+    # -- Finance Data / Macro --
+    "LizAnnSonders":   {"name": "Liz Ann Sonders (Schwab)","region": "north-america","category": "macro_finance",    "priority": 3, "credibility": 0.82},
+    "charliebilello":  {"name": "Charlie Bilello",        "region": "north-america", "category": "macro_finance",    "priority": 3, "credibility": 0.80},
+    "elerianm":        {"name": "Mohamed El-Erian",       "region": "global",        "category": "macro_finance",    "priority": 3, "credibility": 0.85},
+    "bespokeinvest":   {"name": "Bespoke Invest",         "region": "north-america", "category": "market_data",      "priority": 3, "credibility": 0.80},
+    "WSJmarkets":      {"name": "WSJ Markets",            "region": "global",        "category": "breaking_market",  "priority": 3, "credibility": 0.88},
+    "Fxhedgers":       {"name": "Fxhedgers",              "region": "global",        "category": "macro_finance",    "priority": 3, "credibility": 0.68},
+    "Insider_Trades":  {"name": "Insider Trade Alerts",   "region": "north-america", "category": "insider_trading",  "priority": 3, "credibility": 0.75},
+    # -- Investigative / Transparency --
+    "ggreenwald":      {"name": "Glenn Greenwald",        "region": "global",        "category": "investigative",    "priority": 3, "credibility": 0.75},
+    "zerohedge":       {"name": "ZeroHedge",              "region": "global",        "category": "finance",          "priority": 3, "credibility": 0.55},
+    "wikileaks":       {"name": "WikiLeaks",              "region": "global",        "category": "transparency",     "priority": 3, "credibility": 0.70},
 
-    # === Tier 3: Geopolitical Journalists (every 3rd cycle) ================
-    "ggreenwald": {
-        "name": "Glenn Greenwald",
-        "region": "global",
-        "category": "investigative",
-        "priority": 3,
-        "credibility": 0.75,
-    },
-    "MaxBlumenthal": {
-        "name": "Max Blumenthal",
-        "region": "global",
-        "category": "investigative",
-        "priority": 3,
-        "credibility": 0.65,
-    },
-    "zerohedge": {
-        "name": "ZeroHedge",
-        "region": "global",
-        "category": "finance",
-        "priority": 3,
-        "credibility": 0.55,
-    },
-    "wikileaks": {
-        "name": "WikiLeaks",
-        "region": "global",
-        "category": "transparency",
-        "priority": 3,
-        "credibility": 0.70,
-    },
-
-    # === Tier 4: Commentary / Analysis (every 12th cycle, ~1x/day) =========
-    "mtracey": {
-        "name": "Michael Tracey",
-        "region": "global",
-        "category": "analysis",
-        "priority": 4,
-        "credibility": 0.62,
-    },
-    "BenjaminNorton": {
-        "name": "Ben Norton",
-        "region": "global",
-        "category": "investigative",
-        "priority": 4,
-        "credibility": 0.60,
-    },
-    "caitoz": {
-        "name": "Caitlin Johnstone",
-        "region": "global",
-        "category": "analysis",
-        "priority": 4,
-        "credibility": 0.55,
-    },
-    "TheGrayzoneNews": {
-        "name": "The Grayzone",
-        "region": "global",
-        "category": "media",
-        "priority": 4,
-        "credibility": 0.60,
-    },
+    # ═══════════════════════════════════════════════════════════════════════
+    #  TIER 4 — COMMENTARY + DEEP ANALYSIS (target: every 24h)
+    #  Long-form thinkers, institutional accounts, education.
+    #  Budget: 36 accts × 1 cycle/day × 30 days = 1 080 calls/month
+    # ═══════════════════════════════════════════════════════════════════════
+    # -- Geopolitical Commentary --
+    "Natsecjeff":      {"name": "NatSecJeff",             "region": "north-america", "category": "defense_analyst",  "priority": 4, "credibility": 0.72},
+    "Mr_Andrew_Fox":   {"name": "Andrew Fox",             "region": "global",        "category": "osint_military",   "priority": 4, "credibility": 0.70},
+    "DD_Geopolitics":  {"name": "DD Geopolitics",         "region": "global",        "category": "geopolitical_analyst","priority": 4, "credibility": 0.72},
+    "GeoPWatch":       {"name": "Geopolitical Watch",     "region": "global",        "category": "geopolitical_analyst","priority": 4, "credibility": 0.70},
+    "InsightGL":       {"name": "Insight Global",         "region": "asia",          "category": "geopolitical_analyst","priority": 4, "credibility": 0.68},
+    "GIS_Reports":     {"name": "GIS Reports",            "region": "global",        "category": "geopolitical_analyst","priority": 4, "credibility": 0.78},
+    "Overton_news":    {"name": "Overton News",           "region": "global",        "category": "breaking_news",    "priority": 4, "credibility": 0.65},
+    "weewoono":        {"name": "weewoono",               "region": "global",        "category": "geopolitical_analyst","priority": 4, "credibility": 0.65},
+    "HelenHet20":      {"name": "Helen Thompson",         "region": "europe",        "category": "political_economy","priority": 4, "credibility": 0.78},
+    "MaxBlumenthal":   {"name": "Max Blumenthal",         "region": "global",        "category": "investigative",    "priority": 4, "credibility": 0.65},
+    "mtracey":         {"name": "Michael Tracey",         "region": "global",        "category": "analysis",         "priority": 4, "credibility": 0.62},
+    "BenjaminNorton":  {"name": "Ben Norton",             "region": "global",        "category": "investigative",    "priority": 4, "credibility": 0.60},
+    "caitoz":          {"name": "Caitlin Johnstone",      "region": "global",        "category": "analysis",         "priority": 4, "credibility": 0.55},
+    "TheGrayzoneNews": {"name": "The Grayzone",           "region": "global",        "category": "media",            "priority": 4, "credibility": 0.60},
+    "PrometheanActn":  {"name": "Promethean Action",      "region": "north-america", "category": "geopolitical_analyst","priority": 4, "credibility": 0.60},
+    # -- Institutional Finance / Macro --
+    "RayDalio":        {"name": "Ray Dalio",              "region": "global",        "category": "macro_finance",    "priority": 4, "credibility": 0.82},
+    "paulkrugman":     {"name": "Paul Krugman",           "region": "north-america", "category": "economics",        "priority": 4, "credibility": 0.75},
+    "TheEconomist":    {"name": "The Economist",          "region": "global",        "category": "economics",        "priority": 4, "credibility": 0.85},
+    "YardeniResearch": {"name": "Yardeni Research",       "region": "north-america", "category": "macro_finance",    "priority": 4, "credibility": 0.80},
+    "GoldmanSachs":    {"name": "Goldman Sachs",          "region": "global",        "category": "institutional_finance","priority": 4, "credibility": 0.82},
+    "CNBC":            {"name": "CNBC",                   "region": "global",        "category": "breaking_market",  "priority": 4, "credibility": 0.72},
+    "MarketWatch":     {"name": "MarketWatch",            "region": "north-america", "category": "breaking_market",  "priority": 4, "credibility": 0.72},
+    "Nasdaq":          {"name": "Nasdaq",                 "region": "north-america", "category": "institutional_finance","priority": 4, "credibility": 0.80},
+    "AswathDamodaran": {"name": "Aswath Damodaran (NYU)", "region": "north-america", "category": "valuation",        "priority": 4, "credibility": 0.85},
+    "JustinWolfers":   {"name": "Justin Wolfers",         "region": "north-america", "category": "economics",        "priority": 4, "credibility": 0.78},
+    "Steve_Hanke":     {"name": "Steve Hanke",            "region": "global",        "category": "macro_finance",    "priority": 4, "credibility": 0.75},
+    # -- Finance Education / Investing --
+    "morganhousel":    {"name": "Morgan Housel",          "region": "north-america", "category": "behavioral_finance","priority": 4, "credibility": 0.78},
+    "BrianFeroldi":    {"name": "Brian Feroldi",          "region": "north-america", "category": "fundamentals",     "priority": 4, "credibility": 0.72},
+    "awealthofcs":     {"name": "Ben Carlson",            "region": "north-america", "category": "investing",        "priority": 4, "credibility": 0.78},
+    "Trader_Dante":    {"name": "Trader Dante",           "region": "global",        "category": "trading",          "priority": 4, "credibility": 0.65},
+    "DeepakShenoy":    {"name": "Deepak Shenoy",          "region": "asia",          "category": "investing",        "priority": 4, "credibility": 0.70},
+    "AndrewLokenauth": {"name": "Andrew Lokenauth",       "region": "north-america", "category": "finance_education","priority": 4, "credibility": 0.65},
+    "IanCassel":       {"name": "Ian Cassel",             "region": "north-america", "category": "micro_cap",        "priority": 4, "credibility": 0.70},
+    # -- Regional (Asia-Pacific) --
+    "elitepredatorss": {"name": "Elite Predators",        "region": "asia",          "category": "geopolitical_analyst","priority": 4, "credibility": 0.58},
+    "alpha_defense":   {"name": "Alpha Defense",          "region": "asia",          "category": "defense_analyst",  "priority": 4, "credibility": 0.62},
+    "BharatAlphaint":  {"name": "Bharat Alpha",           "region": "asia",          "category": "geopolitical_analyst","priority": 4, "credibility": 0.58},
 }
 
 
@@ -301,7 +220,7 @@ class TwitterFetcher:
         )
         self._client = None
         self._user_id_cache: Dict[str, str] = {}
-        self._cycle_counter: int = 0
+        self._cycle_counter: int = self._load_cycle_counter()
 
         if not self.bearer_token:
             logger.warning(
@@ -324,6 +243,9 @@ class TwitterFetcher:
             bearer_token=self.bearer_token,
             wait_on_rate_limit=False,
         )
+
+        # Log budget estimation
+        self._log_budget_estimate()
         logger.info("TwitterFetcher initialised (%d accounts configured).",
                      len(OSINT_ACCOUNTS))
 
@@ -336,27 +258,146 @@ class TwitterFetcher:
         """Return True if the fetcher has a working tweepy client."""
         return self._client is not None
 
+    def _log_budget_estimate(self) -> None:
+        """Log estimated monthly API call budget for current config."""
+        from .config import config as _cfg
+        base = max(_cfg.twitter_fetch_interval_minutes, 1)
+        cycles_day = (24 * 60) / base
+        tier_counts: Dict[int, int] = {}
+        for info in OSINT_ACCOUNTS.values():
+            t = info["priority"]
+            tier_counts[t] = tier_counts.get(t, 0) + 1
+        total_day = 0.0
+        parts = []
+        for tier in sorted(tier_counts):
+            target = self._TIER_TARGET_MINUTES.get(tier, 1440)
+            skip = max(1, round(target / base))
+            calls = tier_counts[tier] * (cycles_day / skip)
+            total_day += calls
+            parts.append(f"T{tier}({tier_counts[tier]})={calls:.0f}/day")
+        total_month = total_day * 30
+        summary = ", ".join(parts)
+        level = "warning" if total_month > 10000 else "info"
+        getattr(logger, level)(
+            "X budget estimate @ %dmin interval: %s → "
+            "%.0f/day, %.0f/month (X Basic quota: 10K/month %s)",
+            base, summary, total_day, total_month,
+            "✅" if total_month <= 10000 else f"⚠️ {total_month/10000:.1f}×",
+        )
+
     # ------------------------------------------------------------------
-    # Priority scheduling
+    # Cycle counter persistence
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_cycle_counter() -> int:
+        """Load persisted cycle counter from DB (survives restarts)."""
+        try:
+            from .db import get_session, EngineSettings
+            with get_session() as session:
+                setting = session.query(EngineSettings).get("twitter_cycle_counter")
+                if setting:
+                    return int(setting.value)
+        except Exception as e:
+            logger.warning("Failed to load twitter cycle counter: %s", e)
+        return 0
+
+    def _save_cycle_counter(self) -> None:
+        """Persist cycle counter to DB."""
+        try:
+            from .db import get_session, EngineSettings
+            with get_session() as session:
+                setting = session.query(EngineSettings).get("twitter_cycle_counter")
+                if setting:
+                    setting.value = str(self._cycle_counter)
+                else:
+                    session.add(EngineSettings(key="twitter_cycle_counter", value=str(self._cycle_counter)))
+                session.commit()
+        except Exception as e:
+            logger.warning("Failed to persist twitter cycle counter: %s", e)
+
+    # ------------------------------------------------------------------
+    # Adaptive priority scheduling
+    # ------------------------------------------------------------------
+
+    # Target polling interval per tier (in minutes).
+    # The actual cycle-skip count is auto-calculated from the base interval.
+    _TIER_TARGET_MINUTES = {1: 30, 2: 120, 3: 360, 4: 1440}
+
+    # Monthly quota auto-throttle settings
+    _MONTHLY_QUOTA = 10_000      # X Basic plan
+    _THROTTLE_WARN_PCT = 0.70    # At 70% → skip T4
+    _THROTTLE_HARD_PCT = 0.85    # At 85% → skip T3+T4
+    _THROTTLE_CRIT_PCT = 0.95    # At 95% → only T1
+
+    def _get_monthly_calls(self) -> int:
+        """Count X API calls this calendar month (from DB)."""
+        try:
+            from .db import get_session, Article
+            from datetime import date
+            session = get_session()
+            try:
+                first_of_month = datetime(datetime.utcnow().year, datetime.utcnow().month, 1)
+                count = session.query(
+                    func.count(func.distinct(Article.source))
+                ).filter(
+                    Article.source.like("X/Twitter%"),
+                    Article.fetched_at >= first_of_month,
+                ).scalar() or 0
+                # Each unique source fetched = ~1 API call per occurrence
+                # Better metric: count distinct (source, date) pairs
+                from sqlalchemy import cast, Date
+                calls = session.query(
+                    func.count()
+                ).select_from(
+                    session.query(
+                        Article.source,
+                        cast(Article.fetched_at, Date),
+                    ).filter(
+                        Article.source.like("X/Twitter%"),
+                        Article.fetched_at >= first_of_month,
+                    ).group_by(
+                        Article.source,
+                        func.strftime("%Y-%m-%d %H", Article.fetched_at),
+                    ).subquery()
+                ).scalar() or 0
+                return calls
+            finally:
+                session.close()
+        except Exception:
+            return 0
 
     def _should_fetch(self, priority: int) -> bool:
         """Decide whether an account at *priority* tier runs this cycle.
 
-        Tier 1 -- every cycle
-        Tier 2 -- every 2nd cycle
-        Tier 3 -- every 3rd cycle
-        Tier 4 -- every 12th cycle (~once per day with 2-hour intervals)
+        Uses **target polling intervals** per tier so the system auto-adapts
+        to whatever base interval is configured (30 min, 60 min, 120 min…).
+        Also applies **auto-throttle** when monthly quota usage is high.
+
+            Tier 1 — target  30 min  (breaking OSINT/markets)
+            Tier 2 — target 120 min  (fast OSINT + market flow)
+            Tier 3 — target 360 min  (analysts + institutional, ~6h)
+            Tier 4 — target 1440 min (commentary + education, ~24h)
         """
-        if priority == 1:
-            return True
-        if priority == 2:
-            return self._cycle_counter % 2 == 0
-        if priority == 3:
-            return self._cycle_counter % 3 == 0
-        if priority == 4:
-            return self._cycle_counter % 12 == 0
-        return False
+        from .config import config as _cfg
+        target = self._TIER_TARGET_MINUTES.get(priority, 1440)
+        base = max(_cfg.twitter_fetch_interval_minutes, 1)
+        skip = max(1, round(target / base))
+
+        if self._cycle_counter % skip != 0:
+            return False
+
+        # Auto-throttle check (only run DB query once per cycle for T3/T4)
+        if priority >= 3 and hasattr(self, "_throttle_level"):
+            if priority == 4 and self._throttle_level >= 1:
+                return False  # Skip T4 at 70%+ quota
+            if priority == 3 and self._throttle_level >= 2:
+                return False  # Skip T3 at 85%+ quota
+        if priority >= 2 and hasattr(self, "_throttle_level"):
+            if self._throttle_level >= 3:
+                return False  # Only T1 at 95%+ quota
+
+        return True
 
     # ------------------------------------------------------------------
     # User ID lookup (cached, synchronous)
@@ -451,8 +492,9 @@ class TwitterFetcher:
 
                 text: str = tweet.text or ""
                 title = _first_sentence(text)
+                # Strip timezone info for consistency with naive UTC datetimes used elsewhere
                 pub_date = (
-                    tweet.created_at if tweet.created_at else datetime.utcnow()
+                    tweet.created_at.replace(tzinfo=None) if tweet.created_at else datetime.utcnow()
                 )
 
                 articles.append({
@@ -509,8 +551,24 @@ class TwitterFetcher:
 
         from .db import get_session, Article
 
+        # --- 0. auto-throttle check ---
+        monthly_calls = self._get_monthly_calls()
+        quota_pct = monthly_calls / self._MONTHLY_QUOTA if self._MONTHLY_QUOTA else 0
+        if quota_pct >= self._THROTTLE_CRIT_PCT:
+            self._throttle_level = 3
+            logger.warning("X auto-throttle: CRITICAL (%.0f%% quota) — T1 only.", quota_pct * 100)
+        elif quota_pct >= self._THROTTLE_HARD_PCT:
+            self._throttle_level = 2
+            logger.warning("X auto-throttle: HARD (%.0f%% quota) — T1+T2 only.", quota_pct * 100)
+        elif quota_pct >= self._THROTTLE_WARN_PCT:
+            self._throttle_level = 1
+            logger.info("X auto-throttle: SOFT (%.0f%% quota) — skipping T4.", quota_pct * 100)
+        else:
+            self._throttle_level = 0
+
         # --- 1. advance cycle ---
         self._cycle_counter += 1
+        self._save_cycle_counter()
 
         accounts_this_cycle = [
             (username, info)

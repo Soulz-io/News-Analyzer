@@ -242,3 +242,55 @@ def get_bunq_stocks_prompt_snippet() -> str:
         f"US stocks: {', '.join(sorted(us_tickers))}\n"
         f"EU stocks/ETFs: {', '.join(sorted(eu_tickers))}"
     )
+
+
+# ---------------------------------------------------------------------------
+# US → EU Equivalent Mapping
+# Maps US tickers from Swarm analysis to European ETFs/stocks available on Bunq
+# ---------------------------------------------------------------------------
+
+US_TO_EU_EQUIVALENT: dict = {
+    # Defense → Airbus (EU defense peer)
+    "LMT": [{"ticker": "AIR.PA", "name": "Airbus", "relevance": 0.5, "reason": "EU defense/aerospace peer"}],
+    "RTX": [{"ticker": "AIR.PA", "name": "Airbus", "relevance": 0.5, "reason": "EU defense/aerospace peer"}],
+    "NOC": [{"ticker": "AIR.PA", "name": "Airbus", "relevance": 0.4, "reason": "EU defense/aerospace peer"}],
+    "GD":  [{"ticker": "AIR.PA", "name": "Airbus", "relevance": 0.4, "reason": "EU defense/aerospace peer"}],
+    "BA":  [{"ticker": "AIR.PA", "name": "Airbus", "relevance": 0.6, "reason": "Direct competitor"}],
+
+    # Oil & Gas → IS0D.DE (iShares Oil & Gas E&P ETF)
+    "COP": [{"ticker": "IS0D.DE", "name": "iShares Oil & Gas E&P", "relevance": 0.9, "reason": "COP is top holding"}],
+    "EOG": [{"ticker": "IS0D.DE", "name": "iShares Oil & Gas E&P", "relevance": 0.8, "reason": "EOG held in ETF"}],
+    "SLB": [{"ticker": "IS0D.DE", "name": "iShares Oil & Gas E&P", "relevance": 0.7, "reason": "Oil services exposure"}],
+    "OXY": [{"ticker": "IS0D.DE", "name": "iShares Oil & Gas E&P", "relevance": 0.7, "reason": "OXY held in ETF"}],
+    "HAL": [{"ticker": "IS0D.DE", "name": "iShares Oil & Gas E&P", "relevance": 0.6, "reason": "Oil services exposure"}],
+    "CVX": [{"ticker": "IS0D.DE", "name": "iShares Oil & Gas E&P", "relevance": 0.85, "reason": "CVX is major holding"}],
+    "SHEL": [{"ticker": "IS0D.DE", "name": "iShares Oil & Gas E&P", "relevance": 0.8, "reason": "Shell held in ETF"}],
+    "XLE": [{"ticker": "IS0D.DE", "name": "iShares Oil & Gas E&P", "relevance": 0.95, "reason": "Direct sector equivalent"}],
+    "XOP": [{"ticker": "IS0D.DE", "name": "iShares Oil & Gas E&P", "relevance": 0.95, "reason": "Direct E&P equivalent"}],
+    "USO": [{"ticker": "IS0D.DE", "name": "iShares Oil & Gas E&P", "relevance": 0.7, "reason": "Oil price proxy"}],
+
+    # Gold/Mining → IS0E.DE (Gold Producers) and WMIN.DE (Global Mining)
+    "GDX": [{"ticker": "IS0E.DE", "name": "iShares Gold Producers", "relevance": 0.95, "reason": "Direct equivalent"}],
+    "GLD": [{"ticker": "IS0E.DE", "name": "iShares Gold Producers", "relevance": 0.7, "reason": "Gold via producers"}],
+    "NEM": [{"ticker": "IS0E.DE", "name": "iShares Gold Producers", "relevance": 0.9, "reason": "NEM is top holding"}],
+    "GOLD": [{"ticker": "IS0E.DE", "name": "iShares Gold Producers", "relevance": 0.9, "reason": "Barrick is top holding"}],
+    "AEM": [{"ticker": "IS0E.DE", "name": "iShares Gold Producers", "relevance": 0.85, "reason": "Agnico held in ETF"}],
+    "FCX": [
+        {"ticker": "WMIN.DE", "name": "VanEck Global Mining", "relevance": 0.8, "reason": "FCX held in ETF"},
+        {"ticker": "IS0E.DE", "name": "iShares Gold Producers", "relevance": 0.4, "reason": "Gold mining overlap"},
+    ],
+    "BHP": [{"ticker": "WMIN.DE", "name": "VanEck Global Mining", "relevance": 0.9, "reason": "BHP is top holding"}],
+    "RIO": [{"ticker": "WMIN.DE", "name": "VanEck Global Mining", "relevance": 0.9, "reason": "RIO is top holding"}],
+    "VALE": [{"ticker": "WMIN.DE", "name": "VanEck Global Mining", "relevance": 0.85, "reason": "VALE held in ETF"}],
+
+    # Broad market → ISPA.DE (Global Dividend 100)
+    "SPY": [{"ticker": "ISPA.DE", "name": "iShares Global Dividend 100", "relevance": 0.5, "reason": "Broad market proxy"}],
+    "HDV": [{"ticker": "ISPA.DE", "name": "iShares Global Dividend 100", "relevance": 0.85, "reason": "Direct equivalent"}],
+    "SCHD": [{"ticker": "ISPA.DE", "name": "iShares Global Dividend 100", "relevance": 0.8, "reason": "Dividend strategy"}],
+}
+
+
+def get_eu_equivalents(us_ticker: str) -> list:
+    """Return EU-available equivalents for a US ticker, sorted by relevance."""
+    alts = US_TO_EU_EQUIVALENT.get(us_ticker.upper(), [])
+    return sorted(alts, key=lambda x: x.get("relevance", 0), reverse=True)

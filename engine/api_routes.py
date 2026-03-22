@@ -7,17 +7,25 @@ Two audiences:
     scoreboard, world map data, status.
 """
 
+import ipaddress
 import json
 import logging
+import sqlite3
 from datetime import datetime, date, timedelta
+from pathlib import Path
 from typing import List, Optional, Any, Dict
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, desc, case
 from sqlalchemy.orm import Session
 
+from .admin_guard import require_admin
 from .config import config
+from .auth import verify_bearer_token
+from .audit import audit_log
+from .rate_limit import limiter, SENSITIVE_LIMIT, WRITE_LIMIT
 from .db import (
     get_session,
     Article,
@@ -36,6 +44,7 @@ from .db import (
     AnalysisReport,
     TradingSignal,
     SwarmVerdict,
+    AuditLog,
 )
 from .narrative_tracker import update_narratives, detect_runups, consolidate_runups
 from .probability_engine import get_significant_shifts
@@ -47,7 +56,7 @@ from .focus_manager import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix="/api", dependencies=[Depends(verify_bearer_token)])
 
 # ---------------------------------------------------------------------------
 # Dependency: DB session
@@ -73,7 +82,7 @@ def _get_engine_setting(db: Session, key: str, default: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 class NarrativeCreate(BaseModel):
-    narrative_name: str
+    narrative_name: str = Field(..., max_length=500)
     topic_cluster_id: Optional[int] = None
     date: Optional[str] = None  # ISO date string
     article_count: int = 0
@@ -118,7 +127,7 @@ class PredictionCreate(BaseModel):
     run_up_id: int
     decision_node_id: Optional[int] = None
     consequence_id: Optional[int] = None
-    prediction_text: str
+    prediction_text: str = Field(..., max_length=2000)
     confidence: float = 0.5
     branch: str = "yes"
     deadline: Optional[str] = None  # ISO datetime
@@ -130,10 +139,10 @@ class PredictionVerify(BaseModel):
 
 
 class UserFeedCreate(BaseModel):
-    name: str
-    url: str
-    region: str = "global"
-    lang: str = "en"
+    name: str = Field(..., max_length=200)
+    url: str = Field(..., max_length=2000)
+    region: str = Field("global", max_length=50)
+    lang: str = Field("en", max_length=10)
 
 
 class FocusUpdate(BaseModel):
@@ -142,7 +151,13 @@ class FocusUpdate(BaseModel):
 
 class PolymarketLinkCreate(BaseModel):
     run_up_id: int
-    polymarket_url: str
+    polymarket_url: str = Field(..., max_length=500)
+
+
+class SwarmConfigUpdate(BaseModel):
+    groq_api_key: Optional[str] = None
+    openrouter_api_key: Optional[str] = None
+    interval_minutes: Optional[int] = None
 
 
 # ===========================================================================
@@ -183,24 +198,36 @@ def get_focus(db: Session = Depends(_get_db)):
 
 
 @router.put("/focus")
-def update_focus(payload: FocusUpdate, db: Session = Depends(_get_db)):
+@limiter.limit(WRITE_LIMIT)
+def update_focus(request: Request, payload: FocusUpdate, db: Session = Depends(_get_db), _admin=Depends(require_admin)):
     """Set focused run-ups (max 3). Triggers consolidation."""
     ids = set_focus(payload.runup_ids)
     if ids:
         consolidate_runups()
+    audit_log(request, "focus.update", "focus", detail={"runup_ids": ids})
     return {"status": "ok", "focused_runup_ids": ids}
 
 
 @router.delete("/focus")
-def delete_focus():
+@limiter.limit(WRITE_LIMIT)
+def delete_focus(request: Request, _admin=Depends(require_admin)):
     """Clear all focus selections."""
     clear_focus()
+    audit_log(request, "focus.clear", "focus")
     return {"status": "ok", "focused_runup_ids": []}
 
 
 @router.post("/focus/polymarket-link")
-def focus_polymarket_link(payload: PolymarketLinkCreate, db: Session = Depends(_get_db)):
+@limiter.limit(WRITE_LIMIT)
+def focus_polymarket_link(request: Request, payload: PolymarketLinkCreate, db: Session = Depends(_get_db)):
     """Manually link a Polymarket URL to a run-up."""
+    # Validate Polymarket URL (prevent XSS/SSRF via stored malicious URLs)
+    parsed_pm = urlparse(payload.polymarket_url)
+    pm_hostname = (parsed_pm.hostname or "").lower()
+    if parsed_pm.scheme not in ("http", "https") or not (
+        pm_hostname == "polymarket.com" or pm_hostname.endswith(".polymarket.com")
+    ):
+        raise HTTPException(400, detail="Only polymarket.com URLs are allowed.")
     from .polymarket import create_manual_polymarket_match
 
     result = create_manual_polymarket_match(
@@ -211,11 +238,13 @@ def focus_polymarket_link(payload: PolymarketLinkCreate, db: Session = Depends(_
     if result is None:
         from fastapi import HTTPException as HE
         raise HE(status_code=400, detail="Failed to link Polymarket URL")
+    audit_log(request, "polymarket_link.create", "polymarket", str(payload.run_up_id))
     return result
 
 
 @router.post("/focus/regenerate-tree/{run_up_id}")
-def focus_regenerate_tree(run_up_id: int):
+@limiter.limit(SENSITIVE_LIMIT)
+def focus_regenerate_tree(request: Request, run_up_id: int, _admin=Depends(require_admin)):
     """Force regenerate a decision tree for a focused run-up."""
     if not is_focused(run_up_id):
         from fastapi import HTTPException as HE
@@ -226,6 +255,7 @@ def focus_regenerate_tree(run_up_id: int):
     if result is None:
         from fastapi import HTTPException as HE
         raise HE(status_code=500, detail="Tree regeneration failed")
+    audit_log(request, "tree.regenerate", "decision_tree", str(run_up_id))
     return result
 
 
@@ -342,7 +372,8 @@ def get_narrative_timeline(name: str, db: Session = Depends(_get_db)):
 
 
 @router.post("/narratives")
-def create_narrative(payload: NarrativeCreate, db: Session = Depends(_get_db)):
+@limiter.limit(WRITE_LIMIT)
+def create_narrative(request: Request, payload: NarrativeCreate, db: Session = Depends(_get_db)):
     """Create or update a NarrativeTimeline entry (agent-authored)."""
     target_date = date.fromisoformat(payload.date) if payload.date else date.today()
 
@@ -436,7 +467,8 @@ def get_runup_evidence(runup_id: int, db: Session = Depends(_get_db)):
 
 
 @router.post("/runups")
-def create_runup(payload: RunUpCreate, db: Session = Depends(_get_db)):
+@limiter.limit(WRITE_LIMIT)
+def create_runup(request: Request, payload: RunUpCreate, db: Session = Depends(_get_db)):
     """Create a RunUp record (agent-authored)."""
     start = date.fromisoformat(payload.start_date) if payload.start_date else date.today()
     ru = RunUp(
@@ -457,7 +489,8 @@ def create_runup(payload: RunUpCreate, db: Session = Depends(_get_db)):
 # ---- Manual analysis trigger ----------------------------------------------
 
 @router.post("/analyze")
-def run_analysis(db: Session = Depends(_get_db)):
+@limiter.limit(WRITE_LIMIT)
+def run_analysis(request: Request, db: Session = Depends(_get_db), _admin=Depends(require_admin)):
     """Manually trigger narrative analysis and run-up detection.
 
     Fetches all existing briefs (with article eagerly loaded), runs
@@ -484,7 +517,7 @@ def run_analysis(db: Session = Depends(_get_db)):
     # Expunge briefs so they can be used outside this session
     for b in briefs:
         db.expunge(b)
-    db.close()
+    # Session cleanup handled by _get_db() dependency — don't double-close
 
     narratives = update_narratives(briefs)
     runups = detect_runups()
@@ -509,16 +542,19 @@ def run_analysis(db: Session = Depends(_get_db)):
 # ---- Tree generation (Claude API) -----------------------------------------
 
 @router.post("/generate-tree/{run_up_id}")
-def api_generate_tree(run_up_id: int):
+@limiter.limit(SENSITIVE_LIMIT)
+def api_generate_tree(request: Request, run_up_id: int, _admin=Depends(require_admin)):
     """Generate a decision tree for a specific run-up using Claude API."""
     result = generate_tree(run_up_id)
     if result is None:
         raise HTTPException(500, detail="Tree generation failed. Check logs.")
+    audit_log(request, "tree.generate", "decision_tree", str(run_up_id))
     return result
 
 
 @router.post("/generate-trees")
-def api_generate_trees():
+@limiter.limit(SENSITIVE_LIMIT)
+def api_generate_trees(request: Request, _admin=Depends(require_admin)):
     """Consolidate run-ups and generate decision trees for top-N without trees."""
     primaries = consolidate_runups()
     trees = generate_trees_for_new_runups()
@@ -534,15 +570,24 @@ def api_generate_trees():
 
 @router.get("/budget")
 def get_budget():
-    """Get current token budget status."""
-    from .tree_generator import get_daily_budget_eur, get_today_spending_eur
+    """Get current token budget status including tier and hard ceiling."""
+    from .tree_generator import (
+        get_daily_budget_eur, get_today_spending_eur,
+        get_budget_tier, get_hard_ceiling_eur, HARD_CEILING_SPILLOVER_EUR,
+    )
     budget = get_daily_budget_eur()
     spent = get_today_spending_eur()
+    tier = get_budget_tier()
+    ceiling = get_hard_ceiling_eur()
     return {
         "daily_budget_eur": budget,
         "spent_today_eur": round(spent, 4),
         "remaining_eur": round(max(0, budget - spent), 4),
         "percentage_used": round((spent / budget * 100) if budget > 0 else 0, 1),
+        "hard_ceiling_eur": ceiling,
+        "ceiling_remaining_eur": round(max(0, ceiling - spent), 4),
+        "spillover_eur": HARD_CEILING_SPILLOVER_EUR,
+        "tier": tier.value,
     }
 
 
@@ -551,10 +596,12 @@ class BudgetUpdate(BaseModel):
 
 
 @router.put("/budget")
-def update_budget(payload: BudgetUpdate):
+@limiter.limit(SENSITIVE_LIMIT)
+def update_budget(request: Request, payload: BudgetUpdate, _admin=Depends(require_admin)):
     """Update the daily token budget in EUR."""
     from .tree_generator import set_daily_budget_eur
     new_budget = set_daily_budget_eur(payload.daily_budget_eur)
+    audit_log(request, "budget.update", "budget", detail={"daily_budget_eur": new_budget})
     return {
         "status": "ok",
         "daily_budget_eur": new_budget,
@@ -566,20 +613,20 @@ class ApiKeyUpdate(BaseModel):
 
 
 @router.put("/settings/api-key")
-def update_api_key(payload: ApiKeyUpdate):
+@limiter.limit(SENSITIVE_LIMIT)
+def update_api_key(request: Request, payload: ApiKeyUpdate, _admin=Depends(require_admin)):
     """Set the Anthropic API key (stored in DB, persists across restarts)."""
     config.anthropic_api_key = payload.api_key
     masked = payload.api_key[:8] + "..." + payload.api_key[-4:] if len(payload.api_key) > 12 else "****"
+    audit_log(request, "api_key.update", "api_key", "anthropic", detail={"masked": masked})
     return {"status": "ok", "api_key_set": True, "masked": masked}
 
 
 @router.get("/settings/api-key")
 def get_api_key_status():
     """Check if an Anthropic API key is configured."""
-    key = config.anthropic_api_key
-    has_key = bool(key)
-    masked = key[:8] + "..." + key[-4:] if key and len(key) > 12 else ("****" if key else "")
-    return {"has_key": has_key, "masked": masked}
+    has_key = bool(config.anthropic_api_key)
+    return {"has_key": has_key}
 
 
 @router.get("/budget/history")
@@ -618,11 +665,16 @@ def usage_breakdown(
     db: Session = Depends(_get_db),
 ):
     """Comprehensive token usage breakdown by platform, purpose, and model."""
-    from .tree_generator import get_daily_budget_eur, get_today_spending_eur
+    from .tree_generator import (
+        get_daily_budget_eur, get_today_spending_eur,
+        get_budget_tier, get_hard_ceiling_eur,
+    )
 
     cutoff = datetime.utcnow() - timedelta(days=days)
     budget = get_daily_budget_eur()
     spent_today = get_today_spending_eur()
+    tier = get_budget_tier()
+    ceiling = get_hard_ceiling_eur()
 
     # ---------- helpers to classify provider ----------
     def _provider(model: str) -> str:
@@ -731,6 +783,8 @@ def usage_breakdown(
             "spent_today_eur": round(spent_today, 4),
             "remaining_today_eur": round(max(0, budget - spent_today), 4),
             "pct_used_today": round((spent_today / budget * 100) if budget > 0 else 0, 1),
+            "hard_ceiling_eur": ceiling,
+            "tier": tier.value,
         },
         "period_days": days,
         "totals": {
@@ -751,7 +805,8 @@ def usage_breakdown(
 # ---- Decision trees -------------------------------------------------------
 
 @router.post("/decision-tree")
-def create_decision_tree(payload: DecisionTreeCreate, db: Session = Depends(_get_db)):
+@limiter.limit(WRITE_LIMIT)
+def create_decision_tree(request: Request, payload: DecisionTreeCreate, db: Session = Depends(_get_db)):
     """Ingest a full decision tree JSON from the Game Theory Analyst.
 
     Expected node shape::
@@ -882,10 +937,13 @@ def get_decision_tree(run_up_id: int, db: Session = Depends(_get_db)):
 
 
 @router.put("/decision-tree/{node_id}")
+@limiter.limit(WRITE_LIMIT)
 def update_decision_node(
+    request: Request,
     node_id: int,
     payload: NodeUpdate,
     db: Session = Depends(_get_db),
+    _admin=Depends(require_admin),
 ):
     """Update a decision node's probability, status, or timeline."""
     node: Optional[DecisionNode] = db.query(DecisionNode).get(node_id)
@@ -910,10 +968,13 @@ def update_decision_node(
 
 
 @router.put("/decision-tree/{node_id}/confirm")
+@limiter.limit(WRITE_LIMIT)
 def confirm_decision_node(
+    request: Request,
     node_id: int,
     payload: NodeConfirm,
     db: Session = Depends(_get_db),
+    _admin=Depends(require_admin),
 ):
     """Confirm a yes/no branch outcome on a decision node."""
     node: Optional[DecisionNode] = db.query(DecisionNode).get(node_id)
@@ -947,7 +1008,8 @@ def get_probability_shifts(
 # ---- Predictions ----------------------------------------------------------
 
 @router.post("/predictions")
-def create_prediction(payload: PredictionCreate, db: Session = Depends(_get_db)):
+@limiter.limit(WRITE_LIMIT)
+def create_prediction(request: Request, payload: PredictionCreate, db: Session = Depends(_get_db), _admin=Depends(require_admin)):
     """Record a prediction by an agent."""
     pred = Prediction(
         run_up_id=payload.run_up_id,
@@ -969,10 +1031,13 @@ def create_prediction(payload: PredictionCreate, db: Session = Depends(_get_db))
 
 
 @router.put("/predictions/{pred_id}/verify")
+@limiter.limit(WRITE_LIMIT)
 def verify_prediction(
+    request: Request,
     pred_id: int,
     payload: PredictionVerify,
     db: Session = Depends(_get_db),
+    _admin=Depends(require_admin),
 ):
     """Verify a prediction's outcome."""
     pred: Optional[Prediction] = db.query(Prediction).get(pred_id)
@@ -1031,9 +1096,42 @@ def get_feeds(db: Session = Depends(_get_db)):
     return result
 
 
+def _validate_feed_url(url: str) -> None:
+    """SSRF protection: validate feed URL before storing."""
+    import socket
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(400, detail="Only http/https URLs are allowed.")
+    hostname = parsed.hostname or ""
+    if not hostname:
+        raise HTTPException(400, detail="Invalid URL: no hostname.")
+    # Block common internal hostnames
+    blocked = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "metadata.google.internal"}
+    if hostname.lower() in blocked:
+        raise HTTPException(400, detail="URLs pointing to internal services are not allowed.")
+    # Block private/reserved IP ranges (check literal IPs)
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise HTTPException(400, detail="URLs pointing to private/local networks are not allowed.")
+    except ValueError:
+        pass  # hostname is a domain name — resolve and check below
+    # DNS resolution check: block domains that resolve to private IPs
+    try:
+        addrs = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+        for _family, _type, _proto, _canonname, sockaddr in addrs:
+            resolved_ip = ipaddress.ip_address(sockaddr[0])
+            if resolved_ip.is_private or resolved_ip.is_loopback or resolved_ip.is_link_local or resolved_ip.is_reserved:
+                raise HTTPException(400, detail="URLs pointing to private/local networks are not allowed.")
+    except socket.gaierror:
+        raise HTTPException(400, detail="Could not resolve hostname.")
+
+
 @router.post("/feeds")
-def create_feed(payload: UserFeedCreate, db: Session = Depends(_get_db)):
+@limiter.limit(WRITE_LIMIT)
+def create_feed(request: Request, payload: UserFeedCreate, db: Session = Depends(_get_db), _admin=Depends(require_admin)):
     """Add a new user-defined RSS feed."""
+    _validate_feed_url(payload.url)
     # Check for duplicate URL among user feeds
     existing = db.query(UserFeed).filter(UserFeed.url == payload.url).first()
     if existing:
@@ -1070,7 +1168,8 @@ def create_feed(payload: UserFeedCreate, db: Session = Depends(_get_db)):
 
 
 @router.delete("/feeds/{feed_id}")
-def delete_feed(feed_id: int, db: Session = Depends(_get_db)):
+@limiter.limit(WRITE_LIMIT)
+def delete_feed(request: Request, feed_id: int, db: Session = Depends(_get_db), _admin=Depends(require_admin)):
     """Remove a user-added feed.  Default feeds cannot be deleted."""
     uf = db.query(UserFeed).get(feed_id)
     if uf is None:
@@ -1085,7 +1184,8 @@ def delete_feed(feed_id: int, db: Session = Depends(_get_db)):
 
 
 @router.put("/feeds/{feed_id}/toggle")
-def toggle_feed(feed_id: int, db: Session = Depends(_get_db)):
+@limiter.limit(WRITE_LIMIT)
+def toggle_feed(request: Request, feed_id: int, db: Session = Depends(_get_db), _admin=Depends(require_admin)):
     """Enable or disable a user-added feed."""
     uf = db.query(UserFeed).get(feed_id)
     if uf is None:
@@ -1537,8 +1637,11 @@ def dashboard_worldmap(db: Session = Depends(_get_db)):
 
 
 @router.get("/status")
-def get_status(db: Session = Depends(_get_db)):
-    """Health-check / status endpoint."""
+def get_status(request: Request, db: Session = Depends(_get_db)):
+    """Enhanced health-check / status endpoint with scheduler and memory info."""
+    import resource
+    import time
+
     try:
         article_count = db.query(func.count(Article.id)).scalar() or 0
         brief_count = db.query(func.count(ArticleBrief.id)).scalar() or 0
@@ -1548,17 +1651,120 @@ def get_status(db: Session = Depends(_get_db)):
         brief_count = 0
         db_ok = False
 
-    return {
+    # Memory usage (RSS in MB)
+    try:
+        mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # Linux: KB -> MB
+    except Exception:
+        mem_mb = 0
+
+    # Scheduler job status
+    scheduler_jobs = []
+    try:
+        from .engine import scheduler
+        for job in scheduler.get_jobs():
+            scheduler_jobs.append({
+                "id": job.id,
+                "name": job.name,
+                "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+            })
+    except Exception:
+        pass
+
+    # Uptime
+    _start = getattr(get_status, "_start_time", None)
+    if _start is None:
+        get_status._start_time = time.time()
+        _start = get_status._start_time
+    uptime_sec = int(time.time() - _start)
+
+    import os as _os
+
+    # Determine scheduler running state
+    try:
+        from .engine import scheduler as _sched
+        _scheduler_running = _sched.running
+    except Exception:
+        _scheduler_running = False
+
+    _healthy = db_ok and _scheduler_running and uptime_sec > 0
+
+    # Check if request is authenticated (internal/admin) or public health check
+    _is_authed = hasattr(request, "state") and hasattr(request.state, "user")
+
+    # Public response: minimal health info only
+    result = {
         "status": "ok" if db_ok else "degraded",
-        "engine": "running" if db_ok else "stopped",
-        "engine_port": config.engine_port,
-        "database": "connected",
-        "feeds_configured": len(config.feeds),
-        "feeds": len(config.feeds),
-        "total_articles": article_count,
-        "total_briefs": brief_count,
-        "fetch_interval_minutes": config.fetch_interval_minutes,
+        "healthy": _healthy,
     }
+
+    # Authenticated users get full details
+    if _is_authed:
+        result.update({
+            "engine": "running" if db_ok else "stopped",
+            "engine_port": config.engine_port,
+            "database": "connected" if db_ok else "error",
+            "pid": _os.getpid(),
+            "feeds_configured": len(config.feeds),
+            "feeds": len(config.feeds),
+            "total_articles": article_count,
+            "total_briefs": brief_count,
+            "fetch_interval_minutes": config.fetch_interval_minutes,
+            "memory_mb": round(mem_mb, 1),
+            "uptime_seconds": uptime_sec,
+            "scheduler_jobs": len(scheduler_jobs),
+            "scheduler_jobs_detail": scheduler_jobs,
+        })
+
+    return result
+
+
+@router.get("/pipeline-health")
+def pipeline_health():
+    """Pipeline data quality metrics — zero LLM tokens."""
+    from .pipeline_health import check_pipeline_health
+    return check_pipeline_health()
+
+
+# ===========================================================================
+# Anomaly detection & calibration endpoints
+# ===========================================================================
+
+
+@router.get("/anomalies")
+def get_anomalies(db: Session = Depends(_get_db)):
+    """Return latest detected anomalies (volume/sentiment/feed)."""
+    try:
+        setting = db.query(EngineSettings).get("last_anomalies")
+        if setting and setting.value:
+            return json.loads(setting.value)
+    except Exception:
+        pass
+    return []
+
+
+@router.get("/calibration-stats")
+def get_calibration_stats(db: Session = Depends(_get_db)):
+    """Return Brier scores + decomposition + calibration log summary."""
+    result = {}
+    try:
+        brier = db.query(EngineSettings).get("advisory_brier_scores")
+        if brier and brier.value:
+            result["brier"] = json.loads(brier.value)
+    except Exception:
+        pass
+
+    # CalibrationLog summary
+    try:
+        from .db import CalibrationLog
+        total = db.query(func.count(CalibrationLog.id)).scalar() or 0
+        evaluated = db.query(func.count(CalibrationLog.id)).filter(
+            CalibrationLog.outcome.isnot(None)
+        ).scalar() or 0
+        result["calibration_log"] = {"total_entries": total, "evaluated": evaluated}
+    except Exception:
+        result["calibration_log"] = {"total_entries": 0, "evaluated": 0}
+
+    return result
 
 
 # ===========================================================================
@@ -1579,7 +1785,8 @@ def get_polymarket_matches(run_up_id: int, db: Session = Depends(_get_db)):
 
 
 @router.post("/polymarket/refresh")
-def trigger_polymarket_refresh():
+@limiter.limit(WRITE_LIMIT)
+def trigger_polymarket_refresh(request: Request, _admin=Depends(require_admin)):
     """Manually trigger a Polymarket data refresh."""
     from .polymarket import update_polymarket_matches
     count = update_polymarket_matches()
@@ -1619,7 +1826,8 @@ def get_latest_analysis(db: Session = Depends(_get_db)):
 
 
 @router.post("/analysis/run")
-def trigger_analysis():
+@limiter.limit(SENSITIVE_LIMIT)
+def trigger_analysis(request: Request):
     """Manually trigger a deep analysis run."""
     from .deep_analysis import run_deep_analysis
     try:
@@ -1633,7 +1841,8 @@ def trigger_analysis():
 
 
 @router.post("/predictions/score")
-def trigger_prediction_scoring():
+@limiter.limit(WRITE_LIMIT)
+def trigger_prediction_scoring(request: Request):
     """Manually trigger prediction auto-scoring."""
     from .prediction_scorer import score_predictions
     try:
@@ -1728,7 +1937,8 @@ def get_signal_history(
 
 
 @router.post("/signals/refresh")
-def trigger_confidence_scoring():
+@limiter.limit(WRITE_LIMIT)
+def trigger_confidence_scoring(request: Request, _admin=Depends(require_admin)):
     """Manually trigger confidence scoring for all active run-ups."""
     from .confidence_scorer import update_trading_signals
 
@@ -1766,7 +1976,8 @@ def get_swarm_verdict(node_id: int):
 
 
 @router.post("/swarm/evaluate/{node_id}")
-async def trigger_swarm_evaluation(node_id: int):
+@limiter.limit(SENSITIVE_LIMIT)
+async def trigger_swarm_evaluation(request: Request, node_id: int, _admin=Depends(require_admin)):
     """Manually trigger a swarm evaluation for a specific decision node."""
     from .swarm_consensus import evaluate_node
 
@@ -1785,7 +1996,8 @@ async def trigger_swarm_evaluation(node_id: int):
 
 
 @router.post("/swarm/run-cycle")
-async def trigger_swarm_cycle():
+@limiter.limit(SENSITIVE_LIMIT)
+async def trigger_swarm_cycle(request: Request, _admin=Depends(require_admin)):
     """Manually trigger a full swarm consensus cycle."""
     from .swarm_consensus import swarm_consensus_cycle
 
@@ -1814,6 +2026,16 @@ def get_swarm_status(db: Session = Depends(_get_db)):
         )
         verdicts_by_type = {v: c for v, c in rows}
 
+    # Get next swarm run time from scheduler
+    next_run = None
+    try:
+        from .engine import scheduler
+        job = scheduler.get_job("swarm_consensus")
+        if job and job.next_run_time:
+            next_run = job.next_run_time.isoformat()
+    except Exception:
+        pass
+
     return {
         "enabled": config.swarm_enabled,
         "groq_model": config.groq_model,
@@ -1823,28 +2045,59 @@ def get_swarm_status(db: Session = Depends(_get_db)):
         "total_verdicts": total,
         "active_verdicts": active,
         "verdicts_by_type": verdicts_by_type,
+        "next_run": next_run,
     }
 
 
 @router.put("/swarm/config")
-def update_swarm_config(
-    groq_api_key: Optional[str] = None,
-    openrouter_api_key: Optional[str] = None,
-    interval_minutes: Optional[int] = None,
-):
+@limiter.limit(SENSITIVE_LIMIT)
+def update_swarm_config(request: Request, payload: SwarmConfigUpdate, _admin=Depends(require_admin)):
     """Update Groq/OpenRouter API keys or swarm interval."""
-    if groq_api_key is not None:
-        config.groq_api_key = groq_api_key
-    if openrouter_api_key is not None:
-        config.openrouter_api_key = openrouter_api_key
-    if interval_minutes is not None and interval_minutes >= 10:
-        config.swarm_interval_minutes = interval_minutes
+    if payload.groq_api_key is not None:
+        config.groq_api_key = payload.groq_api_key
+    if payload.openrouter_api_key is not None:
+        config.openrouter_api_key = payload.openrouter_api_key
+    if payload.interval_minutes is not None and payload.interval_minutes >= 10:
+        config.swarm_interval_minutes = payload.interval_minutes
+    audit_log(request, "swarm_config.update", "swarm_config")
     return {
         "enabled": config.swarm_enabled,
         "groq_configured": bool(config.groq_api_key),
         "openrouter_configured": bool(config.openrouter_api_key),
         "interval_minutes": config.swarm_interval_minutes,
     }
+
+
+@router.get("/swarm/experts")
+def list_swarm_experts():
+    """List all swarm experts with their enabled state."""
+    from .swarm_consensus import EXPERTS
+    return [
+        {
+            "id": e["id"],
+            "name": e["name"],
+            "emoji": e["emoji"],
+            "enabled": e.get("enabled", True),
+            "provider": e.get("provider"),
+            "system": e.get("system", "")[:200],
+        }
+        for e in EXPERTS
+    ]
+
+
+@router.put("/swarm/experts/{expert_id}/toggle")
+@limiter.limit(SENSITIVE_LIMIT)
+def toggle_swarm_expert(
+    expert_id: str, request: Request, _admin=Depends(require_admin)
+):
+    """Enable or disable a swarm expert."""
+    from .swarm_consensus import EXPERTS
+    for e in EXPERTS:
+        if e["id"] == expert_id:
+            e["enabled"] = not e.get("enabled", True)
+            audit_log(request, "swarm_expert.toggle", expert_id)
+            return {"id": e["id"], "enabled": e["enabled"]}
+    raise HTTPException(404, f"Expert '{expert_id}' not found")
 
 
 # ===========================================================================
@@ -2213,11 +2466,11 @@ def _safe_json(raw: Optional[str]) -> Any:
 # ---------------------------------------------------------------------------
 
 @router.get("/advisory/latest")
-def advisory_latest(db: Session = Depends(_get_db)):
+def advisory_latest(request: Request, db: Session = Depends(_get_db)):
     """Return the most recent daily advisory with portfolio context."""
     report = (
         db.query(AnalysisReport)
-        .filter(AnalysisReport.report_type == "daily_advisory")
+        .filter(AnalysisReport.report_type.in_(["daily_advisory", "advisory_refresh"]))
         .order_by(AnalysisReport.created_at.desc())
         .first()
     )
@@ -2236,22 +2489,73 @@ def advisory_latest(db: Session = Depends(_get_db)):
         except Exception:
             pass
 
-    # Inject live portfolio holdings for UI
-    from .db import EngineSettings
-    holdings = []
-    s = db.query(EngineSettings).get("portfolio_holdings")
-    if s and s.value:
-        try:
-            holdings = json.loads(s.value)
-        except Exception:
-            pass
+    # Inject live portfolio holdings for UI (per-user)
+    user_id = getattr(getattr(request, "state", None), "user_id", None)
+    if user_id:
+        from .user_auth import get_user_portfolio
+        holdings = get_user_portfolio(user_id)
+    else:
+        from .db import EngineSettings
+        holdings = []
+        s = db.query(EngineSettings).get("portfolio_holdings")
+        if s and s.value:
+            try:
+                holdings = json.loads(s.value)
+            except Exception:
+                pass
+
+    portfolio_updated_at = datetime.utcnow().isoformat()
+
+    # ----- Investment Swarm V3 consensus enrichment -----
+    swarm_v3 = None
+    swarm_is_latest = False
+    _NEWS_ANALYZER_DB = "/home/opposite/news-analyzer/news.db"
+    try:
+        conn = sqlite3.connect(_NEWS_ANALYZER_DB)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM swarm_consensus "
+            "WHERE error IS NULL AND confidence IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            swarm_v3 = {
+                "macro_outlook": {
+                    "regime": row["macro_regime"],
+                    "bias": row["macro_bias"],
+                    "sentiment": row["macro_sentiment"],
+                    "summary": row["macro_summary"],
+                },
+                "top_picks": json.loads(row["top_picks"]) if row["top_picks"] else [],
+                "sell_signals": json.loads(row["sell_signals"]) if row["sell_signals"] else [],
+                "sector_rotation": json.loads(row["sector_rotation"]) if row["sector_rotation"] else {},
+                "key_risks": json.loads(row["key_risks"]) if row["key_risks"] else [],
+                "confidence": row["confidence"],
+                "created_at": row["created_at"],
+                "total_experts": row["total_llm_calls"],
+            }
+            # Compare timestamps to decide if swarm data is fresher
+            advisory_ts = report.created_at.isoformat() if report.created_at else ""
+            swarm_ts = row["created_at"] or ""
+            if swarm_ts > advisory_ts:
+                swarm_is_latest = True
+    except Exception:
+        # Don't break the advisory endpoint if news-analyzer DB is unavailable
+        pass
 
     return {
         "advisory": data,
+        "advisory_type": report.report_type,
         "report_id": report.id,
         "created_at": report.created_at.isoformat() if report.created_at else None,
         "performance": performance,
         "portfolio_holdings": holdings,
+        "portfolio_updated_at": portfolio_updated_at,
+        "swarm_v3": swarm_v3,
+        "swarm_is_latest": swarm_is_latest,
     }
 
 
@@ -2337,13 +2641,14 @@ def advisory_history(
 
 
 @router.post("/advisory/generate")
-def advisory_generate():
+@limiter.limit(SENSITIVE_LIMIT)
+def advisory_generate(request: Request, _admin=Depends(require_admin)):
     """Manually trigger daily advisory generation."""
     try:
         from .daily_advisory import generate_daily_advisory
         report = generate_daily_advisory()
         if not report:
-            return {"success": False, "message": "Advisory generation failed — check logs."}
+            raise HTTPException(status_code=500, detail="Advisory generation failed — check logs.")
 
         data = json.loads(report.report_json) if report.report_json else {}
         return {
@@ -2359,27 +2664,114 @@ def advisory_generate():
         raise HTTPException(status_code=500, detail="Advisory generation failed. Check engine logs.")
 
 
+# ── Advisory Feedback ──────────────────────────────────────────────────
+
+
+@router.get("/advisory/feedback")
+def advisory_feedback_get(
+    date: Optional[str] = None,
+    db: Session = Depends(_get_db),
+):
+    """Return user feedback for a specific advisory date (or latest)."""
+    from .db import EngineSettings
+
+    key = f"advisory_feedback:{date}" if date else "advisory_feedback:latest"
+    s = db.query(EngineSettings).get(key)
+    if s and s.value:
+        try:
+            return json.loads(s.value)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {"date": date, "feedback": []}
+
+
+@router.post("/advisory/feedback")
+def advisory_feedback_post(
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(_get_db),
+):
+    """Submit user feedback on a specific advisory recommendation.
+
+    Body: {
+        "date": "2026-03-16",
+        "ticker": "XOM",
+        "action": "BUY",
+        "rating": "agree" | "disagree" | "partially_agree",
+        "comment": "optional free-text"
+    }
+    """
+    from .db import EngineSettings
+
+    adv_date = payload.get("date", date.today().isoformat())
+    ticker = payload.get("ticker", "")
+    rating = payload.get("rating", "")
+    if rating not in ("agree", "disagree", "partially_agree"):
+        raise HTTPException(status_code=400, detail="Rating must be agree, disagree, or partially_agree.")
+
+    key = f"advisory_feedback:{adv_date}"
+    s = db.query(EngineSettings).get(key)
+    existing = []
+    if s and s.value:
+        try:
+            data = json.loads(s.value)
+            existing = data.get("feedback", [])
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Upsert: replace feedback for same ticker+action
+    action = payload.get("action", "BUY")
+    existing = [f for f in existing if not (f.get("ticker") == ticker and f.get("action") == action)]
+    existing.append({
+        "ticker": ticker,
+        "action": action,
+        "rating": rating,
+        "comment": payload.get("comment", ""),
+        "submitted_at": datetime.utcnow().isoformat(),
+    })
+
+    val = json.dumps({"date": adv_date, "feedback": existing})
+    if s:
+        s.value = val
+    else:
+        s = EngineSettings(key=key, value=val)
+        db.add(s)
+    db.commit()
+
+    # Also save as latest
+    latest = db.query(EngineSettings).get("advisory_feedback:latest")
+    if latest:
+        latest.value = val
+    else:
+        db.add(EngineSettings(key="advisory_feedback:latest", value=val))
+    db.commit()
+
+    return {"success": True, "feedback_count": len(existing)}
+
+
 # ── Portfolio Holdings ──────────────────────────────────────────────────
 
 
 @router.get("/portfolio/holdings")
-def portfolio_holdings(db: Session = Depends(_get_db)):
+def portfolio_holdings(request: Request, db: Session = Depends(_get_db)):
     """Return user's portfolio holdings with LIVE valuations from yfinance."""
-    from .db import EngineSettings
     from .price_fetcher import get_price_fetcher
+    from .user_auth import get_user_portfolio
 
-    s = db.query(EngineSettings).get("portfolio_holdings")
-    if not s or not s.value:
-        return {"holdings": [], "total_value": 0, "total_cost": 0, "total_pnl": 0, "total_pnl_pct": 0}
-    try:
-        holdings = json.loads(s.value)
-    except (json.JSONDecodeError, ValueError):
+    # Per-user portfolio (no global fallback)
+    user_id = getattr(getattr(request, "state", None), "user_id", None)
+    s = None
+    empty = {"holdings": [], "total_value": 0, "total_cost": 0, "total_pnl": 0, "total_pnl_pct": 0}
+    if user_id:
+        holdings = get_user_portfolio(user_id)
+    else:
         holdings = []
+
     if not holdings:
-        return {"holdings": [], "total_value": 0, "total_cost": 0, "total_pnl": 0, "total_pnl_pct": 0}
+        return empty
 
     pf = get_price_fetcher()
     enriched = []
+    _needs_save = False
 
     for h in holdings:
         ticker = h["ticker"]
@@ -2435,6 +2827,13 @@ def portfolio_holdings(db: Session = Depends(_get_db)):
         currency = quote.get("currency", "EUR")
         live_price_eur = round(pf.convert_to_eur(live_price, currency), 4)
 
+        # If no buy price set, use current price as starting point (P&L starts at 0)
+        if avg_buy <= 0:
+            avg_buy = live_price_eur
+            # Persist this so future loads have a reference point
+            h["avg_buy_price_eur"] = avg_buy
+            _needs_save = True
+
         current_value = round(shares * live_price_eur, 2)
         cost_basis = round(shares * avg_buy, 2)
         pnl = round(current_value - cost_basis, 2)
@@ -2455,11 +2854,24 @@ def portfolio_holdings(db: Session = Depends(_get_db)):
             "change_pct": quote.get("change_pct", 0),
         })
 
+    # Auto-save buy prices if they were set from live prices
+    if _needs_save and user_id:
+        from .user_auth import set_user_portfolio
+        set_user_portfolio(user_id, holdings)
+
     # Portfolio totals
     total_value = round(sum(e.get("current_value_eur", 0) for e in enriched), 2)
     total_cost = round(sum(e.get("cost_basis_eur", 0) for e in enriched), 2)
     total_pnl = round(sum(e.get("pnl_eur", 0) for e in enriched), 2)
     total_pnl_pct = round((total_pnl / total_cost) * 100, 2) if total_cost > 0 else 0.0
+
+    # Portfolio staleness: report when holdings were last updated
+    holdings_updated_at = s.updated_at.isoformat() if s and hasattr(s, 'updated_at') and s.updated_at else None
+    # Check for per-holding updated_at (set during PUT)
+    if not holdings_updated_at and holdings:
+        per_item_ts = [h.get("updated_at") for h in holdings if h.get("updated_at")]
+        if per_item_ts:
+            holdings_updated_at = max(per_item_ts)
 
     return {
         "holdings": enriched,
@@ -2467,11 +2879,15 @@ def portfolio_holdings(db: Session = Depends(_get_db)):
         "total_cost": total_cost,
         "total_pnl": total_pnl,
         "total_pnl_pct": total_pnl_pct,
+        "updated_at": datetime.utcnow().isoformat(),
+        "holdings_config_updated_at": holdings_updated_at,
     }
 
 
 @router.put("/portfolio/holdings")
+@limiter.limit(WRITE_LIMIT)
 def portfolio_holdings_update(
+    request: Request,
     payload: Dict[str, Any] = Body(...),
     db: Session = Depends(_get_db),
 ):
@@ -2498,20 +2914,178 @@ def portfolio_holdings_update(
             "updated_at": datetime.utcnow().isoformat(),
         })
 
-    from .db import EngineSettings
-    s = db.query(EngineSettings).get("portfolio_holdings")
-    if s:
-        s.value = json.dumps(cleaned)
+    # Save per-user
+    user_id = getattr(getattr(request, "state", None), "user_id", None)
+    if user_id:
+        from .user_auth import set_user_portfolio
+        set_user_portfolio(user_id, cleaned)
     else:
-        s = EngineSettings(key="portfolio_holdings", value=json.dumps(cleaned))
-        db.add(s)
+        from .db import EngineSettings
+        s = db.query(EngineSettings).get("portfolio_holdings")
+        if s:
+            s.value = json.dumps(cleaned)
+        else:
+            s = EngineSettings(key="portfolio_holdings", value=json.dumps(cleaned))
+            db.add(s)
     db.commit()
 
     return {"success": True, "count": len(cleaned)}
 
 
+@router.get("/portfolio/search")
+def portfolio_search(q: str = Query("", min_length=1)):
+    """Search available Bunq/Ginmon stocks by ticker or name."""
+    from .bunq_stocks import BUNQ_STOCKS
+    from .price_fetcher import get_price_fetcher
+
+    query = q.upper().strip()
+    matches = []
+    for ticker, name in BUNQ_STOCKS.items():
+        if query in ticker.upper() or query in name.upper():
+            matches.append({"ticker": ticker, "name": name})
+        if len(matches) >= 20:
+            break
+
+    # Fetch live prices for top 5 matches
+    if matches:
+        pf = get_price_fetcher()
+        for m in matches[:5]:
+            try:
+                quote = pf.get_quote(m["ticker"])
+                if "error" not in quote:
+                    m["price"] = quote["price"]
+                    m["change_pct"] = quote.get("change_pct", 0)
+                    m["currency"] = quote.get("currency", "EUR")
+            except Exception:
+                pass
+
+    return {"query": q, "results": matches, "total": len(matches)}
+
+
+@router.post("/portfolio/holdings/upsert")
+@limiter.limit(WRITE_LIMIT)
+def portfolio_holding_upsert(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(_get_db),
+):
+    """Add or update a single holding.
+
+    Body: { "ticker": "XOM", "name": "ExxonMobil", "shares": 10.5, "avg_buy_price_eur": 95.50 }
+    To remove a holding, set shares to 0.
+    """
+    ticker = (payload.get("ticker") or "").strip().upper()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="Ticker is required")
+
+    shares = float(payload.get("shares", 0))
+    avg_buy = round(float(payload.get("avg_buy_price_eur", 0)), 4)
+    name = payload.get("name", ticker)
+
+    # Load current holdings (per-user or global fallback)
+    user_id = getattr(getattr(request, "state", None), "user_id", None)
+    if user_id:
+        from .user_auth import get_user_portfolio, set_user_portfolio
+        holdings = get_user_portfolio(user_id)
+    else:
+        from .db import EngineSettings
+        s = db.query(EngineSettings).get("portfolio_holdings")
+        try:
+            holdings = json.loads(s.value) if s and s.value else []
+        except (json.JSONDecodeError, ValueError):
+            holdings = []
+
+    # Find existing holding
+    found = False
+    new_holdings = []
+    for h in holdings:
+        if h.get("ticker", "").upper() == ticker:
+            found = True
+            if shares > 0:
+                h["shares"] = round(shares, 6)
+                if avg_buy > 0:
+                    h["avg_buy_price_eur"] = avg_buy
+                h["name"] = name
+                h["updated_at"] = datetime.utcnow().isoformat()
+                new_holdings.append(h)
+        else:
+            new_holdings.append(h)
+
+    if not found and shares > 0:
+        new_holdings.append({
+            "ticker": ticker,
+            "name": name,
+            "shares": round(shares, 6),
+            "avg_buy_price_eur": avg_buy,
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+
+    # Save per-user or global
+    if user_id:
+        set_user_portfolio(user_id, new_holdings)
+    else:
+        from .db import EngineSettings
+        s = db.query(EngineSettings).get("portfolio_holdings")
+        if s:
+            s.value = json.dumps(new_holdings)
+        else:
+            s = EngineSettings(key="portfolio_holdings", value=json.dumps(new_holdings))
+            db.add(s)
+        db.commit()
+
+    action = "removed" if shares == 0 else ("updated" if found else "added")
+    return {"success": True, "action": action, "ticker": ticker, "shares": shares, "total_holdings": len(new_holdings)}
+
+
+@router.get("/portfolio/size")
+def portfolio_size_get(db: Session = Depends(_get_db)):
+    """Return the configured portfolio size in EUR."""
+    from .db import EngineSettings
+    from .daily_advisory import DEFAULT_PORTFOLIO_EUR
+
+    s = db.query(EngineSettings).get("portfolio_size_eur")
+    size = DEFAULT_PORTFOLIO_EUR
+    if s and s.value:
+        try:
+            size = float(json.loads(s.value))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+    return {"portfolio_size_eur": size, "default": DEFAULT_PORTFOLIO_EUR}
+
+
+@router.put("/portfolio/size")
+@limiter.limit(WRITE_LIMIT)
+def portfolio_size_update(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(_get_db),
+    _admin=Depends(require_admin),
+):
+    """Update the assumed portfolio size for position sizing calculations.
+
+    Body: { "portfolio_size_eur": 10000 }
+    """
+    from .db import EngineSettings
+
+    size = float(payload.get("portfolio_size_eur", 5000))
+    if size < 100:
+        raise HTTPException(status_code=400, detail="Portfolio size must be at least 100 EUR.")
+    if size > 10_000_000:
+        raise HTTPException(status_code=400, detail="Portfolio size exceeds maximum (10M EUR).")
+
+    s = db.query(EngineSettings).get("portfolio_size_eur")
+    if s:
+        s.value = json.dumps(size)
+    else:
+        s = EngineSettings(key="portfolio_size_eur", value=json.dumps(size))
+        db.add(s)
+    db.commit()
+
+    return {"success": True, "portfolio_size_eur": size}
+
+
 @router.get("/portfolio/alignment")
-def portfolio_alignment(db: Session = Depends(_get_db)):
+def portfolio_alignment(request: Request, db: Session = Depends(_get_db)):
     """Compare current portfolio against latest advisory + live signals and return alignment analysis.
 
     Data freshness hierarchy (newest wins):
@@ -2519,16 +3093,20 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
       2. SwarmVerdict    — updated every 60 min by swarm_consensus
       3. DailyAdvisory   — generated once at 07:30 UTC
     """
-    from .db import EngineSettings
-
-    # ── 1. Load holdings ────────────────────────────────────────
-    s = db.query(EngineSettings).get("portfolio_holdings")
-    holdings = []
-    if s and s.value:
-        try:
-            holdings = json.loads(s.value)
-        except Exception:
-            pass
+    # ── 1. Load holdings (per-user) ─────────────────────────────
+    user_id = getattr(getattr(request, "state", None), "user_id", None)
+    if user_id:
+        from .user_auth import get_user_portfolio
+        holdings = get_user_portfolio(user_id)
+    else:
+        from .db import EngineSettings
+        s = db.query(EngineSettings).get("portfolio_holdings")
+        holdings = []
+        if s and s.value:
+            try:
+                holdings = json.loads(s.value)
+            except Exception:
+                pass
 
     if not holdings:
         return {"alignment": [], "message": "No portfolio holdings configured."}
@@ -2639,16 +3217,16 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
         if t in buy_map:
             rec = buy_map[t]
             entry["signal"] = "HOLD_ADD"
-            entry["label"] = "✅ Aanhouden + bijkopen"
-            entry["reasoning"] = rec.get("reasoning", "In BUY aanbevelingen")
+            entry["label"] = "✅ Hold + add position"
+            entry["reasoning"] = rec.get("reasoning", "In BUY recommendations")
             entry["composite_score"] = rec.get("composite_score")
             entry["rank"] = rec.get("rank")
             entry["source"] = "advisory"
         elif t in sell_map:
             rec = sell_map[t]
             entry["signal"] = "REDUCE"
-            entry["label"] = "⚠️ Afbouwen / verkopen"
-            entry["reasoning"] = rec.get("reasoning", "In SELL aanbevelingen")
+            entry["label"] = "⚠️ Reduce / sell"
+            entry["reasoning"] = rec.get("reasoning", "In SELL recommendations")
             entry["composite_score"] = rec.get("composite_score")
             entry["rank"] = rec.get("rank")
             entry["source"] = "advisory"
@@ -2661,26 +3239,26 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
                 direction = best.get("direction", "neutral")
                 if direction == "bullish":
                     entry["signal"] = "HOLD"
-                    entry["label"] = f"🟢 Aanhouden — {best['sector']} bullish"
+                    entry["label"] = f"🟢 Hold — {best['sector']} bullish"
                 elif direction == "bearish":
                     entry["signal"] = "WATCH"
-                    entry["label"] = f"🟡 Monitoren — {best['sector']} bearish"
+                    entry["label"] = f"🟡 Monitor — {best['sector']} bearish"
                 else:
                     entry["signal"] = "NEUTRAL"
-                    entry["label"] = "⚪ Geen signaal"
+                    entry["label"] = "⚪ No signal"
                 entry["reasoning"] = best.get("reasoning", "")
                 entry["source"] = "advisory_sector"
             else:
                 _sector = _detect_sector(t, h.get("name", ""))
                 if _sector:
                     entry["signal"] = "HOLD"
-                    entry["label"] = f"🟢 Aanhouden — {_sector}"
-                    entry["reasoning"] = "Geen actief signaal; positie behouden."
+                    entry["label"] = f"🟢 Hold — {_sector}"
+                    entry["reasoning"] = "No active signal; hold position."
                     entry["source"] = "sector_detect"
                 else:
                     entry["signal"] = "NEUTRAL"
-                    entry["label"] = "⚪ Geen signaal"
-                    entry["reasoning"] = "Niet in huidige advisory — geen actie nodig"
+                    entry["label"] = "⚪ No signal"
+                    entry["reasoning"] = "Not in current advisory — no action needed"
                     entry["source"] = "none"
 
         # --- 5b. Override / enrich with fresh TradingSignal ---
@@ -2729,7 +3307,7 @@ def portfolio_alignment(db: Session = Depends(_get_db)):
                 "name": sig.narrative_name or sig.ticker,
                 "action": sig.signal_level,
                 "composite_score": round(sig.confidence, 3),
-                "reasoning": sig.reasoning or f"{sig.signal_level} signaal (conf={sig.confidence:.0%})",
+                "reasoning": sig.reasoning or f"{sig.signal_level} signal (conf={sig.confidence:.0%})",
                 "current_price": None,
                 "source": "live_signal",
             })
@@ -2758,31 +3336,31 @@ def _apply_trading_signal(entry: dict, ts: "TradingSignal") -> None:
         # Bearish signal → WATCH or REDUCE
         if level in ("BUY", "STRONG_BUY") and conf >= 0.60:
             entry["signal"] = "REDUCE"
-            entry["label"] = f"⚠️ Afbouwen — bearish signaal ({conf:.0%})"
-            entry["reasoning"] = ts.reasoning or f"Bearish {level} signaal met {conf:.0%} confidence"
+            entry["label"] = f"⚠️ Reduce — bearish signal ({conf:.0%})"
+            entry["reasoning"] = ts.reasoning or f"Bearish {level} signal with {conf:.0%} confidence"
             entry["composite_score"] = round(conf, 3)
             entry["source"] = "live_signal"
         elif current_rank < 2:
             entry["signal"] = "WATCH"
-            entry["label"] = f"🟡 Monitoren — bearish {level} ({conf:.0%})"
+            entry["label"] = f"🟡 Monitor — bearish {level} ({conf:.0%})"
             if not entry.get("reasoning") or entry["source"] in ("sector_detect", "none"):
-                entry["reasoning"] = ts.reasoning or f"Bearish trading signaal"
+                entry["reasoning"] = ts.reasoning or f"Bearish trading signal"
             entry["source"] = "live_signal"
     else:
         # Bullish (default) signal → upgrade to HOLD / HOLD_ADD
         if level in ("BUY", "STRONG_BUY") and conf >= 0.60:
             if current_rank < 3:
                 entry["signal"] = "HOLD_ADD"
-                entry["label"] = f"✅ Aanhouden + bijkopen — {level} ({conf:.0%})"
-                entry["reasoning"] = ts.reasoning or f"Bullish {level} signaal met {conf:.0%} confidence"
+                entry["label"] = f"✅ Hold + add — {level} ({conf:.0%})"
+                entry["reasoning"] = ts.reasoning or f"Bullish {level} signal with {conf:.0%} confidence"
                 entry["composite_score"] = round(conf, 3)
                 entry["source"] = "live_signal"
         elif level == "ALERT" and conf >= 0.50:
             if current_rank < 2:
                 entry["signal"] = "HOLD"
-                entry["label"] = f"🟢 Aanhouden — ALERT signaal ({conf:.0%})"
+                entry["label"] = f"🟢 Hold — ALERT signal ({conf:.0%})"
                 if not entry.get("reasoning") or entry["source"] in ("sector_detect", "none"):
-                    entry["reasoning"] = ts.reasoning or f"Bullish alert signaal"
+                    entry["reasoning"] = ts.reasoning or f"Bullish alert signal"
                 entry["source"] = "live_signal"
 
 
@@ -2797,23 +3375,23 @@ def _apply_swarm_verdict(entry: dict, sv: "SwarmVerdict") -> None:
     if verdict in ("SELL", "STRONG_SELL") and conf >= 0.50:
         if current_rank < 3 or entry.get("signal") != "REDUCE":
             entry["signal"] = "REDUCE"
-            entry["label"] = f"⚠️ Afbouwen — swarm {verdict} ({conf:.0%})"
-            summary = sv.summary[:120] if hasattr(sv, "summary") and sv.summary else f"Swarm {verdict} met {conf:.0%} consensus"
+            entry["label"] = f"⚠️ Reduce — swarm {verdict} ({conf:.0%})"
+            summary = sv.entry_reasoning[:120] if sv.entry_reasoning else f"Swarm {verdict} with {conf:.0%} consensus"
             entry["reasoning"] = summary
             entry["composite_score"] = round(conf, 3)
             entry["source"] = "swarm"
     elif verdict in ("BUY", "STRONG_BUY") and conf >= 0.55:
         if current_rank < 3:
             entry["signal"] = "HOLD_ADD"
-            entry["label"] = f"✅ Aanhouden + bijkopen — swarm {verdict} ({conf:.0%})"
-            summary = sv.summary[:120] if hasattr(sv, "summary") and sv.summary else f"Swarm {verdict} met {conf:.0%} consensus"
+            entry["label"] = f"✅ Hold + add — swarm {verdict} ({conf:.0%})"
+            summary = sv.entry_reasoning[:120] if sv.entry_reasoning else f"Swarm {verdict} with {conf:.0%} consensus"
             entry["reasoning"] = summary
             entry["composite_score"] = round(conf, 3)
             entry["source"] = "swarm"
     elif verdict == "HOLD" and conf >= 0.50:
         if current_rank < 1:
             entry["signal"] = "HOLD"
-            entry["label"] = f"🟢 Aanhouden — swarm consensus ({conf:.0%})"
+            entry["label"] = f"🟢 Hold — swarm consensus ({conf:.0%})"
             entry["source"] = "swarm"
 
 
@@ -2859,20 +3437,131 @@ def _detect_sector(ticker: str, name: str):
     SECTOR_MAP = [
         ("Energy / Oil & Gas", ["oil", "gas", "energy", "petroleum", "crude",
                                  "is0d", "xle", "exxon", "xom"]),
-        ("Mining & Grondstoffen", ["mining", "miner", "mineral", "copper",
+        ("Mining & Materials", ["mining", "miner", "mineral", "copper",
                                     "wmin", "vaneck", "glen", "bhp", "rio",
                                     "teck", "fcx", "scco"]),
-        ("Goud & Edelmetalen", ["gold", "silver", "precious", "producer",
+        ("Gold & Precious Metals", ["gold", "silver", "precious", "producer",
                                  "is0e", "gdx"]),
         ("Dividend", ["dividend", "select dividend", "stoxx", "ispa", "vhyl",
                        "yield", "income"]),
-        ("Defensie", ["defense", "defence", "aerospace", "military"]),
-        ("Technologie", ["tech", "software", "semiconductor"]),
+        ("Defense", ["defense", "defence", "aerospace", "military"]),
+        ("Technology", ["tech", "software", "semiconductor"]),
     ]
     for sector_label, keywords in SECTOR_MAP:
         if any(kw in lower for kw in keywords):
             return sector_label
     return None
+
+
+# ── Swarm Intelligence Feed ──────────────────────────────────────────
+
+
+@router.get("/swarm/feed")
+def swarm_feed(db: Session = Depends(_get_db), limit: int = Query(10, ge=1, le=50)):
+    """Return latest swarm verdicts for dashboard display."""
+    verdicts = (
+        db.query(SwarmVerdict)
+        .filter(SwarmVerdict.superseded_at.is_(None))
+        .order_by(SwarmVerdict.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    result = []
+    for v in verdicts:
+        result.append({
+            "verdict": v.verdict,
+            "confidence": round(v.confidence, 2) if v.confidence else 0,
+            "consensus_strength": round(v.consensus_strength, 2) if v.consensus_strength else 0,
+            "ticker": v.primary_ticker or None,
+            "direction": v.ticker_direction or None,
+            "entry_reasoning": v.entry_reasoning or "",
+            "exit_trigger": v.exit_trigger or "",
+            "risk_note": v.risk_note or "",
+            "dissent_note": v.dissent_note or "",
+            "created_at": v.created_at.isoformat() if v.created_at else None,
+        })
+
+    return {"verdicts": result, "total": len(result)}
+
+
+# ── Admin: User Management ────────────────────────────────────────────
+
+
+@router.get("/admin/users")
+def admin_list_users(request: Request, db: Session = Depends(_get_db), _admin=Depends(require_admin)):
+    """List all registered users (admin only)."""
+    from .db import User
+    users = db.query(User).order_by(User.created_at.desc()).all()
+    result = []
+    for u in users:
+        holdings = []
+        try:
+            holdings = json.loads(u.portfolio_json or "[]")
+        except Exception:
+            pass
+        result.append({
+            "id": u.id,
+            "username": u.username,
+            "email": u.email,
+            "first_name": u.first_name,
+            "last_name": u.last_name,
+            "is_admin": getattr(u, "is_admin", False),
+            "onboarded": u.onboarded,
+            "holdings_count": len(holdings),
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+            "last_login": u.last_login.isoformat() if u.last_login else None,
+            "failed_logins": u.failed_logins or 0,
+            "locked": bool(u.locked_until and u.locked_until > datetime.utcnow()),
+        })
+    return {"users": result, "total": len(result)}
+
+
+@router.delete("/admin/users/{user_id}")
+@limiter.limit(SENSITIVE_LIMIT)
+def admin_delete_user(request: Request, user_id: int, db: Session = Depends(_get_db), _admin=Depends(require_admin)):
+    """Delete a user (admin only). Cannot delete yourself."""
+    from .db import User
+    session_data = _admin
+    if session_data.get("user_id") == user_id:
+        raise HTTPException(400, detail="Cannot delete your own account")
+    user = db.query(User).get(user_id)
+    if not user:
+        raise HTTPException(404, detail="User not found")
+    username = user.username
+    db.delete(user)
+    db.commit()
+    return {"success": True, "deleted": username}
+
+
+@router.put("/admin/users/{user_id}/toggle-admin")
+@limiter.limit(SENSITIVE_LIMIT)
+def admin_toggle_admin(request: Request, user_id: int, db: Session = Depends(_get_db), _admin=Depends(require_admin)):
+    """Toggle admin status for a user (admin only). Cannot demote yourself."""
+    from .db import User
+    session_data = _admin
+    if session_data.get("user_id") == user_id:
+        raise HTTPException(400, detail="Cannot change your own admin status")
+    user = db.query(User).get(user_id)
+    if not user:
+        raise HTTPException(404, detail="User not found")
+    user.is_admin = not user.is_admin
+    db.commit()
+    return {"success": True, "username": user.username, "is_admin": user.is_admin}
+
+
+@router.put("/admin/users/{user_id}/unlock")
+@limiter.limit(SENSITIVE_LIMIT)
+def admin_unlock_user(request: Request, user_id: int, db: Session = Depends(_get_db), _admin=Depends(require_admin)):
+    """Unlock a locked user account (admin only)."""
+    from .db import User
+    user = db.query(User).get(user_id)
+    if not user:
+        raise HTTPException(404, detail="User not found")
+    user.failed_logins = 0
+    user.locked_until = None
+    db.commit()
+    return {"success": True, "username": user.username}
 
 
 # ── Telegram Notifications ────────────────────────────────────────────
@@ -2904,15 +3593,19 @@ def telegram_status(db: Session = Depends(_get_db)):
 
 
 @router.put("/telegram/configure")
+@limiter.limit(SENSITIVE_LIMIT)
 def telegram_configure(
+    request: Request,
     payload: Dict[str, Any] = Body(...),
     db: Session = Depends(_get_db),
+    _admin=Depends(require_admin),
 ):
     """Configure Telegram bot token and chat ID.
 
     Body: { "bot_token": "...", "chat_id": "..." }
     """
     from .db import EngineSettings
+    from .crypto import encrypt_value
 
     token = (payload.get("bot_token") or "").strip()
     chat_id = (payload.get("chat_id") or "").strip()
@@ -2921,22 +3614,25 @@ def telegram_configure(
         raise HTTPException(status_code=400, detail="Both bot_token and chat_id are required.")
 
     for key, val in [("telegram_bot_token", token), ("telegram_chat_id", chat_id)]:
+        encrypted_val = encrypt_value(val)
         s = db.query(EngineSettings).get(key)
         if s:
-            s.value = val
+            s.value = encrypted_val
         else:
-            db.add(EngineSettings(key=key, value=val))
+            db.add(EngineSettings(key=key, value=encrypted_val))
     db.commit()
 
+    audit_log(request, "telegram.configure", "telegram")
     return {"success": True, "message": "Telegram configured. Use /api/telegram/test to verify."}
 
 
 @router.post("/telegram/test")
-def telegram_test():
+@limiter.limit(SENSITIVE_LIMIT)
+def telegram_test(request: Request, _admin=Depends(require_admin)):
     """Send a test message via Telegram to verify configuration."""
     from .telegram_notifier import send_test_message, is_telegram_configured
     if not is_telegram_configured():
-        return {"success": False, "message": "Telegram not configured. Set bot_token and chat_id first."}
+        raise HTTPException(status_code=400, detail="Telegram not configured. Set bot_token and chat_id first.")
 
     sent = send_test_message()
     return {
@@ -2946,7 +3642,8 @@ def telegram_test():
 
 
 @router.post("/telegram/send-advisory")
-def telegram_send_advisory(db: Session = Depends(_get_db)):
+@limiter.limit(WRITE_LIMIT)
+def telegram_send_advisory(request: Request, db: Session = Depends(_get_db), _admin=Depends(require_admin)):
     """Manually send the latest advisory via Telegram."""
     from .telegram_notifier import send_advisory_notification, is_telegram_configured
 
@@ -3016,7 +3713,8 @@ def ml_predictions(db: Session = Depends(_get_db)):
 
 
 @router.post("/ml/retrain")
-def ml_retrain():
+@limiter.limit(SENSITIVE_LIMIT)
+def ml_retrain(request: Request):
     """Force ML model retrain on current data."""
     try:
         from .ml.prepare import extract_all
@@ -3056,3 +3754,424 @@ def ml_experiments():
         for row in reader:
             experiments.append(row)
     return {"experiments": experiments, "count": len(experiments)}
+
+
+# ---------------------------------------------------------------------------
+# Flash alerts
+# ---------------------------------------------------------------------------
+
+@router.get("/flash/alerts")
+def get_flash_alerts(db: Session = Depends(_get_db)):
+    """Return active + recently expired flash alerts (last 12 hours, max 10)."""
+    from .db import FlashAlert
+
+    cutoff = datetime.utcnow() - timedelta(hours=12)
+    alerts = (
+        db.query(FlashAlert)
+        .filter(FlashAlert.detected_at >= cutoff)
+        .order_by(FlashAlert.detected_at.desc())
+        .limit(10)
+        .all()
+    )
+    return [_serialize_flash(a) for a in alerts]
+
+
+def _serialize_flash(a) -> dict:
+    """Serialize a FlashAlert to a dict for JSON response."""
+    return {
+        "id": a.id,
+        "alert_id": a.alert_id,
+        "trigger_type": a.trigger_type,
+        "flash_score": a.flash_score,
+        "headline": a.headline,
+        "region": a.region,
+        "event_type": a.event_type,
+        "intensity": a.intensity,
+        "sources": _safe_json(a.source_names_json),
+        "tickers_affected": _safe_json(a.tickers_affected_json),
+        "flash_advisory": _safe_json(a.flash_advisory_json),
+        "portfolio_action": a.portfolio_action,
+        "risk_level": a.risk_level,
+        "recommendations": _safe_json(a.recommendations_json),
+        "eval_6h": _safe_json(a.eval_6h_json),
+        "eval_1d": _safe_json(a.eval_1d_json),
+        "eval_4d": _safe_json(a.eval_4d_json),
+        "eval_7d": _safe_json(a.eval_7d_json),
+        "detected_at": a.detected_at.isoformat() if a.detected_at else None,
+        "expires_at": a.expires_at.isoformat() if a.expires_at else None,
+        "status": a.status,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat — Deterministic health + market threshold check (0 LLM tokens)
+# ---------------------------------------------------------------------------
+
+@router.get("/heartbeat")
+def heartbeat_check(db: Session = Depends(_get_db)):
+    """Deterministic health + market threshold check. Zero LLM tokens.
+
+    Returns HEARTBEAT_OK if nothing significant, or alert details if thresholds breached.
+    """
+    alerts = []
+    gold_ref_eur_kg = 141_000  # Reference price, updated periodically
+    portfolio_alert_pct = 3.0
+    gold_alert_pct = 2.0
+
+    # --- Gold price check ---
+    try:
+        from .price_fetcher import get_price_fetcher
+        pf = get_price_fetcher()
+        gold = pf.get_gold_price()
+        if "error" not in gold:
+            gold_price = gold["price"]
+            gold_change_pct = round(((gold_price - gold_ref_eur_kg) / gold_ref_eur_kg) * 100, 2)
+            half_kg_value = round(gold_price * 0.5, 0)
+            if abs(gold_change_pct) > gold_alert_pct:
+                alerts.append({
+                    "type": "gold",
+                    "message": f"Goud €{gold_price:,.0f}/kg ({gold_change_pct:+.1f}% vs ref). Halve kilo: €{half_kg_value:,.0f}",
+                    "change_pct": gold_change_pct,
+                })
+    except Exception as e:
+        logger.warning("Heartbeat gold check failed: %s", e)
+
+    # --- Portfolio check ---
+    try:
+        s = db.query(EngineSettings).get("portfolio_holdings")
+        if s and s.value:
+            from .price_fetcher import get_price_fetcher
+            holdings = json.loads(s.value)
+            pf = get_price_fetcher()
+            total_value = 0
+            total_cost = 0
+            top_mover = {"ticker": "?", "change_pct": 0}
+            for h in holdings:
+                shares = float(h.get("shares", 0))
+                avg_buy = float(h.get("avg_buy_price_eur", 0))
+                if shares <= 0:
+                    continue
+                quote = pf.get_quote(h["ticker"])
+                if "error" not in quote:
+                    live_eur = pf.convert_to_eur(quote["price"], quote.get("currency", "EUR"))
+                    current_val = shares * live_eur
+                    cost_basis = shares * avg_buy
+                    total_value += current_val
+                    total_cost += cost_basis
+                    chg = abs(quote.get("change_pct", 0) or 0)
+                    if chg > abs(top_mover["change_pct"]):
+                        top_mover = {"ticker": h["ticker"], "change_pct": quote.get("change_pct", 0)}
+
+            if total_cost > 0:
+                pnl_pct = round(((total_value - total_cost) / total_cost) * 100, 2)
+                if abs(pnl_pct) > portfolio_alert_pct:
+                    alerts.append({
+                        "type": "portfolio",
+                        "message": f"Portfolio €{total_value:,.0f} ({pnl_pct:+.1f}%). Top mover: {top_mover['ticker']} ({top_mover['change_pct']:+.1f}%)",
+                        "change_pct": pnl_pct,
+                        "top_mover": top_mover,
+                    })
+    except Exception as e:
+        logger.warning("Heartbeat portfolio check failed: %s", e)
+
+    if not alerts:
+        return {"status": "HEARTBEAT_OK", "alerts": []}
+
+    return {"status": "ALERT", "alerts": alerts}
+
+
+# ---------------------------------------------------------------------------
+# Morning Digest — Pre-built data for Arabella (0 LLM tokens)
+# ---------------------------------------------------------------------------
+
+@router.get("/morning-digest")
+def morning_digest(db: Session = Depends(_get_db)):
+    """Return a complete morning digest from pre-calculated DB data.
+
+    Single endpoint that provides ALL data for the morning update:
+    active run-ups with swarm verdicts, portfolio, trading signals,
+    latest advisory, and daily quotes. Pure DB reads, no LLM calls.
+    """
+    now = datetime.utcnow()
+    twenty_four_hours_ago = now - timedelta(hours=24)
+
+    # --- 1. Active run-ups with latest swarm verdicts ---
+    active_runups = (
+        db.query(RunUp)
+        .filter(RunUp.status == "active")
+        .order_by(desc(RunUp.current_score))
+        .limit(5)
+        .all()
+    )
+
+    runups_data = []
+    for ru in active_runups:
+        # Get latest swarm verdict for this run-up
+        verdict = (
+            db.query(SwarmVerdict)
+            .filter(SwarmVerdict.run_up_id == ru.id)
+            .order_by(desc(SwarmVerdict.created_at))
+            .first()
+        )
+
+        runups_data.append({
+            "id": ru.id,
+            "narrative": ru.narrative_name,
+            "score": ru.current_score,
+            "acceleration": ru.acceleration_rate,
+            "article_count": ru.article_count_total,
+            "focused": ru.is_focused,
+            "swarm_verdict": {
+                "verdict": verdict.verdict,
+                "confidence": verdict.confidence,
+                "yes_probability": verdict.yes_probability,
+                "consensus_strength": verdict.consensus_strength,
+            } if verdict else None,
+        })
+
+    # --- 2. Portfolio holdings (live valuations) ---
+    portfolio = []
+    portfolio_total = {}
+    s = db.query(EngineSettings).get("portfolio_holdings")
+    if s and s.value:
+        try:
+            from .price_fetcher import get_price_fetcher
+            holdings = json.loads(s.value)
+            pf = get_price_fetcher()
+            total_value = 0
+            total_cost = 0
+            for h in holdings:
+                ticker = h["ticker"]
+                shares = float(h.get("shares", 0))
+                avg_buy = float(h.get("avg_buy_price_eur", 0))
+                if shares <= 0 and h.get("value_eur", 0) <= 0:
+                    continue
+                quote = pf.get_quote(ticker)
+                if "error" not in quote:
+                    live_eur = round(pf.convert_to_eur(quote["price"], quote.get("currency", "EUR")), 4)
+                    current_val = round(shares * live_eur, 2)
+                    cost_basis = round(shares * avg_buy, 2)
+                    total_value += current_val
+                    total_cost += cost_basis
+                    portfolio.append({
+                        "ticker": ticker,
+                        "name": h.get("name", ticker),
+                        "price_eur": live_eur,
+                        "value_eur": current_val,
+                        "pnl_pct": round(((current_val - cost_basis) / cost_basis) * 100, 2) if cost_basis > 0 else 0,
+                        "change_pct": quote.get("change_pct", 0),
+                    })
+                elif h.get("value_eur", 0) > 0:
+                    # Legacy holding
+                    portfolio.append({
+                        "ticker": ticker,
+                        "name": h.get("name", ticker),
+                        "value_eur": round(h["value_eur"], 2),
+                        "legacy": True,
+                    })
+                    total_value += h.get("value_eur", 0)
+            portfolio_total = {
+                "total_value_eur": round(total_value, 2),
+                "total_cost_eur": round(total_cost, 2),
+                "total_pnl_pct": round(((total_value - total_cost) / total_cost) * 100, 2) if total_cost > 0 else 0,
+            }
+        except Exception as e:
+            logger.warning(f"Portfolio fetch failed in digest: {e}")
+
+    # --- 3. Latest trading signals ---
+    signals = (
+        db.query(TradingSignal)
+        .filter(TradingSignal.created_at >= twenty_four_hours_ago)
+        .order_by(desc(TradingSignal.confidence))
+        .limit(5)
+        .all()
+    )
+
+    signals_data = [
+        {
+            "narrative": s.narrative_name,
+            "ticker": s.ticker,
+            "direction": s.direction,
+            "signal_level": s.signal_level,
+            "confidence": s.confidence,
+        }
+        for s in signals
+    ]
+
+    # --- 4. Latest advisory summary ---
+    advisory_report = (
+        db.query(AnalysisReport)
+        .filter(AnalysisReport.report_type.in_(["daily_advisory", "advisory_refresh"]))
+        .order_by(AnalysisReport.created_at.desc())
+        .first()
+    )
+
+    advisory = None
+    if advisory_report:
+        try:
+            data = json.loads(advisory_report.report_json)
+            advisory = {
+                "market_stance": data.get("market_stance"),
+                "buy_recommendations": [
+                    {"ticker": r.get("ticker"), "reason": (r.get("reason", ""))[:100]}
+                    for r in data.get("buy_recommendations", [])[:3]
+                ],
+                "sell_recommendations": [
+                    {"ticker": r.get("ticker"), "reason": (r.get("reason", ""))[:100]}
+                    for r in data.get("sell_recommendations", [])[:3]
+                ],
+                "created_at": advisory_report.created_at.isoformat() if advisory_report.created_at else None,
+            }
+        except Exception:
+            pass
+
+    # --- 5. Recent flash alerts (breaking news) ---
+    from .db import FlashAlert
+    flashes = (
+        db.query(FlashAlert)
+        .filter(
+            FlashAlert.detected_at >= twenty_four_hours_ago,
+            FlashAlert.status != "expired",
+        )
+        .order_by(desc(FlashAlert.flash_score))
+        .limit(3)
+        .all()
+    )
+
+    flash_data = [
+        {
+            "headline": f.headline[:200],
+            "region": f.region,
+            "event_type": f.event_type,
+            "flash_score": f.flash_score,
+        }
+        for f in flashes
+    ]
+
+    # --- 6. Top narrative timelines (momentum) ---
+    timelines = (
+        db.query(NarrativeTimeline)
+        .filter(NarrativeTimeline.date >= (date.today() - timedelta(days=1)))
+        .order_by(desc(NarrativeTimeline.intensity_score))
+        .limit(5)
+        .all()
+    )
+
+    trending = [
+        {
+            "narrative": t.narrative_name,
+            "article_count": t.article_count,
+            "sources_count": t.sources_count,
+            "sentiment": t.avg_sentiment,
+            "intensity": t.intensity_score,
+            "trend": t.trend,
+        }
+        for t in timelines
+    ]
+
+    # --- 7. Daily quotes ---
+    quotes = _get_daily_quotes(now)
+
+    # --- 8. Action summary (prioritized) ---
+    action_now = []
+    action_week = []
+
+    # Flash alerts = NU
+    for f in flash_data:
+        if f["flash_score"] >= 7:
+            action_now.append(f"⚡ {f['headline'][:80]}")
+
+    # High-confidence signals = NU
+    for s in signals_data:
+        if s["signal_level"] in ("STRONG_BUY", "BUY", "ALERT") and s["confidence"] >= 0.6:
+            action_now.append(f"📊 {s['narrative']}: {s['signal_level']} ({s['confidence']:.0%})")
+
+    # Advisory recommendations = WEEK
+    if advisory:
+        for r in advisory.get("buy_recommendations", []):
+            action_week.append(f"📈 Overweeg {r['ticker']}")
+        for r in advisory.get("sell_recommendations", []):
+            action_week.append(f"📉 Overweeg exit {r['ticker']}")
+
+    actions = {
+        "now": action_now[:3],
+        "week": action_week[:3],
+    }
+
+    return {
+        "digest": {
+            "runups": runups_data,
+            "portfolio": portfolio,
+            "portfolio_total": portfolio_total,
+            "signals": signals_data,
+            "advisory": advisory,
+            "flash_alerts": flash_data,
+            "trending_narratives": trending,
+            "quotes": quotes,
+            "actions": actions,
+        },
+        "freshness": {
+            "generated_at": now.isoformat(),
+            "runups_count": len(runups_data),
+            "signals_count": len(signals_data),
+        },
+    }
+
+
+def _get_daily_quotes(now: datetime) -> dict:
+    """Pick deterministic daily quotes from quotes.json (no repeats for 400+ days)."""
+    quotes_path = Path(__file__).parent / "data" / "quotes.json"
+    if not quotes_path.exists():
+        return {"error": "quotes.json not found"}
+    try:
+        with open(quotes_path, "r", encoding="utf-8") as f:
+            all_quotes = json.load(f)
+    except Exception:
+        return {"error": "Failed to load quotes.json"}
+
+    day_seed = now.timetuple().tm_yday + now.year * 366
+    result = {}
+    for category, quotes in all_quotes.items():
+        if quotes:
+            idx = day_seed % len(quotes)
+            result[category] = quotes[idx]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Audit log endpoint
+# ---------------------------------------------------------------------------
+
+@router.get("/audit/log")
+def get_audit_log_entries(
+    limit: int = Query(100, ge=1, le=1000),
+    action: Optional[str] = Query(None),
+    since: Optional[str] = Query(None),
+    db: Session = Depends(_get_db),
+):
+    """Return recent audit log entries."""
+    q = db.query(AuditLog).order_by(desc(AuditLog.timestamp))
+
+    if action:
+        q = q.filter(AuditLog.action.contains(action))
+    if since:
+        try:
+            cutoff = datetime.fromisoformat(since)
+            q = q.filter(AuditLog.timestamp >= cutoff)
+        except ValueError:
+            raise HTTPException(400, detail="Invalid 'since' datetime format.")
+
+    entries = q.limit(limit).all()
+    return [
+        {
+            "id": e.id,
+            "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+            "action": e.action,
+            "resource_type": e.resource_type,
+            "resource_id": e.resource_id,
+            "ip_address": e.ip_address,
+            "detail": e.detail,
+            "status": e.status,
+        }
+        for e in entries
+    ]

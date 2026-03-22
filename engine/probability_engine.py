@@ -167,8 +167,9 @@ def score_evidence(brief: ArticleBrief, yes_keywords: List[str], no_keywords: Li
 
     # Sentiment modifier (negative sentiment boosts threat evidence)
     sent_boost = 1.0
-    if brief.sentiment < -0.3:
-        sent_boost = 1.0 + abs(brief.sentiment) * 0.5  # up to ~1.5x
+    sentiment_val = brief.sentiment or 0.0
+    if sentiment_val < -0.3:
+        sent_boost = 1.0 + abs(sentiment_val) * 0.5  # up to ~1.5x
 
     raw = direction * intensity_mult * sent_boost
 
@@ -219,10 +220,13 @@ def _bayesian_update(prior: float, evidence_score: float, max_shift: float) -> f
     # Convert back to probability
     posterior = 1.0 / (1.0 + math.exp(-log_odds))
 
-    # Cap the maximum per-cycle shift to prevent wild swings
+    # Cap the maximum per-cycle shift to prevent wild swings.
+    # Dynamic max: strong evidence (score near 1.0) allows larger shifts
+    # (up to 25-30% per cycle instead of only 15%).
+    dynamic_max = min(0.30, max_shift + 0.10 * abs(evidence_score))
     shift = posterior - prior
-    if abs(shift) > max_shift:
-        posterior = prior + max_shift * (1.0 if shift > 0 else -1.0)
+    if abs(shift) > dynamic_max:
+        posterior = prior + dynamic_max * (1.0 if shift > 0 else -1.0)
 
     return round(max(min(posterior, 0.99), 0.01), 4)
 
@@ -461,7 +465,7 @@ def _build_consequence_summary(
 ) -> str:
     """Build a short textual summary for consequence evidence."""
     parts = [f"{len(briefs)} articles match consequence keywords."]
-    avg_sent = sum(b.sentiment for b in briefs) / len(briefs) if briefs else 0
+    avg_sent = sum((b.sentiment or 0.0) for b in briefs) / len(briefs) if briefs else 0
     parts.append(f"Avg sentiment: {avg_sent:.2f}.")
     intensities = [b.intensity for b in briefs]
     if "critical" in intensities:

@@ -29,6 +29,8 @@ from .db import (
     Article,
     DecisionNode,
     EngineSettings,
+    FlashAlert,
+    PriceSnapshot,
     RunUp,
     StockImpact,
     SwarmVerdict,
@@ -64,6 +66,10 @@ KELLY_FRACTION = 0.5          # Half-Kelly (conservative for retail)
 MAX_POSITION_PCT = 20.0       # Never >20% of portfolio in one pick
 MIN_POSITION_PCT = 3.0        # Minimum 3% to be meaningful
 DEFAULT_PORTFOLIO_EUR = 5000  # Assumed portfolio size if not configured
+
+# ── Portfolio-level risk controls ─────────────────────────────────────
+MAX_PORTFOLIO_HEAT_PCT = 8.0  # Max total risk (sum of all position stop-loss %)
+MAX_CONCURRENT_POSITIONS = 4  # Max simultaneous BUY recommendations
 
 # ── Risk level defaults (ATR multipliers) ─────────────────────────────
 STOP_LOSS_ATR_MULT = 2.0     # Stop-loss at 2× ATR below entry
@@ -229,7 +235,56 @@ def _collect_candidates(session) -> Dict[str, Dict[str, Any]]:
         except Exception:
             logger.exception("Failed to parse strategic outlook.")
 
-    # --- 3. Enrich with swarm verdicts ---
+    # --- Source 3: Direct SwarmVerdict ticker votes (bypass signal layer) ---
+    try:
+        from .bunq_stocks import get_eu_equivalents
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+        seen_tickers = set(candidates.keys())
+        recent_verdicts = (
+            session.query(SwarmVerdict)
+            .filter(
+                SwarmVerdict.created_at >= cutoff,
+                SwarmVerdict.superseded_at.is_(None),
+                SwarmVerdict.primary_ticker.isnot(None),
+                SwarmVerdict.verdict.in_(["BUY", "STRONG_BUY", "SELL", "STRONG_SELL"]),
+            )
+            .order_by(SwarmVerdict.confidence.desc())
+            .limit(10)
+            .all()
+        )
+        for v in recent_verdicts:
+            ticker = v.primary_ticker
+            if not is_available_on_bunq(ticker):
+                # Try EU equivalent
+                eu_alts = get_eu_equivalents(ticker)
+                if eu_alts:
+                    ticker = eu_alts[0]["ticker"]
+                else:
+                    continue
+
+            if ticker not in seen_tickers:
+                seen_tickers.add(ticker)
+                direction = "buy" if v.verdict in ("BUY", "STRONG_BUY") else "sell"
+                candidates[ticker] = {
+                    "ticker": ticker,
+                    "direction": direction,
+                    "source": "swarm_direct",
+                    "confidence": v.confidence or 0,
+                    "reasoning": v.entry_reasoning or "",
+                    "risk_note": v.risk_note or "",
+                    "run_up_id": v.run_up_id,
+                    "name": BUNQ_STOCKS.get(ticker.upper(), ticker),
+                    "signal_confidence": v.confidence or 0.0,
+                    "signal_level": "SWARM",
+                    "narrative": v.entry_reasoning or "",
+                    "geopolitical_net_score": 0.0,
+                    "swarm_verdict": v.verdict,
+                    "swarm_confidence": v.confidence or 0.0,
+                }
+    except Exception as e:
+        logger.warning("Swarm direct candidate collection failed: %s", e)
+
+    # --- 4. Enrich with swarm verdicts ---
     for t, c in candidates.items():
         if not c.get("run_up_id"):
             continue
@@ -651,29 +706,18 @@ ADVISORY_SONNET_MODEL = "claude-sonnet-4-20250514"
 
 
 def _select_advisory_model() -> str:
-    """Select the best model for the daily advisory narrative.
+    """Select model for advisory narrative based on budget tier.
 
-    The advisory is the end product the user sees — it deserves the best model
-    we can afford. Use Sonnet if budget allows (>50% remaining), Haiku otherwise.
-    Cost: Sonnet ~€0.03 vs Haiku ~€0.008 per advisory.
+    PREMIUM/STANDARD: Sonnet (advisory is the user-facing product, deserves best)
+    ECONOMY/EMERGENCY: Haiku (save money, but still generate advisory)
     """
     try:
-        from .tree_generator import get_daily_budget_eur, get_today_spending_eur
-        budget = get_daily_budget_eur()
-        spent = get_today_spending_eur()
-        remaining = budget - spent
-        # Use Sonnet if we have at least 50% budget remaining
-        if remaining > budget * 0.5:
-            logger.info(
-                "Advisory narrative: using Sonnet (€%.3f remaining of €%.2f budget)",
-                remaining, budget,
-            )
+        from .tree_generator import get_budget_tier, BudgetTier
+        tier = get_budget_tier()
+        if tier in (BudgetTier.PREMIUM, BudgetTier.STANDARD):
+            logger.info("Advisory: %s tier — using Sonnet", tier.value)
             return ADVISORY_SONNET_MODEL
-        else:
-            logger.info(
-                "Advisory narrative: using Haiku (budget tight: €%.3f remaining)",
-                remaining,
-            )
+        logger.info("Advisory: %s tier — using Haiku", tier.value)
     except Exception:
         pass
     return config.tree_generator_model
@@ -685,12 +729,27 @@ def _generate_narrative(
     context: Dict[str, Any],
     stance: str,
 ) -> Optional[Dict[str, Any]]:
-    """Generate advisory narrative via Claude (Sonnet if budget allows, else Haiku)."""
+    """Generate advisory narrative via Claude (Sonnet or Haiku based on budget tier)."""
     try:
-        from .tree_generator import _check_budget, _log_usage
-        if not _check_budget():
-            logger.info("Advisory narrative skipped — budget exhausted.")
+        from .tree_generator import _check_budget, _log_usage, can_spend, get_budget_tier, BudgetTier
+
+        tier = get_budget_tier()
+        if tier == BudgetTier.BLOCKED:
+            logger.info("Advisory narrative BLOCKED — hard ceiling reached.")
             return None
+
+        if not _check_budget(purpose="daily_advisory"):
+            logger.info("Advisory narrative skipped — budget check failed.")
+            return None
+
+        # Pre-flight cost check against hard ceiling
+        model = _select_advisory_model()
+        est_cost = 0.03 if "sonnet" in model else 0.01
+        if not can_spend(est_cost):
+            logger.warning("Advisory: €%.3f would exceed ceiling. Blocked.", est_cost)
+            return None
+    except ImportError:
+        return None
     except Exception:
         return None
 
@@ -800,8 +859,11 @@ For EACH BUY, provide:
    Include non-obvious angles (e.g., if a company's production is outside a conflict zone,
    that's a structural advantage even when peers suffer).
 2. CATALYST: What is happening RIGHT NOW that makes this urgent? What news/event?
+   Be specific: name the event, date, and expected market impact.
 3. TIMING: Best entry approach for Tradegate (opens 08:00 CET). Gap up expected?
-   Wait for morning dip? Or buy at open?
+   Wait for morning dip? Or buy at open? Give a SPECIFIC CET time window.
+4. RISK: What is the single biggest risk that could invalidate this thesis?
+   Include a concrete trigger (e.g., "if VIX spikes above 25" or "if OPEC announces supply increase").
 
 For EACH SELL, provide:
 1. THESIS: Why sell — what is the risk or the peak signal?
@@ -810,19 +872,21 @@ For EACH SELL, provide:
    Sell-the-news gaps often correct after US open.
    Give a specific CET time window recommendation.
 3. TARGET: What price level or signal would confirm it's time to sell?
+   Include an invalidation level where you would HOLD instead of SELL.
 
 Return STRICT JSON (no text before/after):
 {{
   "reasoning": {{
     "<TICKER>": {{
       "thesis": "2-3 sentences on the fundamental investment thesis",
-      "catalyst": "What is happening NOW that creates urgency",
-      "timing": "Specific entry/exit advice with CET times",
-      "risk": "Key risk to watch for this position"
+      "catalyst": "What is happening NOW that creates urgency — name the event and its expected impact",
+      "timing": "Specific entry/exit advice with CET times (e.g., 'Buy at 08:15 CET if gap < 1.5%')",
+      "risk": "Key risk to watch — include a concrete invalidation trigger",
+      "conviction": "high/medium/low — how confident is this recommendation?"
     }}
   }},
-  "narrative_summary": "3-4 sentence market outlook connecting geopolitics to portfolio action",
-  "risk_warning": "1-2 sentence key risk to watch",
+  "narrative_summary": "3-4 sentence market outlook connecting geopolitics to SPECIFIC portfolio actions the user should take today",
+  "risk_warning": "1-2 sentence key risk to watch — include what action to take if it materialises",
   "sectors_outlook": [
     {{"sector": "...", "direction": "bullish/bearish/mixed", "reasoning": "2-3 sentences with specific analysis"}}
   ]
@@ -831,7 +895,8 @@ Only use tickers from the candidates above. Be specific and actionable.
 Note: Prices shown are in the stock's native currency (USD for US equities,
 EUR for Tradegate-listed). Stop-loss and take-profit levels should always
 include the currency label (e.g. "$142.50" or "€128.30").
-Write as if briefing a trader before market open."""
+Write as if briefing a trader 30 minutes before Tradegate opens. Every sentence
+should help the reader decide WHAT to do, WHEN to do it, and WHEN to bail out."""
 
     model = _select_advisory_model()
 
@@ -840,7 +905,7 @@ Write as if briefing a trader before market open."""
             model=model,
             max_tokens=4000,
             temperature=0.3,
-            system="You are a senior portfolio strategist generating actionable daily investment advisories in JSON format.",
+            system="You are a senior geopolitical investment analyst generating actionable daily investment advisories in JSON format for a European retail investor on bunq Stocks.",
             messages=[{"role": "user", "content": prompt}],
         )
         text = resp.content[0].text.strip()
@@ -881,44 +946,18 @@ def _derive_sectors_outlook(
 
     Maps buy/sell tickers to sectors and infers sector direction.
     """
-    TICKER_SECTORS = {
-        # Energy
-        "XOM": "Energy", "CVX": "Energy", "COP": "Energy", "SLB": "Energy",
-        "EOG": "Energy", "MPC": "Energy", "VLO": "Energy", "PSX": "Energy",
-        "OXY": "Energy", "HAL": "Energy", "TTE.PA": "Energy",
-        "BP.L": "Energy", "SHEL": "Energy", "IS0D.DE": "Energy",
-        # Mining & Materials (NOT all precious metals)
-        "FCX": "Mining", "SCCO": "Mining",             # copper miners
-        "GLEN.L": "Mining", "ANTO.L": "Mining",        # diversified / copper
-        "TECK": "Mining", "ALB": "Lithium",            # zinc-copper / lithium
-        "RIO": "Mining", "BHP": "Mining",              # diversified mining
-        # Defense
-        "LMT": "Defense & Aerospace", "RTX": "Defense & Aerospace",
-        "NOC": "Defense & Aerospace", "GD": "Defense & Aerospace",
-        "LHX": "Defense & Aerospace", "BA": "Defense & Aerospace",
-        "AIR.PA": "Defense & Aerospace",
-        # Technology
-        "NVDA": "Technology", "AMD": "Technology", "INTC": "Technology",
-        "AVGO": "Technology", "QCOM": "Technology", "AAPL": "Technology",
-        "MSFT": "Technology", "GOOGL": "Technology", "META": "Technology",
-        "CRM": "Technology", "ORCL": "Technology", "ADBE": "Technology",
-        "ASML": "Technology",
-        "SAP": "Technology", "PLTR": "Technology",
-        # Emerging Markets
-        "IEMA.AS": "Emerging Markets",
-    }
-
+    # Use the canonical _TICKER_TO_SECTOR mapping (single source of truth)
     # Count direction per sector
     sector_scores: dict = {}
     for r in buy_recs:
-        sector = TICKER_SECTORS.get(r["ticker"])
+        sector = _TICKER_TO_SECTOR.get(r["ticker"])
         if sector:
             entry = sector_scores.setdefault(sector, {"bull": 0, "bear": 0, "tickers": []})
             entry["bull"] += 1
             entry["tickers"].append(r["ticker"])
 
     for r in sell_recs:
-        sector = TICKER_SECTORS.get(r["ticker"])
+        sector = _TICKER_TO_SECTOR.get(r["ticker"])
         if sector:
             entry = sector_scores.setdefault(sector, {"bull": 0, "bear": 0, "tickers": []})
             entry["bear"] += 1
@@ -1161,6 +1200,37 @@ def _compute_position_sizing(
 
     shares = int(eur_amount / price_eur) if price_eur > 0 else 0
 
+    # ── Confidence interval (±1σ around Kelly estimate) ─────────────
+    # Kelly uncertainty comes from win_prob estimation error.  We model
+    # ±0.08 (1σ) around the point estimate, re-run Kelly, and derive
+    # min/max position sizes.  This gives a simple "8-16 shares" range.
+    _CI_SIGMA = 0.08  # ±8pp win-prob uncertainty
+    ci_lo_prob = max(0.30, win_prob - _CI_SIGMA)
+    ci_hi_prob = min(0.85, win_prob + _CI_SIGMA)
+
+    def _kelly_pct(wp):
+        qq = 1.0 - wp
+        kk = (b * wp - qq) / b if b > 0 else 0
+        kk = max(0, kk) * KELLY_FRACTION
+        # apply same VIX adjustment
+        if vix > 30:
+            kk *= 0.5
+        elif vix > 25:
+            kk *= 0.7
+        elif vix < 15:
+            kk *= 1.1
+        pct = kk * 100
+        if pct > 0:
+            pct = max(MIN_POSITION_PCT, pct)
+        return round(min(MAX_POSITION_PCT, pct), 1)
+
+    ci_lo_pct = _kelly_pct(ci_lo_prob)
+    ci_hi_pct = _kelly_pct(ci_hi_prob)
+    ci_lo_eur = round(portfolio_value * ci_lo_pct / 100, 2)
+    ci_hi_eur = round(portfolio_value * ci_hi_pct / 100, 2)
+    ci_lo_shares = int(ci_lo_eur / price_eur) if price_eur > 0 else 0
+    ci_hi_shares = int(ci_hi_eur / price_eur) if price_eur > 0 else 0
+
     return {
         "position_pct": position_pct,
         "shares": shares,
@@ -1171,6 +1241,13 @@ def _compute_position_sizing(
         "reward_risk_ratio": round(b, 2),
         "vix_adjustment": round(vix, 1),
         "method": "half_kelly_atr",
+        # Confidence interval (±1σ)
+        "ci_lo_pct": ci_lo_pct,
+        "ci_hi_pct": ci_hi_pct,
+        "ci_lo_shares": ci_lo_shares,
+        "ci_hi_shares": ci_hi_shares,
+        "ci_lo_eur": ci_lo_eur,
+        "ci_hi_eur": ci_hi_eur,
     }
 
 
@@ -1286,8 +1363,8 @@ def generate_daily_advisory() -> Optional[AnalysisReport]:
         # 2. Collect candidate tickers
         candidates = _collect_candidates(session)
         if not candidates:
-            logger.warning("No advisory candidates found.")
-            return None
+            logger.info("No advisory candidates — generating market-only advisory.")
+            candidates = {}
         logger.info("Advisory candidates: %d tickers", len(candidates))
 
         # 3. Fetch momentum for all candidate tickers
@@ -1355,15 +1432,49 @@ def generate_daily_advisory() -> Optional[AnalysisReport]:
             context["swarm_divergence"] = swarm_risk
 
         # 6c. Compute ATR + position sizing + risk levels for all recs
+        #     Enforce portfolio-level risk budget (max heat + max concurrent positions)
         vix_price = (context.get("vix") or {}).get("price")
         portfolio_val = _get_portfolio_value(session)
         atr_cache: Dict[str, Optional[float]] = {}
-        for rec in buy_recs + sell_recs:
+        total_heat_pct = 0.0
+        accepted_buys = []
+        for rec in buy_recs:
             t = rec["ticker"]
             if t not in atr_cache:
                 atr_cache[t] = _compute_atr(t)
             atr = atr_cache[t]
-            rec["action"] = "BUY" if rec["composite_score"] > 0 else "SELL"
+            rec["action"] = "BUY"
+            rec["risk_levels"] = _compute_risk_levels(rec, atr, vix_price)
+            rec["position_sizing"] = _compute_position_sizing(
+                rec, atr, vix_price, portfolio_val
+            )
+            # Calculate this position's heat (risk = position_pct × stop_loss_pct)
+            pos_pct = rec["position_sizing"].get("position_pct", MIN_POSITION_PCT)
+            sl_pct = rec["risk_levels"].get("stop_loss_pct", 3.0)
+            position_heat = pos_pct * sl_pct / 100.0
+            # Enforce portfolio risk budget
+            if (len(accepted_buys) < MAX_CONCURRENT_POSITIONS
+                    and total_heat_pct + position_heat <= MAX_PORTFOLIO_HEAT_PCT):
+                total_heat_pct += position_heat
+                accepted_buys.append(rec)
+            else:
+                logger.info(
+                    "Portfolio risk budget: skipping %s (heat would be %.1f%%, max %.1f%%, positions %d/%d)",
+                    t, total_heat_pct + position_heat, MAX_PORTFOLIO_HEAT_PCT,
+                    len(accepted_buys), MAX_CONCURRENT_POSITIONS,
+                )
+                # Move to watchlist instead
+                watch_tickers.append(rec)
+        buy_recs = accepted_buys
+        logger.info("Portfolio heat: %.1f%% across %d positions (max %.1f%%)",
+                     total_heat_pct, len(buy_recs), MAX_PORTFOLIO_HEAT_PCT)
+
+        for rec in sell_recs:
+            t = rec["ticker"]
+            if t not in atr_cache:
+                atr_cache[t] = _compute_atr(t)
+            atr = atr_cache[t]
+            rec["action"] = "SELL"
             rec["risk_levels"] = _compute_risk_levels(rec, atr, vix_price)
             rec["position_sizing"] = _compute_position_sizing(
                 rec, atr, vix_price, portfolio_val
@@ -1387,10 +1498,20 @@ def generate_daily_advisory() -> Optional[AnalysisReport]:
 
         # 8. Assemble advisory JSON
         advisory_data = {
-            "version": 3,
+            "version": 4,
             "generated_at": datetime.utcnow().isoformat(),
             "market_stance": stance,
             "market_context": context,
+            "disclaimer": (
+                "This tool provides informational analysis only and does NOT constitute "
+                "investment advice under MiFID II (Directive 2014/65/EU). OpenClaw is not "
+                "a licensed investment firm. All recommendations are generated by automated "
+                "algorithms and should not be relied upon as a sole basis for investment "
+                "decisions. Past performance is not indicative of future results. You may "
+                "lose some or all of your invested capital. Always consult a licensed "
+                "financial advisor before making investment decisions. By using this tool, "
+                "you acknowledge that you are making investment decisions at your own risk."
+            ),
             "weights_used": weights,
             "buy_recommendations": [
                 {
@@ -1462,15 +1583,67 @@ def generate_daily_advisory() -> Optional[AnalysisReport]:
         if portfolio_ctx:
             advisory_data["portfolio_context"] = portfolio_ctx
 
-        # 9. Save as AnalysisReport
+        # 9. Save as AnalysisReport (with size guard — max 500KB)
+        report_json_str = json.dumps(advisory_data, default=str)
+        if len(report_json_str) > 500_000:
+            logger.warning(
+                "Advisory JSON too large (%d bytes) — truncating heavy fields",
+                len(report_json_str),
+            )
+            # Remove ALL heavy fields aggressively
+            for key in ("raw_briefs", "all_briefs", "evidence_briefs",
+                        "full_context", "portfolio_context", "deep_analysis_narrative"):
+                advisory_data.pop(key, None)
+            if "market_context" in advisory_data:
+                advisory_data["market_context"].pop("deep_analysis_narrative", None)
+                advisory_data["market_context"].pop("swarm_divergence", None)
+            for rec in advisory_data.get("buy_recommendations", []):
+                rec.pop("supporting_briefs", None)
+                rec.pop("raw_evidence", None)
+                rec.pop("all_signals", None)
+            for rec in advisory_data.get("sell_recommendations", []):
+                rec.pop("supporting_briefs", None)
+                rec.pop("raw_evidence", None)
+                rec.pop("all_signals", None)
+            for w in advisory_data.get("hold_watchlist", []):
+                w.pop("supporting_briefs", None)
+            report_json_str = json.dumps(advisory_data, default=str)
+            logger.info("Advisory JSON after truncation: %d bytes", len(report_json_str))
+            # If STILL too large, hard truncate
+            if len(report_json_str) > 500_000:
+                logger.error("Advisory still too large after truncation (%d bytes) — skipping save", len(report_json_str))
+                return None
+
         report = AnalysisReport(
             report_type="daily_advisory",
             period_start=date.today(),
             period_end=date.today(),
-            report_json=json.dumps(advisory_data),
+            report_json=report_json_str,
         )
         session.add(report)
         session.commit()
+
+        # 10. Log calibration data for every recommendation
+        for rec in buy_recs:
+            score = rec.get("composite_score", 0)
+            _log_calibration(
+                source="advisory",
+                ticker=rec["ticker"],
+                composite_score=score,
+                win_prob=max(0.35, min(0.80, 0.5 + abs(score) * 0.4)),
+                verdict="BUY",
+                metadata_extra={"signal_level": rec.get("signal_level"), "stance": stance},
+            )
+        for rec in sell_recs:
+            score = rec.get("composite_score", 0)
+            _log_calibration(
+                source="advisory",
+                ticker=rec["ticker"],
+                composite_score=abs(score),
+                win_prob=max(0.35, min(0.80, 0.5 + abs(score) * 0.4)),
+                verdict="SELL",
+                metadata_extra={"signal_level": rec.get("signal_level"), "stance": stance},
+            )
 
         logger.info(
             "Daily advisory generated: %d BUY, %d SELL, stance=%s (report %d)",
@@ -1486,6 +1659,19 @@ def generate_daily_advisory() -> Optional[AnalysisReport]:
         session.close()
 
 
+def _get_configured_portfolio_size(session) -> float:
+    """Read user-configured portfolio size from DB, or return DEFAULT_PORTFOLIO_EUR."""
+    try:
+        s = session.query(EngineSettings).get("portfolio_size_eur")
+        if s and s.value:
+            val = float(json.loads(s.value))
+            if val > 0:
+                return val
+    except Exception:
+        pass
+    return DEFAULT_PORTFOLIO_EUR
+
+
 def _get_portfolio_value(session) -> float:
     """Get total portfolio value from configured holdings using LIVE prices, or default."""
     try:
@@ -1493,7 +1679,7 @@ def _get_portfolio_value(session) -> float:
         if s and s.value:
             holdings = json.loads(s.value)
             if not holdings:
-                return DEFAULT_PORTFOLIO_EUR
+                return _get_configured_portfolio_size(session)
             from .price_fetcher import get_price_fetcher
             pf = get_price_fetcher()
             total = 0.0
@@ -1512,7 +1698,7 @@ def _get_portfolio_value(session) -> float:
                 return total
     except Exception:
         pass
-    return DEFAULT_PORTFOLIO_EUR
+    return _get_configured_portfolio_size(session)
 
 
 def _build_portfolio_context(
@@ -1546,8 +1732,23 @@ def _build_portfolio_context(
 
     buy_tickers = {r["ticker"] for r in advisory.get("buy_recommendations", [])}
     sell_tickers = {r["ticker"] for r in advisory.get("sell_recommendations", [])}
-    buy_map = {r["ticker"]: r for r in advisory.get("buy_recommendations", [])}
-    sell_map = {r["ticker"]: r for r in advisory.get("sell_recommendations", [])}
+    # Only extract fields needed for portfolio context — NOT the full recommendation dicts
+    buy_map = {
+        r["ticker"]: {
+            "composite_score": r.get("composite_score"),
+            "reasoning": (r.get("reasoning", {}) or {}).get("thesis", "") if isinstance(r.get("reasoning"), dict) else str(r.get("reasoning", "")),
+            "signal_level": r.get("signal_level"),
+        }
+        for r in advisory.get("buy_recommendations", [])
+    }
+    sell_map = {
+        r["ticker"]: {
+            "composite_score": r.get("composite_score"),
+            "reasoning": (r.get("reasoning", {}) or {}).get("thesis", "") if isinstance(r.get("reasoning"), dict) else str(r.get("reasoning", "")),
+            "signal_level": r.get("signal_level"),
+        }
+        for r in advisory.get("sell_recommendations", [])
+    }
 
     # Collect active narrative slugs for risk matching
     active_narratives = set()
@@ -1595,7 +1796,7 @@ def _build_portfolio_context(
                     "value_eur": val,
                     "portfolio_pct": pct,
                     "action": "REDUCE",
-                    "label": f"Afbouwen — switch naar {alt_str}",
+                    "label": f"Reduce — switch to {alt_str}",
                     "reasoning": intel["alt_reason"],
                     "alternatives": alts,
                 })
@@ -1609,7 +1810,7 @@ def _build_portfolio_context(
                 "value_eur": val,
                 "portfolio_pct": pct,
                 "action": "HOLD_ADD",
-                "label": "Aanhouden + bijkopen",
+                "label": "Hold + Add",
                 "score": rec.get("composite_score"),
                 "reasoning": rec.get("reasoning", ""),
             })
@@ -1621,7 +1822,7 @@ def _build_portfolio_context(
                 "value_eur": val,
                 "portfolio_pct": pct,
                 "action": "REDUCE",
-                "label": "Afbouwen",
+                "label": "Reduce",
                 "score": rec.get("composite_score"),
                 "reasoning": rec.get("reasoning", ""),
             })
@@ -1639,9 +1840,9 @@ def _build_portfolio_context(
                     "value_eur": val,
                     "portfolio_pct": pct,
                     "action": "HOLD" if direction == "bullish" else "WATCH",
-                    "label": f"Aanhouden — {_sector_match['sector']} {direction}"
+                    "label": f"Hold — {_sector_match['sector']} {direction}"
                         if direction == "bullish"
-                        else f"Monitoren — {_sector_match['sector']} {direction}",
+                        else f"Watch — {_sector_match['sector']} {direction}",
                     "reasoning": _sector_match.get("reasoning", ""),
                 })
             else:
@@ -1655,8 +1856,8 @@ def _build_portfolio_context(
                         "value_eur": val,
                         "portfolio_pct": pct,
                         "action": "HOLD",
-                        "label": f"Aanhouden — {detected_sector}",
-                        "reasoning": "Geen actief signaal voor deze sector in huidig advies.",
+                        "label": f"Hold — {detected_sector}",
+                        "reasoning": "No active signal for this sector in current advisory.",
                     })
                 else:
                     actions.append({
@@ -1665,8 +1866,8 @@ def _build_portfolio_context(
                         "value_eur": val,
                         "portfolio_pct": pct,
                         "action": "NEUTRAL",
-                        "label": "Geen signaal",
-                        "reasoning": "Niet in huidige advisory",
+                        "label": "No Signal",
+                        "reasoning": "Not in current advisory",
                     })
 
     # Missed: BUY recommendations not in portfolio
@@ -1692,15 +1893,15 @@ def _detect_holding_sector(ticker: str, name: str) -> Optional[str]:
     SECTOR_MAP = [
         ("Energy / Oil & Gas", ["oil", "gas", "energy", "petroleum", "crude",
                                  "is0d", "xle", "exxon", "xom"]),
-        ("Mining & Grondstoffen", ["mining", "miner", "mineral", "copper",
-                                    "wmin", "vaneck", "glen", "bhp", "rio",
-                                    "teck", "fcx", "scco"]),
-        ("Goud & Edelmetalen", ["gold", "silver", "precious", "producer",
-                                 "is0e", "gdx"]),
+        ("Mining & Materials", ["mining", "miner", "mineral", "copper",
+                                "wmin", "vaneck", "glen", "bhp", "rio",
+                                "teck", "fcx", "scco"]),
+        ("Gold & Precious Metals", ["gold", "silver", "precious", "producer",
+                                     "is0e", "gdx"]),
         ("Dividend", ["dividend", "select dividend", "stoxx", "ispa", "vhyl",
                        "yield", "income"]),
-        ("Defensie", ["defense", "defence", "aerospace", "military"]),
-        ("Technologie", ["tech", "software", "semiconductor"]),
+        ("Defense & Aerospace", ["defense", "defence", "aerospace", "military"]),
+        ("Technology", ["tech", "software", "semiconductor"]),
     ]
     for sector_label, keywords in SECTOR_MAP:
         if any(kw in lower for kw in keywords):
@@ -2053,6 +2254,11 @@ def rebalance_weights() -> Dict[str, float]:
         if all(FLOOR <= v <= CEIL for v in new_weights.values()):
             break
 
+    # Final normalization: adjust largest weight to force exact sum of 1.0
+    max_key = max(new_weights, key=new_weights.get)
+    remainder = round(1.0 - sum(v for k, v in new_weights.items() if k != max_key), 4)
+    new_weights[max_key] = remainder
+
     _save_weights(new_weights)
 
     logger.info("Weights rebalanced: %s → %s", current, new_weights)
@@ -2131,15 +2337,75 @@ def calculate_brier_scores() -> Dict[str, float]:
         for h_key, scores in scores_by_horizon.items():
             if scores:
                 result[h_key] = round(sum(scores) / len(scores), 4)
+                result[f"{h_key}_n"] = len(scores)
 
         for comp, scores in component_brier.items():
             if scores:
                 result[f"component_{comp}"] = round(sum(scores) / len(scores), 4)
 
+        # --- Brier Decomposition (reliability, resolution, uncertainty) ---
+        # Collects all pred_prob + actual pairs for decomposition
+        all_preds: List[float] = []
+        all_actuals: List[float] = []
+        for report in advisories:
+            try:
+                data = json.loads(report.report_json)
+            except Exception:
+                continue
+            outcomes = data.get("outcomes", {})
+            all_recs = data.get("buy_recommendations", []) + data.get("sell_recommendations", [])
+            for rec in all_recs:
+                ticker = rec.get("ticker")
+                if not ticker or ticker not in outcomes:
+                    continue
+                score = min(1.0, max(0.0, abs(rec.get("composite_score", 0.0))))
+                pred_prob = max(0.35, min(0.80, 0.5 + score * 0.4))
+                for h_key, outcome in outcomes[ticker].items():
+                    actual = 1.0 if outcome.get("correct") else 0.0
+                    all_preds.append(pred_prob)
+                    all_actuals.append(actual)
+
+        if len(all_preds) >= 10:
+            # Bin predictions into 10 bins for reliability diagram
+            n_bins = 10
+            bin_edges = [i / n_bins for i in range(n_bins + 1)]
+            base_rate = sum(all_actuals) / len(all_actuals) if all_actuals else 0.5
+            reliability = 0.0
+            resolution = 0.0
+            for b in range(n_bins):
+                lo, hi = bin_edges[b], bin_edges[b + 1]
+                in_bin = [(p, a) for p, a in zip(all_preds, all_actuals) if lo <= p < hi]
+                if not in_bin:
+                    continue
+                n_k = len(in_bin)
+                f_k = sum(p for p, _ in in_bin) / n_k  # mean predicted prob in bin
+                o_k = sum(a for _, a in in_bin) / n_k  # observed frequency in bin
+                reliability += n_k * (f_k - o_k) ** 2
+                resolution += n_k * (o_k - base_rate) ** 2
+            n_total = len(all_preds)
+            uncertainty = base_rate * (1 - base_rate)
+            result["decomposition_reliability"] = round(reliability / n_total, 4)
+            result["decomposition_resolution"] = round(resolution / n_total, 4)
+            result["decomposition_uncertainty"] = round(uncertainty, 4)
+            result["decomposition_n"] = n_total
+            # Reliability diagram data (for frontend)
+            reliability_diagram = []
+            for b in range(n_bins):
+                lo, hi = bin_edges[b], bin_edges[b + 1]
+                in_bin = [(p, a) for p, a in zip(all_preds, all_actuals) if lo <= p < hi]
+                if in_bin:
+                    reliability_diagram.append({
+                        "bin_center": round((lo + hi) / 2, 2),
+                        "predicted": round(sum(p for p, _ in in_bin) / len(in_bin), 3),
+                        "observed": round(sum(a for _, a in in_bin) / len(in_bin), 3),
+                        "count": len(in_bin),
+                    })
+            result["reliability_diagram"] = reliability_diagram
+
         # Save to DB
         _save_setting_standalone("advisory_brier_scores", json.dumps(result))
 
-        logger.info("Brier scores calculated: %s", result)
+        logger.info("Brier scores calculated: %s", {k: v for k, v in result.items() if not k.startswith("reliability_diagram")})
         return result
 
     except Exception:
@@ -2147,6 +2413,40 @@ def calculate_brier_scores() -> Dict[str, float]:
         return {}
     finally:
         session.close()
+
+
+def _log_calibration(
+    source: str,
+    ticker: str = None,
+    raw_llm_prob: float = None,
+    composite_score: float = None,
+    win_prob: float = None,
+    verdict: str = None,
+    run_up_id: int = None,
+    metadata_extra: Dict = None,
+) -> None:
+    """Log prediction data for future calibration analysis."""
+    session = None
+    try:
+        from .db import CalibrationLog
+        session = get_session()
+        entry = CalibrationLog(
+            source=source,
+            ticker=ticker,
+            raw_llm_probability=raw_llm_prob,
+            composite_score=composite_score,
+            win_probability=win_prob,
+            verdict=verdict,
+            run_up_id=run_up_id,
+            metadata_json=json.dumps(metadata_extra) if metadata_extra else None,
+        )
+        session.add(entry)
+        session.commit()
+    except Exception as e:
+        logger.warning("CalibrationLog write failed: %s", e)
+    finally:
+        if session:
+            session.close()
 
 
 def _save_setting_standalone(key: str, value: str) -> None:
@@ -2162,3 +2462,640 @@ def _save_setting_standalone(key: str, value: str) -> None:
         session.rollback()
     finally:
         session.close()
+
+
+# ===========================================================================
+# Flash Alert Evaluation & Self-Learning
+# ===========================================================================
+
+# Flash evaluation horizons (shorter than advisory — flash = immediate impact)
+FLASH_EVAL_HORIZONS = {
+    "6h": timedelta(hours=6),
+    "1d": timedelta(days=1),
+    "4d": timedelta(days=4),
+    "7d": timedelta(days=7),
+}
+
+# Minimum return threshold per horizon to count as "correct"
+FLASH_MIN_THRESHOLD_PCT = {
+    "6h": 0.5,
+    "1d": 1.0,
+    "4d": 2.0,
+    "7d": 3.0,
+}
+
+# Flash component default weights
+FLASH_DEFAULT_WEIGHTS: Dict[str, float] = {
+    "urgency": 0.30,
+    "intensity": 0.25,
+    "event_type": 0.15,
+    "credibility": 0.15,
+    "actors": 0.15,
+}
+
+
+def _load_flash_weights() -> Dict[str, float]:
+    """Load flash component weights from DB, or return defaults."""
+    session = get_session()
+    try:
+        s = session.query(EngineSettings).get("flash_weights")
+        if s and s.value:
+            loaded = json.loads(s.value)
+            # Validate
+            if all(k in loaded for k in FLASH_DEFAULT_WEIGHTS):
+                total = sum(loaded.values())
+                if 0.95 < total < 1.05 and all(v > 0 for v in loaded.values()):
+                    return loaded
+    except Exception:
+        pass
+    finally:
+        session.close()
+    return dict(FLASH_DEFAULT_WEIGHTS)
+
+
+def _save_flash_weights(weights: Dict[str, float]) -> None:
+    """Persist flash component weights to DB."""
+    _save_setting_standalone("flash_weights", json.dumps(weights))
+
+
+def _load_flash_emas() -> Dict[str, Dict[str, float]]:
+    """Load flash component EMAs from DB."""
+    session = get_session()
+    try:
+        s = session.query(EngineSettings).get("flash_component_emas")
+        if s and s.value:
+            return json.loads(s.value)
+    except Exception:
+        pass
+    finally:
+        session.close()
+    # Default: all 0.5 (neutral)
+    return {comp: {h: 0.5 for h in FLASH_EVAL_HORIZONS}
+            for comp in FLASH_DEFAULT_WEIGHTS}
+
+
+def _save_flash_emas(emas: Dict[str, Dict[str, float]]) -> None:
+    """Persist flash component EMAs to DB."""
+    _save_setting_standalone("flash_component_emas", json.dumps(emas))
+
+
+def evaluate_flash_alerts() -> Dict[str, Any]:
+    """Evaluate flash alert recommendations at [6h, 1d, 4d, 7d] horizons.
+
+    For each flash alert with recommendations, checks if enough time has
+    elapsed and compares price_at_alert with current price.  Updates
+    ``eval_*_json`` columns and component EMAs.
+
+    Returns summary dict with counts and accuracy.
+    """
+    session = get_session()
+    try:
+        # Get all alerts with recommendations that still have unevaluated horizons
+        alerts = (
+            session.query(FlashAlert)
+            .filter(
+                FlashAlert.recommendations_json.isnot(None),
+                FlashAlert.detected_at >= datetime.utcnow() - timedelta(days=10),
+            )
+            .order_by(FlashAlert.detected_at.asc())
+            .all()
+        )
+
+        if not alerts:
+            return {"total_checks": 0, "new_evals": 0}
+
+        emas = _load_flash_emas()
+        total_checks = 0
+        new_evals = 0
+        _newly_evaluated: Dict[tuple, bool] = {}  # (alert_id, h_key) → overall_correct
+        brier_by_horizon: Dict[str, List[float]] = {h: [] for h in FLASH_EVAL_HORIZONS}
+
+        for alert in alerts:
+            try:
+                recs = json.loads(alert.recommendations_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not recs:
+                continue
+
+            now = datetime.utcnow()
+
+            for h_key, h_delta in FLASH_EVAL_HORIZONS.items():
+                # Check if already evaluated
+                eval_col = f"eval_{h_key}_json"
+                existing = getattr(alert, eval_col, None)
+                if existing:
+                    # Already evaluated — collect for Brier
+                    try:
+                        ev = json.loads(existing)
+                        pred_prob = recs[0].get("pred_prob", 0.5) if recs else 0.5
+                        actual = 1.0 if ev.get("overall_correct") else 0.0
+                        brier_by_horizon[h_key].append((pred_prob - actual) ** 2)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    continue
+
+                # Check if enough time has elapsed
+                target_dt = alert.detected_at + h_delta
+                if now < target_dt:
+                    continue
+
+                # Evaluate: compare price_at_alert with current price
+                threshold = FLASH_MIN_THRESHOLD_PCT[h_key]
+                horizon_results = []
+
+                for rec in recs:
+                    ticker = rec.get("ticker")
+                    price_at_alert = rec.get("price_at_alert")
+                    if not ticker or price_at_alert is None:
+                        continue
+
+                    # Get current/target price
+                    current_price = _get_price_at_or_near(session, ticker, target_dt)
+                    if current_price is None:
+                        continue
+
+                    pct_change = ((current_price - price_at_alert) / price_at_alert) * 100
+                    action = rec.get("action", "WATCH")
+
+                    if action in ("BUY", "STRONG_BUY"):
+                        correct = pct_change >= threshold
+                    elif action in ("SELL", "STRONG_SELL"):
+                        correct = pct_change <= -threshold
+                    else:
+                        correct = abs(pct_change) >= threshold
+
+                    horizon_results.append({
+                        "ticker": ticker,
+                        "price": round(current_price, 2),
+                        "pct_change": round(pct_change, 2),
+                        "correct": correct,
+                    })
+
+                if not horizon_results:
+                    continue
+
+                # Aggregate: correct if majority correct
+                n_correct = sum(1 for r in horizon_results if r["correct"])
+                overall_correct = n_correct > len(horizon_results) / 2
+
+                eval_data = {
+                    "results": horizon_results,
+                    "overall_correct": overall_correct,
+                    "evaluated_at": now.isoformat(),
+                }
+                setattr(alert, eval_col, json.dumps(eval_data))
+                new_evals += 1
+                total_checks += 1
+                _newly_evaluated[(alert.id, h_key)] = overall_correct
+
+                # Update component EMAs
+                outcome_val = 1.0 if overall_correct else 0.0
+                primary_rec = recs[0] if recs else {}
+                components = primary_rec.get("components", {})
+
+                for comp_name in FLASH_DEFAULT_WEIGHTS:
+                    comp_score = components.get(comp_name, 0.5)
+                    weight = max(comp_score, 0.1)
+                    effective_alpha = EMA_ALPHA * weight
+                    old = emas.get(comp_name, {}).get(h_key, 0.5)
+                    new_val = old * (1 - effective_alpha) + outcome_val * effective_alpha
+                    emas.setdefault(comp_name, {})[h_key] = round(new_val, 4)
+
+                # Brier score
+                pred_prob = primary_rec.get("pred_prob", 0.5)
+                actual = 1.0 if overall_correct else 0.0
+                brier_by_horizon[h_key].append((pred_prob - actual) ** 2)
+
+        # Commit evaluation results
+        session.commit()
+
+        # Save updated EMAs
+        _save_flash_emas(emas)
+
+        # Calculate and save Brier scores
+        flash_brier: Dict[str, Optional[float]] = {}
+        for h_key, scores in brier_by_horizon.items():
+            if scores:
+                flash_brier[h_key] = round(sum(scores) / len(scores), 4)
+            else:
+                flash_brier[h_key] = None
+        _save_setting_standalone("flash_accuracy", json.dumps(flash_brier))
+
+        # Update cumulative stats
+        try:
+            prev_checks = int(_load_setting("flash_total_checks") or "0")
+            prev_hits = int(_load_setting("flash_total_hits") or "0")
+        except (ValueError, TypeError):
+            prev_checks, prev_hits = 0, 0
+
+        # Count new hits — ONLY from newly evaluated horizons (not all historical)
+        new_hits = sum(
+            1 for (aid, hk), is_correct in _newly_evaluated.items() if is_correct
+        )
+
+        _save_setting_standalone("flash_total_checks", str(prev_checks + new_evals))
+        _save_setting_standalone("flash_total_hits", str(prev_hits + new_hits))
+
+        summary = {
+            "total_checks": total_checks,
+            "new_evals": new_evals,
+            "brier": flash_brier,
+            "emas": emas,
+        }
+        logger.info("Flash evaluation: %d new evals, brier=%s", new_evals, flash_brier)
+        return summary
+
+    except Exception:
+        logger.exception("evaluate_flash_alerts failed")
+        session.rollback()
+        return {"total_checks": 0, "new_evals": 0, "error": True}
+    finally:
+        session.close()
+
+
+def _get_price_at_or_near(session, ticker: str, target_dt: datetime) -> Optional[float]:
+    """Get price for *ticker* at or near *target_dt* from PriceSnapshot."""
+    # Try exact or nearest snapshot within 24h
+    window_start = target_dt - timedelta(hours=24)
+    window_end = target_dt + timedelta(hours=24)
+
+    from sqlalchemy import func as sa_func
+    snap = (
+        session.query(PriceSnapshot)
+        .filter(
+            PriceSnapshot.ticker == ticker,
+            PriceSnapshot.recorded_at >= window_start,
+            PriceSnapshot.recorded_at <= window_end,
+        )
+        .order_by(
+            # Closest to target_dt (SQLite julianday for absolute distance)
+            sa_func.abs(
+                sa_func.julianday(PriceSnapshot.recorded_at)
+                - sa_func.julianday(target_dt)
+            )
+        )
+        .first()
+    )
+    if snap:
+        return snap.price
+
+    # Fallback: latest available price
+    latest = (
+        session.query(PriceSnapshot)
+        .filter(PriceSnapshot.ticker == ticker)
+        .order_by(PriceSnapshot.recorded_at.desc())
+        .first()
+    )
+    return latest.price if latest else None
+
+
+def _load_setting(key: str) -> Optional[str]:
+    """Load a single EngineSettings value."""
+    session = get_session()
+    try:
+        s = session.query(EngineSettings).get(key)
+        return s.value if s else None
+    except Exception:
+        return None
+    finally:
+        session.close()
+
+
+def rebalance_flash_weights() -> Dict[str, float]:
+    """Auto-adjust flash component weights based on evaluation accuracy.
+
+    Uses the same EMA + log-weighted horizon approach as
+    ``rebalance_weights()`` but with flash-specific horizons and a
+    minimum-15-alert threshold.
+
+    Runs weekly (Sunday 07:40 UTC).
+    """
+    logger.info("=== rebalance_flash_weights START ===")
+
+    # Check minimum sample size
+    try:
+        total_checks = int(_load_setting("flash_total_checks") or "0")
+    except (ValueError, TypeError):
+        total_checks = 0
+
+    if total_checks < 15:
+        logger.info("Flash rebalance skipped: only %d evaluations (need ≥15)", total_checks)
+        return _load_flash_weights()
+
+    emas = _load_flash_emas()
+    old_weights = _load_flash_weights()
+
+    # Compute weighted average accuracy per component
+    avg_accuracy: Dict[str, float] = {}
+    for comp in FLASH_DEFAULT_WEIGHTS:
+        horizons = emas.get(comp, {})
+        if not horizons:
+            avg_accuracy[comp] = 0.5
+            continue
+
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        for h_str, acc in horizons.items():
+            # Convert horizon to numeric for weighting
+            if h_str == "6h":
+                h_num = 0.25  # 6 hours ≈ 0.25 days
+            else:
+                h_num = int(h_str.rstrip("d"))
+            hw = math.log2(h_num + 1)
+            weighted_sum += acc * hw
+            weight_sum += hw
+
+        avg_accuracy[comp] = weighted_sum / weight_sum if weight_sum > 0 else 0.5
+
+    # Normalize to sum=1.0
+    total_acc = sum(avg_accuracy.values())
+    if total_acc <= 0:
+        logger.warning("Flash rebalance: all accuracies zero — keeping current weights")
+        return old_weights
+
+    new_weights = {comp: round(acc / total_acc, 4) for comp, acc in avg_accuracy.items()}
+
+    # Clamp to [0.05, 0.50]
+    FLOOR, CEIL = 0.05, 0.50
+    for _ in range(5):
+        clamped = {k: max(FLOOR, min(CEIL, v)) for k, v in new_weights.items()}
+        total = sum(clamped.values())
+        new_weights = {k: round(v / total, 4) for k, v in clamped.items()}
+        if all(FLOOR <= v <= CEIL for v in new_weights.values()):
+            break
+
+    _save_flash_weights(new_weights)
+
+    # Audit log
+    try:
+        log_raw = _load_setting("flash_rebalance_log") or "[]"
+        log_entries = json.loads(log_raw)
+    except (json.JSONDecodeError, TypeError):
+        log_entries = []
+
+    log_entries.append({
+        "timestamp": datetime.utcnow().isoformat(),
+        "old_weights": old_weights,
+        "new_weights": new_weights,
+        "sample_size": total_checks,
+        "avg_accuracy": avg_accuracy,
+    })
+    # Keep last 52 entries (1 year of weekly rebalances)
+    log_entries = log_entries[-52:]
+    _save_setting_standalone("flash_rebalance_log", json.dumps(log_entries, default=str))
+
+    logger.info("Flash weights rebalanced: %s → %s (n=%d)", old_weights, new_weights, total_checks)
+    return new_weights
+
+
+# ===========================================================================
+# Advisory Refresh (lightweight update every 2-3 hours)
+# ===========================================================================
+
+def generate_refresh_advisory() -> Optional[AnalysisReport]:
+    """Generate a lightweight advisory refresh based on changes since morning.
+
+    Process:
+      1. Load today's morning advisory as baseline
+      2. Detect changes: new TradingSignals, SwarmVerdicts, FlashAlerts
+      3. Generate delta summary via Groq (1 call, free)
+      4. Save as AnalysisReport(report_type="advisory_refresh")
+      5. Send Telegram if significant changes detected
+
+    Returns the new AnalysisReport or None if no significant changes.
+    """
+    logger.info("=== generate_refresh_advisory START ===")
+
+    session = get_session()
+    try:
+        # 1. Load today's morning advisory
+        today = date.today()
+        baseline = (
+            session.query(AnalysisReport)
+            .filter(
+                AnalysisReport.report_type == "daily_advisory",
+                AnalysisReport.period_end >= today,
+            )
+            .order_by(AnalysisReport.created_at.desc())
+            .first()
+        )
+
+        if not baseline:
+            logger.warning("No morning advisory found — cannot refresh")
+            return None
+
+        try:
+            baseline_data = json.loads(baseline.report_json)
+        except (json.JSONDecodeError, TypeError):
+            logger.error("Baseline advisory has invalid JSON")
+            return None
+
+        baseline_time = baseline.created_at
+
+        # 2. Detect changes since baseline
+        changes: Dict[str, Any] = {
+            "new_signals": [],
+            "new_verdicts": [],
+            "flash_alerts": [],
+            "signal_changes": [],
+        }
+
+        # New trading signals since baseline
+        new_signals = (
+            session.query(TradingSignal)
+            .filter(
+                TradingSignal.created_at > baseline_time,
+                TradingSignal.superseded_by_id.is_(None),
+            )
+            .order_by(TradingSignal.confidence.desc())
+            .limit(10)
+            .all()
+        )
+        for sig in new_signals:
+            changes["new_signals"].append({
+                "ticker": sig.ticker,
+                "signal_level": sig.signal_level,
+                "confidence": round(sig.confidence, 2) if sig.confidence else 0,
+            })
+
+        # New swarm verdicts since baseline
+        new_verdicts = (
+            session.query(SwarmVerdict)
+            .filter(
+                SwarmVerdict.created_at > baseline_time,
+                SwarmVerdict.superseded_at.is_(None),
+            )
+            .order_by(SwarmVerdict.confidence.desc())
+            .limit(10)
+            .all()
+        )
+        for v in new_verdicts:
+            changes["new_verdicts"].append({
+                "ticker": v.primary_ticker,
+                "verdict": v.verdict,
+                "confidence": round(v.confidence, 2) if v.confidence else 0,
+            })
+
+        # Flash alerts since baseline
+        flash_alerts = (
+            session.query(FlashAlert)
+            .filter(
+                FlashAlert.detected_at > baseline_time,
+                FlashAlert.status == "active",
+            )
+            .order_by(FlashAlert.flash_score.desc())
+            .limit(5)
+            .all()
+        )
+        for fa in flash_alerts:
+            changes["flash_alerts"].append({
+                "headline": fa.headline,
+                "region": fa.region,
+                "flash_score": fa.flash_score,
+                "risk_level": fa.risk_level,
+            })
+
+        # Check if changes are significant
+        has_strong_signals = any(
+            s["signal_level"] in ("STRONG_BUY", "STRONG_SELL")
+            for s in changes["new_signals"]
+        )
+        has_flash = bool(changes["flash_alerts"])
+        has_significant_verdicts = any(
+            v["verdict"] in ("STRONG_BUY", "STRONG_SELL") and v["confidence"] > 0.7
+            for v in changes["new_verdicts"]
+        )
+
+        significant = has_strong_signals or has_flash or has_significant_verdicts
+
+        if not significant and not changes["new_signals"] and not changes["new_verdicts"]:
+            logger.info("Advisory refresh: no significant changes detected")
+            return None
+
+        # 3. Generate delta narrative via Groq
+        delta_narrative = _generate_refresh_narrative(baseline_data, changes)
+
+        # 4. Build refresh report
+        refresh_data = {
+            "version": 3,
+            "advisory_type": "advisory_refresh",
+            "generated_at": datetime.utcnow().isoformat(),
+            "baseline_advisory_id": baseline.id,
+            "baseline_generated_at": baseline.created_at.isoformat(),
+            "market_stance": baseline_data.get("market_stance", "neutral"),
+            "market_context": baseline_data.get("market_context", {}),
+            "changes_since_baseline": changes,
+            "delta_narrative": delta_narrative,
+            "buy_recommendations": baseline_data.get("buy_recommendations", []),
+            "sell_recommendations": baseline_data.get("sell_recommendations", []),
+            "significant": significant,
+        }
+
+        # Update recommendations if flash alerts affect them
+        if has_flash:
+            refresh_data["flash_context"] = changes["flash_alerts"]
+
+        report = AnalysisReport(
+            report_type="advisory_refresh",
+            period_start=today,
+            period_end=today,
+            report_json=json.dumps(refresh_data, default=str),
+        )
+        session.add(report)
+        session.commit()
+
+        logger.info("Advisory refresh generated (significant=%s)", significant)
+
+        # 5. Send Telegram if significant
+        if significant:
+            try:
+                from .telegram_notifier import send_advisory_refresh_notification
+                send_advisory_refresh_notification(refresh_data)
+            except Exception:
+                logger.exception("Failed to send refresh notification")
+
+        return report
+
+    except Exception:
+        logger.exception("generate_refresh_advisory failed")
+        session.rollback()
+        return None
+    finally:
+        session.close()
+
+
+def _generate_refresh_narrative(
+    baseline: Dict[str, Any],
+    changes: Dict[str, Any],
+) -> str:
+    """Generate a delta narrative via Groq describing what changed.
+
+    Falls back to a simple template if Groq is unavailable.
+    """
+    # Build context
+    parts = []
+    if changes["flash_alerts"]:
+        alerts_txt = "; ".join(
+            f"{a['headline']} ({a['region']}, score={a['flash_score']:.0f})"
+            for a in changes["flash_alerts"][:3]
+        )
+        parts.append(f"Flash alerts: {alerts_txt}")
+
+    if changes["new_signals"]:
+        sigs_txt = "; ".join(
+            f"{s['ticker']}={s['signal_level']} (conf={s['confidence']:.0%})"
+            for s in changes["new_signals"][:5]
+        )
+        parts.append(f"New signals: {sigs_txt}")
+
+    if changes["new_verdicts"]:
+        verd_txt = "; ".join(
+            f"{v['ticker']}={v['verdict']} (conf={v['confidence']:.0%})"
+            for v in changes["new_verdicts"][:5]
+        )
+        parts.append(f"New swarm verdicts: {verd_txt}")
+
+    if not parts:
+        return "No significant changes since morning advisory."
+
+    context = "\n".join(parts)
+    morning_stance = baseline.get("market_stance", "neutral")
+
+    # Try Groq
+    try:
+        from .swarm_consensus import _get_groq_client, GROQ_DEFAULT_MODEL
+
+        client = _get_groq_client()
+        if client is None:
+            return f"Changes since morning: {context}"
+
+        resp = client.chat.completions.create(
+            model=GROQ_DEFAULT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Arabella, a geopolitical risk analyst writing for active traders. "
+                        "Write a 3-5 sentence update on what changed since the morning advisory. "
+                        "RULES: "
+                        "1) Name SPECIFIC stocks, ETFs, or commodities affected (use tickers). "
+                        "2) Include SPECIFIC events driving the change (e.g., 'Iran's IRGC deployed naval assets to Strait of Hormuz'). "
+                        "3) Give a SHORT-TERM outlook (next 24-48h), MID-TERM outlook (1-2 weeks), and one RISK to watch. "
+                        "4) Use concrete probabilities where available (e.g., '72% confidence'). "
+                        "5) NEVER use vague phrases like 'cautious approach' or 'monitor developments' without specifics. "
+                        "Morning stance was: " + morning_stance
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Changes since morning advisory:\n{context}",
+                },
+            ],
+            max_tokens=500,
+            temperature=0.4,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        logger.exception("Groq refresh narrative failed — using template")
+        return f"Changes since morning: {context}"

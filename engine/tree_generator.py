@@ -13,8 +13,10 @@ The output is stored as DecisionNode + Consequence records in the DB.
 import json
 import logging
 import re
+import threading
 import time as _time
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import List, Optional, Dict, Any
 
 from sqlalchemy import func
@@ -36,6 +38,35 @@ from .db import (
 )
 
 logger = logging.getLogger(__name__)
+
+_tree_gen_lock = threading.Lock()
+
+
+def _is_question_duplicate(question: str, run_up_id: int, session, threshold: float = 85.0) -> Optional[int]:
+    """Check if a similar question already exists among open nodes.
+
+    Uses rapidfuzz token_set_ratio for semantic near-duplicate detection.
+    Returns the existing node ID if duplicate found, None otherwise.
+    """
+    from rapidfuzz import fuzz
+    from .db import DecisionNode
+
+    existing_nodes = (
+        session.query(DecisionNode)
+        .filter(DecisionNode.status == "open", DecisionNode.depth == 0)
+        .all()
+    )
+    for node in existing_nodes:
+        score = fuzz.token_set_ratio(question.lower(), node.question.lower())
+        if score >= threshold:
+            logger.warning(
+                "Question dedup: new question for run_up %d is %.0f%% similar to existing node %d "
+                "(run_up %d): '%s' vs '%s'",
+                run_up_id, score, node.id, node.run_up_id,
+                question[:80], node.question[:80],
+            )
+            return node.id
+    return None
 
 
 def _sanitize_text_for_prompt(text: str, max_len: int = 200) -> str:
@@ -61,7 +92,72 @@ MODEL_PRICING = {
 }
 DEFAULT_PRICING = (1.00, 5.00)  # fallback
 
-DEFAULT_DAILY_BUDGET_EUR = 1.00
+DEFAULT_DAILY_BUDGET_EUR = 2.00
+HARD_CEILING_SPILLOVER_EUR = 1.00  # Max €1 above budget for in-progress runs
+
+
+# ---------------------------------------------------------------------------
+# Budget tier system
+# ---------------------------------------------------------------------------
+
+class BudgetTier(str, Enum):
+    """Budget tiers control model selection across all modules.
+
+    PREMIUM:   Best models everywhere (Sonnet for trees+advisory, paid swarm)
+    STANDARD:  Haiku for trees, Sonnet for advisory, paid swarm
+    ECONOMY:   Haiku everywhere, free swarm fallbacks
+    EMERGENCY: Only essential calls (advisory Haiku), all free models
+    BLOCKED:   NO paid API calls — hard ceiling reached
+    """
+    PREMIUM   = "premium"
+    STANDARD  = "standard"
+    ECONOMY   = "economy"
+    EMERGENCY = "emergency"
+    BLOCKED   = "blocked"
+
+
+def get_budget_tier() -> BudgetTier:
+    """Determine current budget tier based on today's spending.
+
+    This is THE central authority for budget decisions.
+    Every module must respect the returned tier.
+    """
+    budget = get_daily_budget_eur()
+    spent = get_today_spending_eur()
+    ceiling = budget + HARD_CEILING_SPILLOVER_EUR
+
+    if spent >= ceiling:
+        return BudgetTier.BLOCKED
+    if spent >= budget:
+        return BudgetTier.EMERGENCY
+
+    pct_used = (spent / budget * 100) if budget > 0 else 100
+
+    if pct_used >= 85:
+        return BudgetTier.ECONOMY
+    if pct_used >= 60:
+        return BudgetTier.STANDARD
+    return BudgetTier.PREMIUM
+
+
+def get_hard_ceiling_eur() -> float:
+    """Return the absolute hard ceiling = budget + spillover.
+
+    It is IMPOSSIBLE to spend more than this amount in a single day.
+    """
+    return get_daily_budget_eur() + HARD_CEILING_SPILLOVER_EUR
+
+
+def can_spend(estimated_cost_eur: float) -> bool:
+    """Pre-flight check: would this call exceed the hard ceiling?
+
+    Called before EVERY paid API call. Returns False if the call
+    would push spending above the hard ceiling.
+    """
+    ceiling = get_hard_ceiling_eur()
+    spent = get_today_spending_eur()
+    return (spent + estimated_cost_eur) <= ceiling
+
 
 # ---------------------------------------------------------------------------
 # Prompt template
@@ -245,12 +341,19 @@ def _briefs_to_summary(briefs: List[ArticleBrief]) -> str:
 # ---------------------------------------------------------------------------
 
 def get_daily_budget_eur() -> float:
-    """Get the daily token budget in EUR from settings (default €1.00)."""
+    """Get the daily token budget in EUR from settings (default €2.00)."""
     session = get_session()
     try:
         setting = session.query(EngineSettings).get("daily_budget_eur")
         if setting:
-            return float(setting.value)
+            val = float(setting.value)
+            # One-time migration: old default 1.00 → new default 2.00
+            if val == 1.00:
+                setting.value = str(DEFAULT_DAILY_BUDGET_EUR)
+                session.commit()
+                logger.info("Migrated daily budget from €1.00 to €%.2f", DEFAULT_DAILY_BUDGET_EUR)
+                return DEFAULT_DAILY_BUDGET_EUR
+            return val
         return DEFAULT_DAILY_BUDGET_EUR
     except Exception:
         return DEFAULT_DAILY_BUDGET_EUR
@@ -304,19 +407,32 @@ def _calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     return round(cost, 6)
 
 
-def _check_budget() -> bool:
-    """Check if we still have budget left for today. Returns True if OK."""
+def _check_budget(purpose: str = "tree_generation") -> bool:
+    """Check if we still have budget for paid API calls.
+
+    BLOCKED tier → no paid calls at all.
+    EMERGENCY tier → only advisory calls allowed.
+    """
+    tier = get_budget_tier()
     budget = get_daily_budget_eur()
     spent = get_today_spending_eur()
-    remaining = budget - spent
-    if remaining <= 0:
+
+    if tier == BudgetTier.BLOCKED:
         logger.warning(
-            "Daily token budget exhausted: €%.4f spent of €%.2f budget.",
-            spent, budget,
+            "HARD CEILING REACHED: €%.4f spent, ceiling €%.2f — all paid calls blocked.",
+            spent, get_hard_ceiling_eur(),
         )
         return False
-    logger.info("Budget check OK: €%.4f spent, €%.4f remaining of €%.2f.",
-                spent, remaining, budget)
+
+    if tier == BudgetTier.EMERGENCY and purpose != "daily_advisory":
+        logger.warning(
+            "EMERGENCY tier: €%.4f spent of €%.2f budget — only advisory allowed, blocking %s.",
+            spent, budget, purpose,
+        )
+        return False
+
+    logger.debug("Budget %s tier: €%.4f spent of €%.2f (purpose=%s).",
+                 tier.value, spent, budget, purpose)
     return True
 
 
@@ -367,33 +483,32 @@ SONNET_ARTICLE_THRESHOLD = 15  # Article count >= 15 → use Sonnet
 
 
 def _select_model_for_tree(prompt_context: Dict[str, Any]) -> str:
-    """Select Claude model based on narrative importance.
+    """Select Claude model based on budget tier and narrative importance.
 
-    High-signal narratives (score >= 60 OR article_count >= 15) get Sonnet
-    for deeper analysis. Regular narratives use Haiku (default).
-    Cost impact: Sonnet ~€0.03/call vs Haiku ~€0.008/call.
-    With ~5 trees/day, maybe 1-2 use Sonnet = ~€0.06 extra/day max.
+    PREMIUM tier: Sonnet for high-signal narratives (score >= 60 OR articles >= 15)
+    All other tiers: Haiku (default)
     """
-    score = prompt_context.get("score", 0) or 0
-    article_count = prompt_context.get("article_count", 0) or 0
+    tier = get_budget_tier()
 
-    if score >= SONNET_SCORE_THRESHOLD or article_count >= SONNET_ARTICLE_THRESHOLD:
-        # Check we have enough budget remaining for the more expensive model
-        budget = get_daily_budget_eur()
-        spent = get_today_spending_eur()
-        remaining = budget - spent
-        # Only use Sonnet if we have at least 40% budget remaining
-        if remaining > budget * 0.4:
-            logger.info(
-                "Upgrading to Sonnet for high-signal narrative (score=%d, articles=%d, budget remaining=€%.3f)",
-                score, article_count, remaining,
-            )
-            return SONNET_MODEL
-        else:
-            logger.info(
-                "Would upgrade to Sonnet (score=%d, articles=%d) but budget tight (€%.3f remaining)",
-                score, article_count, remaining,
-            )
+    if tier == BudgetTier.PREMIUM:
+        score = prompt_context.get("score", 0) or 0
+        article_count = prompt_context.get("article_count", 0) or 0
+
+        if score >= SONNET_SCORE_THRESHOLD or article_count >= SONNET_ARTICLE_THRESHOLD:
+            # Pre-flight: check if Sonnet cost fits within ceiling
+            est_cost = _calculate_cost(SONNET_MODEL, 2000, 4000)
+            if can_spend(est_cost):
+                logger.info(
+                    "PREMIUM tier: Sonnet for high-signal narrative (score=%d, articles=%d)",
+                    score, article_count,
+                )
+                return SONNET_MODEL
+            else:
+                logger.info(
+                    "PREMIUM tier: Sonnet preferred but would exceed ceiling (score=%d, articles=%d)",
+                    score, article_count,
+                )
+
     return config.tree_generator_model
 
 
@@ -411,7 +526,7 @@ def _call_claude(
         return None
 
     # Budget gate
-    if not _check_budget():
+    if not _check_budget(purpose="tree_generation"):
         return None
 
     try:
@@ -422,6 +537,12 @@ def _call_claude(
 
     user_prompt = USER_PROMPT_TEMPLATE.format(**prompt_context)
     model = _select_model_for_tree(prompt_context)
+
+    # Pre-flight: estimated cost vs hard ceiling
+    est_cost = _calculate_cost(model, 2000, 4000)
+    if not can_spend(est_cost):
+        logger.warning("Pre-flight: tree gen €%.4f would exceed ceiling. Blocked.", est_cost)
+        return None
 
     try:
         client = anthropic.Anthropic(api_key=config.anthropic_api_key)
@@ -617,13 +738,28 @@ def generate_tree(run_up_id: int, max_briefs: int = 30) -> Optional[Dict]:
 
         # Build prompt context
         from .bunq_stocks import get_bunq_stocks_prompt_snippet
+
+        # Include existing questions in prompt to prevent LLM from generating duplicates
+        existing_questions = [
+            n.question for n in session.query(DecisionNode)
+            .filter(DecisionNode.status == "open", DecisionNode.depth == 0)
+            .limit(20)
+            .all()
+        ]
+        existing_q_addition = ""
+        if existing_questions:
+            existing_q_text = "\n".join(f"- {q}" for q in existing_questions)
+            existing_q_addition = (
+                f"\n\nEXISTING QUESTIONS (do NOT generate similar questions):\n{existing_q_text}\n"
+            )
+
         prompt_context = {
             "narrative_name": run_up.narrative_name,
             "score": run_up.current_score,
             "article_count": run_up.article_count_total,
             "days_active": days_active,
             "region": region,
-            "article_summaries": summaries,
+            "article_summaries": summaries + existing_q_addition,
             "available_tickers": get_bunq_stocks_prompt_snippet(),
         }
 
@@ -632,18 +768,42 @@ def generate_tree(run_up_id: int, max_briefs: int = 30) -> Optional[Dict]:
         if tree_data is None:
             return None
 
-        # Store in DB
-        root = _store_tree(run_up_id, tree_data, session)
-        session.commit()
+        with _tree_gen_lock:
+            # Re-check for existing root node (prevents race condition)
+            existing = (
+                session.query(DecisionNode)
+                .filter(DecisionNode.run_up_id == run_up_id, DecisionNode.depth == 0)
+                .first()
+            )
+            if existing:
+                logger.warning("RunUp %d: tree already exists (node %d). Skipping.", run_up_id, existing.id)
+                return {"status": "exists", "root_node_id": existing.id}
 
-        return {
-            "status": "created",
-            "run_up_id": run_up_id,
-            "root_node_id": root.id,
-            "question": root.question,
-            "yes_probability": root.yes_probability,
-            "timeline": root.timeline_estimate,
-        }
+            # Fuzzy dedup check across all open nodes
+            question = tree_data.get("question", "") or tree_data.get("root", {}).get("question", "")
+            if question:
+                dup_node_id = _is_question_duplicate(question, run_up_id, session)
+                if dup_node_id is not None:
+                    logger.warning("RunUp %d: near-duplicate of node %d. Skipping tree generation.",
+                                 run_up_id, dup_node_id)
+                    return {"status": "duplicate", "similar_node_id": dup_node_id}
+
+            # Store in DB
+            root = _store_tree(run_up_id, tree_data, session)
+            if root is None:
+                logger.warning("_store_tree returned None for run-up %d — aborting.", run_up_id)
+                session.rollback()
+                return None
+            session.commit()
+
+            return {
+                "status": "created",
+                "run_up_id": run_up_id,
+                "root_node_id": root.id,
+                "question": root.question,
+                "yes_probability": root.yes_probability,
+                "timeline": root.timeline_estimate,
+            }
 
     except Exception:
         logger.exception("Failed to generate tree for run-up %d.", run_up_id)

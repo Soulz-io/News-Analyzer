@@ -225,7 +225,7 @@
       "display:none;position:absolute;inset:0;z-index:50;background:var(--bg,#12141a);";
 
     const iframe = document.createElement("iframe");
-    iframe.src = PLUGIN_URL;
+    iframe.src = PLUGIN_URL + "?embed=1#portfolio";
     iframe.style.cssText = "width:100%;height:100%;border:none;background:var(--bg,#12141a);";
     iframe.setAttribute("allow", "clipboard-write");
     iframe.setAttribute("title", "News Analyzer Dashboard");
@@ -297,6 +297,11 @@
     coord._wrapSetTab(app);
     coord._attachPopstate();
 
-    if (location.hash === TAB_HASH) setTimeout(() => coord.activate(PLUGIN_ID), 150);
+    // Auto-activate News Analyzer as default view (replaces V1 control UI content)
+    // Activate for the plugin hash OR when no hash / a non-plugin hash is set
+    const isPluginHash = Object.values(coord._plugins).some(p => p.hash === location.hash);
+    if (!location.hash || location.hash === "#" || location.hash === TAB_HASH || !isPluginHash) {
+      setTimeout(() => coord.activate(PLUGIN_ID), 150);
+    }
   });
 })();

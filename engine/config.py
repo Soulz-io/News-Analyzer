@@ -32,7 +32,16 @@ class EngineConfig:
     def __init__(self) -> None:
         # Server
         self.engine_port: int = int(os.getenv("ENGINE_PORT", "9120"))
-        self.host: str = os.getenv("ENGINE_HOST", "0.0.0.0")
+        self.host: str = os.getenv("ENGINE_HOST", "127.0.0.1")
+
+        # Security
+        self.api_bearer_token: str = os.getenv("API_BEARER_TOKEN", "")
+        _cors_raw = os.getenv("CORS_ALLOWED_ORIGINS", "")
+        self.cors_allowed_origins: list = (
+            [o.strip() for o in _cors_raw.split(",") if o.strip()]
+            if _cors_raw
+            else []
+        )
 
         # Data
         self.data_dir: Path = Path(os.getenv("DATA_DIR", str(_ENGINE_DIR / "data")))
@@ -104,8 +113,30 @@ class EngineConfig:
             "X_BEARER_TOKEN", os.getenv("TWITTER_BEARER_TOKEN", "")
         )
         self.twitter_fetch_interval_minutes: int = int(
-            os.getenv("TWITTER_FETCH_INTERVAL_MINUTES", "120")
+            os.getenv("TWITTER_FETCH_INTERVAL_MINUTES", "30")
         )
+
+        # Flash alerts
+        self.flash_alert_enabled: bool = os.getenv(
+            "FLASH_ALERT_ENABLED", "true"
+        ).lower() in ("true", "1", "yes")
+        self.flash_single_threshold: int = int(
+            os.getenv("FLASH_SINGLE_THRESHOLD", "65")
+        )
+        self.flash_cluster_threshold: int = int(
+            os.getenv("FLASH_CLUSTER_THRESHOLD", "45")
+        )
+        self.flash_cooldown_minutes: int = int(
+            os.getenv("FLASH_COOLDOWN_MINUTES", "120")
+        )
+        self.flash_max_per_6h: int = int(
+            os.getenv("FLASH_MAX_PER_6H", "3")
+        )
+
+        # Advisory refresh
+        self.advisory_refresh_enabled: bool = os.getenv(
+            "ADVISORY_REFRESH_ENABLED", "true"
+        ).lower() in ("true", "1", "yes")
 
         # Logging
         self.log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -200,17 +231,17 @@ class EngineConfig:
     # ------------------------------------------------------------------
     @property
     def anthropic_api_key(self) -> str:
-        """Return API key from env → DB settings → empty."""
+        """Return API key from env → DB settings (decrypted) → empty."""
         if self._anthropic_api_key:
             return self._anthropic_api_key
-        # Try loading from DB settings
         try:
             from .db import get_session, EngineSettings
+            from .crypto import decrypt_value
             session = get_session()
             try:
                 setting = session.query(EngineSettings).get("anthropic_api_key")
                 if setting and setting.value:
-                    return setting.value
+                    return decrypt_value(setting.value)
             finally:
                 session.close()
         except Exception:
@@ -219,17 +250,19 @@ class EngineConfig:
 
     @anthropic_api_key.setter
     def anthropic_api_key(self, value: str) -> None:
-        """Store API key in DB settings for persistence."""
+        """Store API key in DB settings for persistence (encrypted)."""
         self._anthropic_api_key = value
         try:
             from .db import get_session, EngineSettings
+            from .crypto import encrypt_value
             session = get_session()
             try:
+                encrypted = encrypt_value(value)
                 setting = session.query(EngineSettings).get("anthropic_api_key")
                 if setting:
-                    setting.value = value
+                    setting.value = encrypted
                 else:
-                    setting = EngineSettings(key="anthropic_api_key", value=value)
+                    setting = EngineSettings(key="anthropic_api_key", value=encrypted)
                     session.add(setting)
                 session.commit()
             finally:
@@ -255,16 +288,17 @@ class EngineConfig:
     # ------------------------------------------------------------------
     @property
     def groq_api_key(self) -> str:
-        """Return Groq API key from env → DB settings → empty."""
+        """Return Groq API key from env → DB settings (decrypted) → empty."""
         if self._groq_api_key:
             return self._groq_api_key
         try:
             from .db import get_session, EngineSettings
+            from .crypto import decrypt_value
             session = get_session()
             try:
                 setting = session.query(EngineSettings).get("groq_api_key")
                 if setting and setting.value:
-                    return setting.value
+                    return decrypt_value(setting.value)
             finally:
                 session.close()
         except Exception:
@@ -273,18 +307,20 @@ class EngineConfig:
 
     @groq_api_key.setter
     def groq_api_key(self, value: str) -> None:
-        """Store Groq API key in DB settings for persistence."""
+        """Store Groq API key in DB settings for persistence (encrypted)."""
         self._groq_api_key = value
         self.swarm_enabled = bool(value)
         try:
             from .db import get_session, EngineSettings
+            from .crypto import encrypt_value
             session = get_session()
             try:
+                encrypted = encrypt_value(value)
                 setting = session.query(EngineSettings).get("groq_api_key")
                 if setting:
-                    setting.value = value
+                    setting.value = encrypted
                 else:
-                    setting = EngineSettings(key="groq_api_key", value=value)
+                    setting = EngineSettings(key="groq_api_key", value=encrypted)
                     session.add(setting)
                 session.commit()
             finally:
@@ -297,16 +333,17 @@ class EngineConfig:
     # ------------------------------------------------------------------
     @property
     def openrouter_api_key(self) -> str:
-        """Return OpenRouter API key from env → DB settings → empty."""
+        """Return OpenRouter API key from env → DB settings (decrypted) → empty."""
         if self._openrouter_api_key:
             return self._openrouter_api_key
         try:
             from .db import get_session, EngineSettings
+            from .crypto import decrypt_value
             session = get_session()
             try:
                 setting = session.query(EngineSettings).get("openrouter_api_key")
                 if setting and setting.value:
-                    return setting.value
+                    return decrypt_value(setting.value)
             finally:
                 session.close()
         except Exception:
@@ -315,18 +352,20 @@ class EngineConfig:
 
     @openrouter_api_key.setter
     def openrouter_api_key(self, value: str) -> None:
-        """Store OpenRouter API key in DB settings."""
+        """Store OpenRouter API key in DB settings (encrypted)."""
         self._openrouter_api_key = value
         self.swarm_enabled = bool(self._groq_api_key) or bool(value)
         try:
             from .db import get_session, EngineSettings
+            from .crypto import encrypt_value
             session = get_session()
             try:
+                encrypted = encrypt_value(value)
                 setting = session.query(EngineSettings).get("openrouter_api_key")
                 if setting:
-                    setting.value = value
+                    setting.value = encrypted
                 else:
-                    setting = EngineSettings(key="openrouter_api_key", value=value)
+                    setting = EngineSettings(key="openrouter_api_key", value=encrypted)
                     session.add(setting)
                 session.commit()
             finally:
@@ -339,16 +378,17 @@ class EngineConfig:
     # ------------------------------------------------------------------
     @property
     def twitter_bearer_token(self) -> str:
-        """Return X/Twitter bearer token from env → DB settings → empty."""
+        """Return X/Twitter bearer token from env → DB settings (decrypted) → empty."""
         if self._twitter_bearer_token:
             return self._twitter_bearer_token
         try:
             from .db import get_session, EngineSettings
+            from .crypto import decrypt_value
             session = get_session()
             try:
                 setting = session.query(EngineSettings).get("twitter_bearer_token")
                 if setting and setting.value:
-                    return setting.value
+                    return decrypt_value(setting.value)
             finally:
                 session.close()
         except Exception:
@@ -357,17 +397,19 @@ class EngineConfig:
 
     @twitter_bearer_token.setter
     def twitter_bearer_token(self, value: str) -> None:
-        """Store X/Twitter bearer token in DB settings for persistence."""
+        """Store X/Twitter bearer token in DB settings (encrypted)."""
         self._twitter_bearer_token = value
         try:
             from .db import get_session, EngineSettings
+            from .crypto import encrypt_value
             session = get_session()
             try:
+                encrypted = encrypt_value(value)
                 setting = session.query(EngineSettings).get("twitter_bearer_token")
                 if setting:
-                    setting.value = value
+                    setting.value = encrypted
                 else:
-                    setting = EngineSettings(key="twitter_bearer_token", value=value)
+                    setting = EngineSettings(key="twitter_bearer_token", value=encrypted)
                     session.add(setting)
                 session.commit()
             finally:
@@ -385,16 +427,17 @@ class EngineConfig:
     # ------------------------------------------------------------------
     @property
     def fred_api_key(self) -> str:
-        """Return FRED API key from env → DB settings → empty."""
+        """Return FRED API key from env → DB settings (decrypted) → empty."""
         if self._fred_api_key:
             return self._fred_api_key
         try:
             from .db import get_session, EngineSettings
+            from .crypto import decrypt_value
             session = get_session()
             try:
                 setting = session.query(EngineSettings).get("fred_api_key")
                 if setting and setting.value:
-                    return setting.value
+                    return decrypt_value(setting.value)
             finally:
                 session.close()
         except Exception:
@@ -403,17 +446,19 @@ class EngineConfig:
 
     @fred_api_key.setter
     def fred_api_key(self, value: str) -> None:
-        """Store FRED API key in DB settings."""
+        """Store FRED API key in DB settings (encrypted)."""
         self._fred_api_key = value
         try:
             from .db import get_session, EngineSettings
+            from .crypto import encrypt_value
             session = get_session()
             try:
+                encrypted = encrypt_value(value)
                 setting = session.query(EngineSettings).get("fred_api_key")
                 if setting:
-                    setting.value = value
+                    setting.value = encrypted
                 else:
-                    setting = EngineSettings(key="fred_api_key", value=value)
+                    setting = EngineSettings(key="fred_api_key", value=encrypted)
                     session.add(setting)
                 session.commit()
             finally:

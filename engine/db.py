@@ -23,6 +23,7 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
     event,
+    text,
 )
 from sqlalchemy.orm import (
     declarative_base,
@@ -500,12 +501,42 @@ class TokenUsage(Base):
     cost_eur: float = Column(Float, nullable=False, default=0.0)
     purpose: str = Column(String(128), nullable=False, default="tree_generation")
     run_up_id: Optional[int] = Column(Integer, ForeignKey("run_ups.id"), nullable=True)
+    prompt_hash: Optional[str] = Column(String(64), nullable=True)  # SHA-256 of full prompt
+
+
+class CalibrationLog(Base):
+    """Log raw LLM probabilities + composite scores for future calibration analysis.
+
+    Red Team consensus: start logging NOW, apply Platt scaling only after 6+ months of data.
+    """
+
+    __tablename__ = "calibration_log"
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+    source: str = Column(String(64), nullable=False)  # "swarm", "advisory", "flash"
+    run_up_id: Optional[int] = Column(Integer, ForeignKey("run_ups.id"), nullable=True)
+    ticker: Optional[str] = Column(String(20), nullable=True)
+    raw_llm_probability: Optional[float] = Column(Float, nullable=True)  # 0-100 from LLM
+    composite_score: Optional[float] = Column(Float, nullable=True)  # 0-1 from scorer
+    win_probability: Optional[float] = Column(Float, nullable=True)  # mapped Kelly prob
+    verdict: Optional[str] = Column(String(20), nullable=True)  # BUY/SELL/HOLD
+    horizon_days: Optional[int] = Column(Integer, nullable=True)  # evaluation horizon
+    outcome: Optional[int] = Column(Integer, nullable=True)  # 1=correct, 0=wrong, NULL=pending
+    outcome_return_pct: Optional[float] = Column(Float, nullable=True)
+    evaluated_at: Optional[datetime] = Column(DateTime, nullable=True)
+    metadata_json: Optional[str] = Column(Text, nullable=True)  # extra context
+
+    __table_args__ = (
+        Index("ix_calibration_log_source", "source"),
+        Index("ix_calibration_log_ticker", "ticker"),
+        Index("ix_calibration_log_timestamp", "timestamp"),
+    )
 
     def __repr__(self) -> str:
         return (
-            f"<TokenUsage model={self.model!r} "
-            f"in={self.input_tokens} out={self.output_tokens} "
-            f"cost=\u20ac{self.cost_eur:.4f}>"
+            f"<CalibrationLog id={self.id} source={self.source!r} "
+            f"ticker={self.ticker!r} verdict={self.verdict!r}>"
         )
 
 
@@ -619,6 +650,33 @@ def cleanup_old_price_snapshots(max_age_days: int = 30) -> int:
         session.close()
 
 
+class User(Base):
+    """Registered user with per-user portfolio."""
+
+    __tablename__ = "users"
+    __table_args__ = (
+        Index("idx_users_email", "email", unique=True),
+        Index("idx_users_username", "username", unique=True),
+    )
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    email: str = Column(String(255), unique=True, nullable=False)
+    username: str = Column(String(64), unique=True, nullable=False)
+    first_name: str = Column(String(100), nullable=False, default="")
+    last_name: str = Column(String(100), nullable=False, default="")
+    password_hash: str = Column(String(255), nullable=False)
+    portfolio_json: str = Column(Text, nullable=False, default="[]")
+    onboarded: bool = Column(Boolean, nullable=False, default=False)
+    created_at: datetime = Column(DateTime, default=datetime.utcnow)
+    last_login: datetime = Column(DateTime, nullable=True)
+    is_admin: bool = Column(Boolean, nullable=False, default=False)
+    failed_logins: int = Column(Integer, nullable=False, default=0)
+    locked_until: datetime = Column(DateTime, nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<User {self.username!r} ({self.email!r}) admin={self.is_admin}>"
+
+
 class EngineSettings(Base):
     """Key-value settings store (e.g. daily budget)."""
 
@@ -641,7 +699,7 @@ class AnalysisReport(Base):
     )
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
-    report_type: str = Column(String(64), nullable=False)  # "daily_briefing" | "weekly_briefing"
+    report_type: str = Column(String(64), nullable=False)  # "daily_briefing" | "weekly_briefing" | "daily_advisory" | "advisory_refresh"
     period_start: date = Column(Date, nullable=False)
     period_end: date = Column(Date, nullable=False)
     report_json: str = Column(Text, nullable=False)
@@ -655,10 +713,128 @@ class AnalysisReport(Base):
         )
 
 
+class FlashAlert(Base):
+    """Breaking-news flash alert detected by the flash detector.
+
+    Records are NEVER deleted — ``expire_old_alerts()`` only sets
+    ``status = "expired"``.  This guarantees that evaluation data
+    (``eval_*_json``) remains permanently available for self-learning
+    and retrospective analysis.
+    """
+
+    __tablename__ = "flash_alerts"
+    __table_args__ = (
+        Index("idx_flash_status_detected", "status", "detected_at"),
+    )
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    alert_id: str = Column(String(64), unique=True, index=True, nullable=False)  # UUID
+    trigger_type: str = Column(String(32), nullable=False)  # single_article / narrative_spike
+    flash_score: float = Column(Float, nullable=False, default=0.0)
+    headline: str = Column(Text, nullable=False, default="")
+    region: Optional[str] = Column(String(64), nullable=True)
+    event_type: Optional[str] = Column(String(32), nullable=True)
+    intensity: Optional[str] = Column(String(32), nullable=True)
+
+    # Source articles
+    article_ids_json: Optional[str] = Column(Text, nullable=True)   # JSON array of article IDs
+    source_names_json: Optional[str] = Column(Text, nullable=True)  # JSON array of source names
+
+    # Narrative / run-up link
+    narrative_name: Optional[str] = Column(String(256), nullable=True)
+    run_up_id: Optional[int] = Column(Integer, ForeignKey("run_ups.id"), nullable=True)
+    run_up = relationship("RunUp", backref="flash_alerts")
+
+    # Groq-generated advisory
+    flash_advisory_json: Optional[str] = Column(Text, nullable=True)
+
+    # Portfolio impact
+    tickers_affected_json: Optional[str] = Column(Text, nullable=True)  # ["XOM","LMT"]
+    portfolio_action: Optional[str] = Column(String(32), nullable=True)  # immediate/watch/none
+    risk_level: Optional[str] = Column(String(16), nullable=True)  # critical/high/moderate
+
+    # Self-learning: concrete recommendations with price-at-alert
+    # [{ticker, action, price_at_alert, confidence, pred_prob, components}]
+    recommendations_json: Optional[str] = Column(Text, nullable=True)
+
+    # Evaluation per horizon (filled by evaluate_flash_alerts)
+    eval_6h_json: Optional[str] = Column(Text, nullable=True)   # {price, pct_change, correct, evaluated_at}
+    eval_1d_json: Optional[str] = Column(Text, nullable=True)
+    eval_4d_json: Optional[str] = Column(Text, nullable=True)
+    eval_7d_json: Optional[str] = Column(Text, nullable=True)
+
+    # Status & lifecycle
+    telegram_sent: bool = Column(Boolean, default=False)
+    detected_at: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at: Optional[datetime] = Column(DateTime, nullable=True)  # +6h (UI banner only)
+    status: str = Column(String(16), default="active", nullable=False)  # active/expired/superseded
+
+    def __repr__(self) -> str:
+        return (
+            f"<FlashAlert id={self.id} score={self.flash_score:.0f} "
+            f"type={self.trigger_type!r} status={self.status!r}>"
+        )
+
+
+class SuppressedNotification(Base):
+    """Notification queued during quiet hours (23:00-06:00 UTC).
+
+    Non-CRITICAL alerts are held here and batch-sent at 06:05 UTC.
+    """
+
+    __tablename__ = "suppressed_notifications"
+    __table_args__ = (
+        Index("idx_suppressed_created", "created_at"),
+    )
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    flash_alert_id: int = Column(Integer, ForeignKey("flash_alerts.id"), unique=True, nullable=False)
+    tier: str = Column(String(16), nullable=False)  # ALERT / REFRESH
+    message_preview: str = Column(Text, nullable=False)
+    created_at: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+    batch_sent_at: Optional[datetime] = Column(DateTime, nullable=True)
+
+    flash_alert = relationship("FlashAlert", backref="suppressed")
+
+    def __repr__(self) -> str:
+        return f"<SuppressedNotification id={self.id} tier={self.tier!r}>"
+
+
+class AuditLog(Base):
+    """Immutable audit trail for all security-relevant operations.
+
+    Records who did what, when, from where.  Never deleted or modified.
+    """
+
+    __tablename__ = "audit_log"
+    __table_args__ = (
+        Index("idx_audit_timestamp", "timestamp"),
+        Index("idx_audit_action", "action"),
+        Index("idx_audit_ip", "ip_address"),
+    )
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp: datetime = Column(DateTime, default=datetime.utcnow, nullable=False)
+    action: str = Column(String(64), nullable=False)  # e.g. "api_key.update", "feed.create"
+    resource_type: str = Column(String(64), nullable=False, default="")
+    resource_id: Optional[str] = Column(String(128), nullable=True)
+    ip_address: str = Column(String(45), nullable=False, default="")  # IPv4/IPv6
+    user_agent: Optional[str] = Column(String(512), nullable=True)
+    detail: Optional[str] = Column(Text, nullable=True)  # JSON or free-text
+    status: str = Column(String(16), nullable=False, default="success")  # success / failed / denied
+
+    def __repr__(self) -> str:
+        return (
+            f"<AuditLog id={self.id} action={self.action!r} "
+            f"resource={self.resource_type}:{self.resource_id} "
+            f"status={self.status!r}>"
+        )
+
+
 class SwarmVerdict(Base):
     """A swarm consensus verdict for a decision node.
 
-    Produced by the expert panel (7 agents × 3 debate rounds).
+    Produced by the expert panel (7 agents x 3 debate rounds).
     New verdicts supersede old ones for the same node.
     """
 
@@ -680,6 +856,7 @@ class SwarmVerdict(Base):
     confidence: float = Column(Float, nullable=False, default=0.0)  # 0.0-1.0
     yes_probability: float = Column(Float, nullable=False, default=0.5)  # 0.0-1.0
     consensus_strength: float = Column(Float, nullable=False, default=0.0)  # 0.0-1.0
+    participation_rate = Column(Float, nullable=True, default=1.0)  # 0.0-1.0, fraction of experts that responded
 
     # Primary trading signal
     primary_ticker: Optional[str] = Column(String(16), nullable=True)
@@ -742,6 +919,7 @@ def _get_engine():
                     cursor = dbapi_conn.cursor()
                     cursor.execute("PRAGMA journal_mode=WAL")
                     cursor.execute("PRAGMA foreign_keys=ON")
+                    cursor.execute("PRAGMA busy_timeout=15000")
                     cursor.close()
 
                 logger.info("Database engine created: %s", config.database_uri)
@@ -777,6 +955,19 @@ def create_all() -> None:
     # SQLAlchemy's create_all() creates new tables but won't add columns
     # to existing ones.  We handle that here.
     _migrate_columns(engine)
+
+    # Enable WAL mode for better concurrent reads and crash safety
+    with engine.connect() as conn:
+        conn.execute(text("PRAGMA journal_mode=WAL"))
+        conn.execute(text("PRAGMA busy_timeout=15000"))
+        conn.commit()
+
+        # Quick integrity check on startup
+        result = conn.execute(text("PRAGMA quick_check")).fetchone()
+        if result[0] != "ok":
+            logger.error("Database integrity check FAILED: %s", result[0])
+        else:
+            logger.info("Database integrity check passed (WAL mode enabled)")
 
     logger.info("Database tables created / verified.")
 
@@ -853,6 +1044,15 @@ def _migrate_columns(engine) -> None:
                 "ALTER TABLE swarm_verdicts ADD COLUMN context_hash VARCHAR(64) DEFAULT NULL"
             )
             logger.info("Migration: added column swarm_verdicts.context_hash")
+
+        # Check token_usage for prompt_hash column
+        cursor.execute("PRAGMA table_info(token_usage)")
+        tu_cols = {row[1] for row in cursor.fetchall()}
+        if "prompt_hash" not in tu_cols:
+            cursor.execute(
+                "ALTER TABLE token_usage ADD COLUMN prompt_hash VARCHAR(64) DEFAULT NULL"
+            )
+            logger.info("Migration: added column token_usage.prompt_hash")
 
         conn.commit()
         conn.close()

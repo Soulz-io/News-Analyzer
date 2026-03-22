@@ -329,11 +329,19 @@ def update_polymarket_matches() -> int:
 
             for node, market, score in matches:
                 outcome_prices = market.get("outcomePrices", [])
+                outcomes = market.get("outcomes", [])
                 try:
                     if isinstance(outcome_prices, str):
                         outcome_prices = json.loads(outcome_prices)
-                    yes_price = float(outcome_prices[0]) if outcome_prices else 0.5
-                    no_price = float(outcome_prices[1]) if len(outcome_prices) > 1 else (1.0 - yes_price)
+                    if isinstance(outcomes, str):
+                        outcomes = json.loads(outcomes)
+                    # Find YES index by checking outcomes array (don't assume [0]=YES)
+                    yes_idx = next(
+                        (i for i, o in enumerate(outcomes) if str(o).lower() == "yes"),
+                        0,  # fallback: assume index 0 if no explicit "Yes"
+                    )
+                    yes_price = float(outcome_prices[yes_idx]) if yes_idx < len(outcome_prices) else 0.5
+                    no_price = 1.0 - yes_price
                 except (ValueError, IndexError, TypeError):
                     yes_price = 0.5
                     no_price = 0.5
